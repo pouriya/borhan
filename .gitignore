@@ -1,0 +1,13 @@
+/target
+/build
+
+# Vendored embedding model (~31 MB) — fetch with `make model`
+/models
+src/embedding/potion-retrieval-32M
+
+# Local store
+/data
+*.db
+*.db-journal
+*.db-wal
+*.lance

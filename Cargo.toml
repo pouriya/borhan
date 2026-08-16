@@ -1,0 +1,60 @@
+[package]
+name = "borhan"
+version = "0.1.0"
+edition = "2024"
+description = "Memory store backed by SQLite, LanceDB and model2vec embeddings"
+authors = ["Pouriya Jahanbakhsh <pouriya.jb@gmail.com>"]
+
+[dependencies]
+# Vector store. lancedb pins arrow ^58, so every arrow-* crate here must stay
+# on 58.x — arrow 59 exists but its types will not unify with lancedb's.
+# default = [], so no aws/azure/gcs/remote/openai pulled in.
+lancedb = "0.37.1"
+arrow-array = "58.4.0"
+arrow-schema = "58.4.0"
+
+# Metadata / keyword store. `bundled` compiles SQLite from source: no
+# libsqlite3-dev on the host, same version on every machine.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+
+# Static embeddings. `local-only` drops hf-hub + ureq so nothing is fetched
+# from HuggingFace at runtime; the model is vendored under models/ by
+# scripts/fetch-model.sh. `fancy-regex` is the pure-Rust tokenizer backend,
+# which avoids the oniguruma C dependency that the `onig` default would add.
+model2vec-rs = { version = "0.2.1", default-features = false, features = [
+    "local-only",
+    "fancy-regex",
+] }
+
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+] }
+
+# HTTP server. default-features = false drops form/json/query/matched-path/
+# tracing extractors that the hello-world router does not use.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+
+thiserror = "2.0.20"
+
+# Used only to flatten a `#[source]` chain into one line via `{:#}`.
+# model2vec-rs already returns anyhow::Error, so this is not a new dependency
+# in the tree — only a direct one.
+anyhow = "1.0"
+
+clap = { version = "4.6.6", default-features = false, features = [
+    "std",
+    "derive",
+    "env",
+    "help",
+    "usage",
+    "error-context",
+] }
+
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "std",
+    "fmt",
+    "json",
+] }
