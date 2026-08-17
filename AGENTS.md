@@ -35,7 +35,7 @@ do not claim it passed without running it.
 | `make model` | Downloads a fixture model into `models/` (once; no-op if present) |
 | `make dev` | Debug build → `build/borhan-<version>-<target>-dev` |
 | `make release` | Release build → `build/borhan-<version>-<target>` |
-| `make start-dev` | `make dev`, then runs the binary with `--debug` |
+| `make start-dev` | `make dev`, then runs `serve` with `--debug` |
 | `make clippy` | `cargo clippy --all-targets --no-deps -- -D warnings` |
 | `make check-style` | `cargo fmt --check` |
 | `make fmt` | Rewrites formatting in place |
@@ -57,6 +57,8 @@ requires nothing: its model is compiled into the binary.
 | `rusqlite` | 0.40.2 | Metadata / keyword store, `bundled` SQLite |
 | `tokio` | 1.53.1 | Async runtime (`lancedb` is async throughout) |
 | `clap` | 4.6.6 | Command line, derive API |
+| `tanzim` | 0.28.0 | Reads `remote.toml` / `server.toml`, with located errors |
+| `toml_edit` | 0.22.27 | Writes `remote.toml` in `init remote` |
 | `tracing` + `tracing-subscriber` | 0.1 / 0.3 | Structured JSON logging to stderr |
 
 ## Hard constraints
@@ -156,14 +158,69 @@ anything else as a directory path.
   model2vec-rs reports a missing directory, a missing `config.json` and a
   missing `model.safetensors` with the same opaque message.
 
-## CLI
+## Home directory
 
-Logging flags and `--storage-directory` are `global = true`, so they work before
-or after a subcommand. **`serve` is the default when no subcommand is given.**
+Everything borhan owns sits under `--home` (`BORHAN_HOME`, default `~/.borhan`),
+and nothing sits outside it:
 
 ```
-borhan                                  # == borhan serve
-borhan serve                            # axum hello-world on 127.0.0.1:1995
+~/.borhan/
+  storage/      SQLite database + LanceDB tables. Written by `init storage`.
+  remote.toml   Written by `init remote`. Present => client of a running server.
+  server.toml   Read by `serve`. Absent => defaults (127.0.0.1:1995, no token).
+```
+
+**Nothing is created implicitly.** `init` is the only thing that writes the
+layout, so a missing `storage/` always means "never set up here", never "set up
+somewhere you did not look". Commands that would touch storage fail with an
+error that spells out both fixes — run `init`, or mount the user's real
+`~/.borhan` into the sandbox and pass `--home`. That message is aimed at agents
+running in containers, where the difference between the two matters: `init`
+there silently produces an *empty* store and hides every existing memory.
+
+Commands that touch no storage (`embedding load`, `embedding do` — model-only
+work) run fine without `init`.
+
+### Local vs client mode
+
+The *presence* of `remote.toml` is the switch. With it, this instance owns no
+storage and talks to the `borhan serve` at its `server`; without it, everything
+happens locally against `storage/`. `serve` reads `server.toml` only — a server
+machine has no `remote.toml`.
+
+Both files are read with [`tanzim`](https://docs.rs/tanzim) into `Remote` /
+`Server`, via the one `read_configuration` helper. The helper formats tanzim's
+error with `{:#}` — that is the form carrying source, line, column and the caret;
+wrapping it as a `#[source]` throws all of it away.
+
+`remote.toml` is the one file borhan *writes*: `init remote` serializes the same
+`Remote` struct back out with `toml_edit`, so reader and writer cannot drift. It
+is created with `create_new` and mode `0600` — it holds a token, and refusing to
+clobber an existing one is what keeps `init remote` from silently repointing a
+configured client.
+
+**Two things are stubs, on purpose:**
+
+- **`init remote` does not reach the server yet.** It is supposed to hit
+  `http://{server}/api/v1/auth` with the token and require a `201` before
+  writing anything; nothing in the tree makes client-side HTTP requests, so the
+  `TODO` in `main.rs` marks where that check goes.
+- **The `token` fields are parsed but never used.** Nothing is sent and nothing
+  is enforced: the only route is a placeholder. Wire them up with the real API,
+  not before. No command routes to the server yet either, so client mode
+  currently only decides that `init storage` refuses to run.
+
+## CLI
+
+Logging flags and `--home` are `global = true`, so they work before or after a
+subcommand. **A subcommand is required** — there is no implicit server.
+
+```
+borhan init                             # == borhan init storage
+borhan init storage                     # create ~/.borhan and ~/.borhan/storage
+borhan init remote --server H:P \
+                  [--token T]           # write ~/.borhan/remote.toml (0600)
+borhan serve                            # axum hello-world, address from server.toml
 borhan embedding load <DIR>             # load a model dir, report name + dims
 borhan embedding do [--model M] <TEXT>  # embed TEXT; M is "default" or a dir
 ```
@@ -182,16 +239,18 @@ models/                              Test-fixture models (gitignored)
 build/                               Named binaries from make dev/release (gitignored)
 ```
 
-`main.rs` holds: `CommandLine`/`Command`/`EmbeddingCommand` (clap derive),
-`logging_level()`, `default_storage_directory()` (with the vendored `dirs` logic
-inlined into it), and `main()`.
+`main.rs` holds: `CommandLine`/`Command`/`InitCommand`/`EmbeddingCommand` (clap
+derive), the `Remote`/`Server` configuration structs (serde derive),
+`logging_level()`,
+`default_home_directory()` (with the vendored `dirs` logic inlined into it),
+`read_configuration()`, and `main()`.
 
-Storage defaults to `~/borhan/storage` (`$HOME` on Unix, `%USERPROFILE%` on
-Windows), overridable with `--storage-directory` or `BORHAN_STORAGE_DIRECTORY`.
+`--home` defaults to `~/.borhan` (`$HOME` on Unix, `%USERPROFILE%` on Windows);
+see the Home directory section for what lives inside it.
 
 ## Vendored code
 
-The home-directory resolution inside `default_storage_directory` is copied from
+The home-directory resolution inside `default_home_directory` is copied from
 `dirs`/`dirs-sys` rather than depended on. **When vendoring, the doc comment must
 quote the original source, name the crate and version, and list every deliberate
 deviation.** Do not vendor silently.

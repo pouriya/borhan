@@ -36,6 +36,27 @@ tokio = { version = "1.53.1", default-features = false, features = [
 # tracing extractors that the hello-world router does not use.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 
+# Configuration files. default-features = false drops the env/JSON/YAML loaders
+# and parsers and the whole validate-schema tree; borhan reads exactly one TOML
+# file per role and nothing else.
+tanzim = { version = "0.28.0", default-features = false, features = [
+    "load-file",
+    "parse-toml",
+] }
+
+# Only for `#[derive(Deserialize)]`/`#[derive(Serialize)]` on the two
+# configuration structs. tanzim already depends on serde, so this is not a new
+# crate in the tree — only a direct dependency.
+serde = { version = "1.0.195", features = ["derive"] }
+
+# Writing `remote.toml` in `init remote`. tanzim only reads. This is the crate
+# tanzim's TOML parser already sits on, so nothing new lands in the tree beyond
+# its `serde` feature; `parse` stays off because borhan never parses with it.
+toml_edit = { version = "0.22.27", default-features = false, features = [
+    "serde",
+    "display",
+] }
+
 thiserror = "2.0.20"
 
 # Used only to flatten a `#[source]` chain into one line via `{:#}`.

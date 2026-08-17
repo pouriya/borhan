@@ -599,8 +599,11 @@ dependencies = [
  "lancedb",
  "model2vec-rs",
  "rusqlite",
+ "serde",
+ "tanzim",
  "thiserror",
  "tokio",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5033,6 +5036,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5384,6 +5396,82 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
+name = "tanzim"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1cb9c11f9f98100793488b3046afc1531c9d6cc258d88e36f4e188da05d668b"
+dependencies = [
+ "cfg-if",
+ "serde",
+ "tanzim-load",
+ "tanzim-merge",
+ "tanzim-parse",
+ "tanzim-source",
+ "tanzim-validate",
+ "tanzim-value",
+]
+
+[[package]]
+name = "tanzim-load"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e66355c0582feff9f1d0419a21c007ef28c5556a26a314bfdd1c1c06a3928a35"
+dependencies = [
+ "cfg-if",
+ "tanzim-source",
+]
+
+[[package]]
+name = "tanzim-merge"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c905fbc8ed738daf0beafe367f7940191d8b9f529b7ecd995efa27ce91c3dcb9"
+dependencies = [
+ "cfg-if",
+ "tanzim-load",
+ "tanzim-source",
+ "tanzim-value",
+]
+
+[[package]]
+name = "tanzim-parse"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4787ec7eec9efd64bdc539058021b78618b7e647848e0b17de6adbb0fb52959"
+dependencies = [
+ "cfg-if",
+ "tanzim-source",
+ "tanzim-value",
+ "toml_edit",
+]
+
+[[package]]
+name = "tanzim-source"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e56a676bdff892168c84854202799073b3f826b61cb5e58e408693241ec3d8"
+
+[[package]]
+name = "tanzim-validate"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eadc21b4c90cfee61865d824a2bf8db26419c23457849df57f65f430babb03b"
+dependencies = [
+ "cfg-if",
+ "tanzim-value",
+]
+
+[[package]]
+name = "tanzim-value"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e04fcbd700b0b19fd6e983cffc041967165d59a7345c5f6efcee2263d18712"
+dependencies = [
+ "serde",
+ "tanzim-source",
+]
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5603,6 +5691,35 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_write",
+ "winnow",
+]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tower"
@@ -6156,6 +6273,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"

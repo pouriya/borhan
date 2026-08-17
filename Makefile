@@ -34,7 +34,7 @@ dev: ${BUILD_DIR}
 
 
 start-dev: dev
-	${DEV_CMD} --debug
+	${DEV_CMD} --debug serve
 
 
 # Downloads the model only if it is not already on disk.
