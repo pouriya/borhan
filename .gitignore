@@ -5,6 +5,12 @@
 /models
 src/embedding/potion-retrieval-32M
 
+# Corpus fetched by `make seed`, and the storage it is scanned into. Neither is
+# ours to commit: the corpus is somebody else's repository and the storage is a
+# few hundred MB of derived vectors.
+/seed
+/home
+
 # Local store
 /data
 *.db

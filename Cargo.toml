@@ -57,6 +57,39 @@ toml_edit = { version = "0.22.27", default-features = false, features = [
     "display",
 ] }
 
+# The 80 random bits of a ULID, straight from the OS entropy source. Chosen
+# over `rand` because there is nothing to seed and no generator to keep: one
+# call, one buffer. Already in the tree (uuid, tempfile, rand all pull it), and
+# it has no default features to turn off.
+getrandom = "0.4.3"
+
+# Rendering a `created_at` (unix milliseconds) as ISO-8601 with a `Z`, which is
+# the only date handling borhan does. default-features = false drops `clock`
+# (borhan reads its clock through SystemTime, in ulid.rs), `oldtime` and
+# `wasmbind`; `alloc` is there because `to_rfc3339_opts` returns a String.
+chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
+
+# Breaking what gets stored into paragraphs and sentences. What arrives is
+# assumed to be Markdown — it is a chat transcript — and a CommonMark parser is
+# what tells a fenced code block from a list from a run of prose, which is the
+# difference between splitting on blank lines and splitting on meaning.
+# default-features = false drops `html` (borhan renders nothing), `simd`,
+# `getopts` and `serde`; the pull parser is the whole of what is used.
+pulldown-cmark = { version = "0.13.4", default-features = false }
+
+# Only for `TryStreamExt::try_next`, to read LanceDB's result stream. lancedb
+# returns a `SendableRecordBatchStream` and re-exports nothing to consume it
+# with, so this is a direct dependency on a crate its own tree already carries.
+# default-features = false drops the executor, `async-await` sugar and the
+# compat shims; `std` is all a stream adaptor needs.
+futures = { version = "0.3.31", default-features = false, features = ["std"] }
+
+# Building the `memory get --json` array. Hand-written JSON is fine until the
+# first row holding a quote or a newline, and a stored sentence is exactly the
+# kind of text that holds both. Already in the tree — tracing-subscriber's
+# `json` feature sits on it — so this is a direct dependency, not a new crate.
+serde_json = "1.0.151"
+
 thiserror = "2.0.20"
 
 # Used only to flatten a `#[source]` chain into one line via `{:#}`.
@@ -79,3 +112,11 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "fmt",
     "json",
 ] }
+
+
+[profile.release]
+opt-level = 'z'     # Optimize for size.
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations.
+panic = 'abort'     # Abort on panic
+strip = true
