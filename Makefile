@@ -6,17 +6,6 @@ RELEASE_FILENAME_POSTFIX := $(if $(findstring windows,$(TARGET)),.exe,)
 CMD=${BUILD_DIR}/borhan-${VERSION}-${TARGET}${RELEASE_FILENAME_POSTFIX}
 DEV_CMD=${BUILD_DIR}/borhan-${VERSION}-${TARGET}-dev${RELEASE_FILENAME_POSTFIX}
 
-# A model directory used to exercise the directory-backed loader. The *default*
-# model is not this one -- it lives in src/embedding/ and is committed, because
-# include_bytes! bakes it into the binary. Not fetched by `all`: it is a 31 MB
-# download that only has to happen once, so it hangs off a file target.
-MODEL_NAME=potion-base-8M
-MODEL_DIR=$(CURDIR)/models/${MODEL_NAME}
-MODEL_FILE=${MODEL_DIR}/model.safetensors
-
-# The one dependency constraint that silently produces nonsense when broken.
-ARROW_MAJOR=58
-
 # A corpus to scan into a real storage, so that the splitter, the vector index
 # and search get exercised on something bigger than a hand-typed sentence.
 # Override the four variables to point at any repository of Markdown files:
@@ -40,7 +29,7 @@ SEED_LIMIT ?= 200
 SEED_HOME=$(CURDIR)/home
 
 
-all: dev clippy test check-style check-arrow
+all: dev clippy test check-style
 
 
 release: ${BUILD_DIR}
@@ -59,13 +48,6 @@ start-dev: dev
 	${DEV_CMD} --debug serve
 
 
-# Downloads the model only if it is not already on disk.
-model: ${MODEL_FILE}
-
-${MODEL_FILE}:
-	./scripts/fetch-model.sh
-
-
 clippy:
 	cargo clippy --all-targets --no-deps -- -D warnings
 
@@ -78,26 +60,7 @@ fmt:
 	cargo fmt
 
 
-# lancedb pins arrow ^58. A second arrow major in the tree compiles right up
-# until two `arrow_schema::Schema` types fail to unify, and the error does not
-# mention versions -- so fail loudly here instead.
-check-arrow:
-	@ versions=`grep -A1 '^name = "arrow"$$' Cargo.lock | grep '^version' | sed 's/version = //;s/"//g' | sort -u`; \
-	count=`echo "$$versions" | grep -c .`; \
-	if [ "$$count" -ne 1 ]; then \
-		echo "FAIL: expected exactly one arrow version in Cargo.lock, found $$count:"; \
-		echo "$$versions" | sed 's/^/  /'; \
-		echo "  run 'cargo tree -i arrow' to find who pulled the second one"; \
-		exit 1; \
-	fi; \
-	case "$$versions" in ${ARROW_MAJOR}.*) ;; *) \
-		echo "FAIL: arrow is $$versions but lancedb pins ^${ARROW_MAJOR}"; \
-		exit 1;; \
-	esac; \
-	echo "arrow $$versions (single version, matches lancedb's ^${ARROW_MAJOR} pin)"
-
-
-lint: clippy check-style check-arrow
+lint: clippy check-style
 
 
 # Fetch the corpus, scan it into ${SEED_HOME}, then search it.
@@ -110,9 +73,9 @@ ${SEED_DIR}:
 	./scripts/fetch-seed.sh ${SEED_REPO} ${SEED_DIR} ${SEED_PATH}
 
 
-# Built with `release`, not `dev`: a debug build spends 1.6s of every invocation
-# loading the model against 0.17s, which turns a few hundred documents from a
-# coffee into an afternoon.
+# Built with `release`, not `dev`: the debug build is several times slower at
+# tokenizing and indexing, which turns a few hundred documents from a coffee
+# into an afternoon.
 #
 # One document is one message, named by its path under ${SEED_PATH} with the
 # slashes turned into dashes -- so `--message` stays unique, which `memory add`
@@ -130,6 +93,7 @@ seed-scan: release seed-fetch
 	@ rm -rf ${SEED_HOME}
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet init storage
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory create ${SEED_NAME} \
+		--languages en \
 		--description "${SEED_REPO} ${SEED_PATH}/, scanned by make seed"
 	@ start=`date +%s`; count=0; \
 	for file in `find ${SEED_DIR}/${SEED_PATH} -name '*.md' | sort | head -n ${SEED_LIMIT}`; do \
@@ -137,7 +101,7 @@ seed-scan: release seed-fetch
 			-e 's|\.md$$||' -e 's|/|-|g'`; \
 		BORHAN_HOME=${SEED_HOME} ${CMD} memory add ${SEED_NAME} \
 			--session ${SEED_NAME} --message $$name \
-			--role assistant --role-name ${SEED_NAME} \
+			--role assistant --author ${SEED_NAME} \
 			-- "`cat $$file`" >/dev/null 2>&1 || { \
 				echo "FAIL: $$file"; exit 1; }; \
 		count=$$((count + 1)); \
@@ -146,24 +110,34 @@ seed-scan: release seed-fetch
 	echo "scanned $$count documents in $$((`date +%s` - start))s into ${SEED_HOME}"
 
 
-# What the scan produced, then a search, then the top hit read back in full.
-# Every command here goes through the same BORHAN_HOME the scan wrote to.
+# What the scan produced, then three searches, then the top hit read back with
+# the messages around it. Every command goes through the same BORHAN_HOME the
+# scan wrote to.
+#
+# Each search is concept groups rather than a sentence: words inside one group
+# are alternatives that compete for one slot, and separate groups are separate
+# things being asked about, which is what coverage scores. A group is one
+# argument, so quoting matters only for the `!` that marks one required.
 seed-test:
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory list
-	@ for query in \
-		"how do I borrow a value mutably" \
-		"what happens when a trait has an associated type" \
-		"the compiler should emit a deprecation warning"; \
-	do \
-		echo; echo "? $$query"; \
-		BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
-			--type sentence --limit 5 -- "$$query"; \
-	done
-	@ echo; echo "? the top hit, read back in full"
+	@ echo; echo "? borrowing a value mutably"
+	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
+		borrow,borrowed,borrowing mutable,mutably,mut --limit 5
+	@ echo; echo "? associated types on a trait"
+	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
+		trait,traits associated type,types --limit 5
+	@ echo; echo "? a deprecation warning from the compiler"
+	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
+		'!deprecated,deprecation' warning,warn,lint --limit 5
+	@ echo; echo "? what a word looks like in this memory before searching for it"
+	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory lexicon ${SEED_NAME} \
+		borrow Borrowing lifetimes rustc UNRESOLVED_QUESTIONS
+	@ echo; echo "? the top hit, and the messages around it"
 	@ top=`BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
-		--type sentence --limit 1 -- "how do I borrow a value mutably" \
-		2>/dev/null | awk '{print $$3}'`; \
-	BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory get ${SEED_NAME} --json $$top
+		borrow,borrowing mutable,mutably --limit 1 \
+		2>/dev/null | head -n 1 | awk '{print $$3}'`; \
+	BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory cursor ${SEED_NAME} $$top \
+		--before 0 --after 0 | head -n 20
 
 
 # Drops the scanned storage but keeps the fetched corpus, so a re-scan does not
@@ -192,14 +166,13 @@ dist-clean: clean
 	@ rm -rf ${BUILD_DIR}
 
 
-# Also drops the vendored model and the seed corpus; `make model` and
-# `make seed` fetch them again.
+# Also drops the seed corpus; `make seed` fetches it again.
 purge: dist-clean seed-clean
-	@ rm -rf $(CURDIR)/models $(CURDIR)/seed
+	@ rm -rf $(CURDIR)/seed
 
 
 ${BUILD_DIR}:
 	@ mkdir -p ${BUILD_DIR}
 
 
-.PHONY: all release dev start-dev model clippy check-style fmt check-arrow lint test docs open-docs clean dist-clean purge seed seed-fetch seed-scan seed-test seed-clean
+.PHONY: all release dev start-dev clippy check-style fmt lint test docs open-docs clean dist-clean purge seed seed-fetch seed-scan seed-test seed-clean

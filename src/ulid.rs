@@ -66,7 +66,7 @@ pub enum Error {
 }
 
 /// A ULID, stored as the 16 bytes that go into the database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ulid([u8; 16]);
 
 impl Ulid {
@@ -96,6 +96,19 @@ impl Ulid {
             return Err(Error::Random { source });
         }
         Ok(Self(bytes))
+    }
+
+    /// Unix milliseconds, right now.
+    ///
+    /// Here rather than in `chrono`, which borhan builds without its `clock`
+    /// feature, and here rather than in each caller, because this is already
+    /// the module that owns reading the clock. Saturates instead of failing: a
+    /// timestamp on a log row is not worth refusing a write over.
+    pub fn now() -> i64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => elapsed.as_millis() as i64,
+            Err(_) => 0,
+        }
     }
 
     /// The 16 bytes, for the `BLOB(16)` primary key.

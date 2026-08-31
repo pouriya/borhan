@@ -2,29 +2,13 @@
 name = "borhan"
 version = "0.1.0"
 edition = "2024"
-description = "Memory store backed by SQLite, LanceDB and model2vec embeddings"
+description = "Memory store: a SQLite source of truth under a tantivy index"
 authors = ["Pouriya Jahanbakhsh <pouriya.jb@gmail.com>"]
 
 [dependencies]
-# Vector store. lancedb pins arrow ^58, so every arrow-* crate here must stay
-# on 58.x — arrow 59 exists but its types will not unify with lancedb's.
-# default = [], so no aws/azure/gcs/remote/openai pulled in.
-lancedb = "0.37.1"
-arrow-array = "58.4.0"
-arrow-schema = "58.4.0"
-
 # Metadata / keyword store. `bundled` compiles SQLite from source: no
 # libsqlite3-dev on the host, same version on every machine.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
-
-# Static embeddings. `local-only` drops hf-hub + ureq so nothing is fetched
-# from HuggingFace at runtime; the model is vendored under models/ by
-# scripts/fetch-model.sh. `fancy-regex` is the pure-Rust tokenizer backend,
-# which avoids the oniguruma C dependency that the `onig` default would add.
-model2vec-rs = { version = "0.2.1", default-features = false, features = [
-    "local-only",
-    "fancy-regex",
-] }
 
 tokio = { version = "1.53.1", default-features = false, features = [
     "rt-multi-thread",
@@ -69,6 +53,47 @@ getrandom = "0.4.3"
 # `wasmbind`; `alloc` is there because `to_rfc3339_opts` returns a String.
 chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 
+# The inverted index: term dictionary, postings, positions, fieldnorms, BM25,
+# segment merging. Everything layer two of the design document describes, with
+# an FST-backed dictionary and a segment format that no hand-rolled SQLite
+# posting table is going to beat. What is *not* delegated is the tokenizer —
+# tantivy has no notion of ZWNJ, ک/ی folding or Persian morphology, and no
+# Snowball algorithm for Persian exists to delegate them to — and the scoring
+# loop, because group semantics, coverage and min-span proximity are not
+# expressible in the stock queries.
+#
+# default-features = false, then mmap and the two compressors back on. The
+# `stemmer` feature stays off even though borhan does stem English: what it
+# enables is `tantivy::tokenizer::Stemmer`, a `TokenFilter`, which can only run
+# inside an index-side analyzer chain — and `normalize::lemma` is also called on
+# query words by search.rs. Stemming in the chain only would fold the stored
+# term and not the one being looked up. rust-stemmers is taken directly below
+# instead, which is the same crate this feature would have pulled. `stopwords`
+# ships English stop lists that would be the wrong answer for a code-switched
+# room even if they were the right language.
+tantivy = { version = "0.26.1", default-features = false, features = [
+    "mmap",
+    "lz4-compression",
+    "columnar-zstd-compression",
+] }
+
+# English morphology, the second half of the normalizer. Snowball's English
+# algorithm is Porter2, and it is what makes `errors` and `error` one lemma
+# rather than two terms that never meet. Called directly rather than through
+# tantivy's `Stemmer` filter so that the query side and the index side go
+# through the same function; see the tantivy note above.
+#
+# Last released in 2019 and quiet since, which for this crate is the point: a
+# Snowball algorithm is a frozen specification, and a stemmer that changed its
+# output would invalidate every posting built by the previous version.
+rust-stemmers = "1.2.0"
+
+# Unicode NFC, the first step of the normalizer. Persian text arrives from
+# editors, phones and copy-paste in both composed and decomposed forms, and
+# `خطا` in two encodings is two term ids and a search that silently misses.
+# The only crate here that borhan did not already depend on.
+unicode-normalization = "0.1.24"
+
 # Breaking what gets stored into paragraphs and sentences. What arrives is
 # assumed to be Markdown — it is a chat transcript — and a CommonMark parser is
 # what tells a fenced code block from a list from a run of prose, which is the
@@ -76,13 +101,6 @@ chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 # default-features = false drops `html` (borhan renders nothing), `simd`,
 # `getopts` and `serde`; the pull parser is the whole of what is used.
 pulldown-cmark = { version = "0.13.4", default-features = false }
-
-# Only for `TryStreamExt::try_next`, to read LanceDB's result stream. lancedb
-# returns a `SendableRecordBatchStream` and re-exports nothing to consume it
-# with, so this is a direct dependency on a crate its own tree already carries.
-# default-features = false drops the executor, `async-await` sugar and the
-# compat shims; `std` is all a stream adaptor needs.
-futures = { version = "0.3.31", default-features = false, features = ["std"] }
 
 # Building the `memory get --json` array. Hand-written JSON is fine until the
 # first row holding a quote or a newline, and a stored sentence is exactly the
@@ -93,8 +111,6 @@ serde_json = "1.0.151"
 thiserror = "2.0.20"
 
 # Used only to flatten a `#[source]` chain into one line via `{:#}`.
-# model2vec-rs already returns anyhow::Error, so this is not a new dependency
-# in the tree — only a direct one.
 anyhow = "1.0"
 
 clap = { version = "4.6.6", default-features = false, features = [

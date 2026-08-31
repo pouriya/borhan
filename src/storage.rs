@@ -1,671 +1,407 @@
-//! The local store: `<home>/storage/`, holding the SQLite database and, beside
-//! it, one LanceDB table per embedding model.
+//! Layer one: the messages as they arrived, and nothing derived from them.
 //!
-//! [`Storage::initialize`] is the only thing here that makes a storage — the
-//! directory, the SQLite tables and the model's vector table, all of it "create
-//! if missing" so that it can be run twice or run again after a crash.
-//! Everything else goes through [`Storage::open`], which will not make the
-//! directory. That is the whole of "nothing is created implicitly": an agent
-//! with the wrong `--home` gets an error naming the missing mount instead of a
-//! new, empty store that silently remembers nothing.
+//! One directory per memory, under `<home>/storage/<name>/`, holding a SQLite
+//! database and — written by [`crate::index`], never by this module — a tantivy
+//! index beside it. A memory is deleted by unlinking its directory, and its
+//! document frequencies are its own, which is the point: `error` is a common
+//! word in an infrastructure room and a rare one in a scheduling room, and an
+//! IDF averaged across both is wrong for each.
+//!
+//! What lives here is the part that is never rebuilt. Messages arrive, are
+//! written verbatim, and are then split into units and sentences that are
+//! recorded as **byte offsets into the message body** rather than as copies of
+//! the text. A unit and the message it came from cannot drift apart if there is
+//! only one copy of the text, and slicing it back out is a join this code is
+//! doing anyway to display a result.
+//!
+//! Everything in [`crate::index`] is reconstructible from this module by a full
+//! rescan. Nothing in this module is reconstructible from anything.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use arrow_array::types::Float32Type;
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
-use futures::TryStreamExt;
-use lancedb::DistanceType;
-use lancedb::index::Index;
-use lancedb::index::scalar::BTreeIndexBuilder;
-use lancedb::index::vector::IvfPqIndexBuilder;
-use lancedb::query::{ExecutableQuery, QueryBase};
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag};
 use rusqlite::Connection;
 
 use crate::ulid::Ulid;
 
-/// The one database file. LanceDB tables will land beside it, in the same
-/// directory, under their own name.
+/// The one database file inside a memory's directory. The tantivy index sits
+/// beside it under [`crate::index::DIRECTORY`].
 const DATABASE: &str = "borhan.db";
 
-/// Longest name a caller may hand to [`Storage::create`], in characters. What
-/// lands in the column is this plus [`NAME_PREFIX`].
+/// Longest name a caller may hand to [`Storage::create`], in characters.
+///
+/// A name is a directory name and it is what every other command takes to find
+/// the memory, so it is `a-z`, `0-9` and `_` and nothing else. No prefix is put
+/// in front of it: unlike the old layout there are no shared tables for a name
+/// to collide with, because a memory *is* its own directory.
 const NAME_LIMIT: usize = 40;
 
-/// Put in front of every name before it is stored, so that the stored value
-/// *is* the table name and every table borhan makes on a memory's behalf is
-/// under this one namespace. Without it a memory called `memory` would name the
-/// table this schema already owns, and nothing about the charset rule would
-/// stop it.
-const NAME_PREFIX: &str = "memory_";
-
-/// Longest `memory.description`, in characters.
+/// Longest `memory.description`, in characters. Shown to the calling model, so
+/// it is prose about what the memory holds rather than a label.
 const DESCRIPTION_LIMIT: usize = 2000;
 
-/// Longest `content` in a memory's own table, in characters.
-///
-/// Characters, not bytes, which is the same rule the two limits above use: a
-/// byte limit would cut a Persian sentence at half the length of an English one
-/// for no reason a writer could see.
-const CONTENT_LIMIT: usize = 5000;
+/// Longest `memory.languages`, in characters. A comma-separated list like
+/// `fa,en`, reported by `memory list` so that a model composing a query knows
+/// which languages are worth expanding a concept group into.
+const LANGUAGES_LIMIT: usize = 64;
 
-/// Lines of a code block that make one paragraph.
+/// Longest feeder-supplied session or message identifier, in characters. A
+/// UUID in one deployment and a filename in another.
+const REFERENCE_LIMIT: usize = 64;
+
+/// Lines of a fenced code block that make one unit.
 ///
-/// Code has no sentences to find in it, so a line is the sentence and this is
-/// how many of them are held to be about one thing. A screenful: long enough
-/// that a function usually lands whole, short enough that a 500-line file does
-/// not become one vector that answers every query about it equally.
+/// Code has no sentences in it, so a line is the sentence and this is how many
+/// of them are held to be about one thing. A screenful: long enough that a
+/// function usually lands whole, short enough that a 500-line paste does not
+/// become one unit that answers every query about it equally.
 const CODE_LINES: usize = 20;
-
-/// Longest `postfix` in a memory's own table, in characters.
-///
-/// A postfix is the whitespace one row was followed by, so this only has to be
-/// long enough for the gaps a writer actually leaves. Sixteen newlines is
-/// already a lot of them, and a run longer than that carries no more meaning
-/// than the run that gets kept.
-const POSTFIX_LIMIT: usize = 16;
-
-/// Words a row needs before it is worth a vector.
-///
-/// A row is always written; this only decides whether one is embedded. A two-
-/// word row is not an answer to anything, and worse than useless in a ranking:
-/// a vector built from two tokens sits close to every query that mentions
-/// either of them, so `}` and `Compiler` and `// code` take places that a
-/// sentence saying something would have had. Measured on 24,343 sentences of
-/// rust-lang/rfcs, a third of every top ten was a row under this line.
-///
-/// What is lost is the ability to find a heading or a stray line of code by
-/// searching for it alone. It is still not lost from the index: [`WINDOW`] puts
-/// it inside the vector of the sentence beside it, so a search for it lands on
-/// the prose it labels — which is the better answer anyway.
-const MINIMUM_WORDS: usize = 5;
-
-/// How much of each neighbouring sentence goes into a sentence's vector.
-///
-/// A sentence on its own is a poor thing to embed. "It doubles the dose" says
-/// nothing about what *it* is, and the model has no way to know: potion is a
-/// lookup table over tokens, so a vector holds only the words it was given. The
-/// sentence before it named the drug and the one after it says what happens
-/// then, and both are what somebody searching would actually type.
-///
-/// So a sentence is embedded together with the back of the sentence before it
-/// and the front of the one after — half of each, which is this. The half
-/// nearest the sentence, because that is the half that is about it.
-///
-/// This buys context for no vectors at all: the same rows are embedded, each
-/// from more text. Measured over 3,737 GitHub-docs sections and 287 sections of
-/// the WHO emergency-care workbook, 20 queries each, recall@1 with document
-/// aggregation went 35% -> 55% and 20% -> 30%; the paraphrased half of the
-/// queries, the ones a person rather than a manual would write, went 40% -> 60%
-/// at recall@10. A quarter did less and the whole neighbour did no better and
-/// cost recall@10, the vector by then having drifted off the sentence and onto
-/// the passage.
-///
-/// It does not lift the floor: below [`MINIMUM_WORDS`] a row is still not
-/// embedded. A three-word row borrowing thirty words from around it would be a
-/// vector for text that is not in the row a hit returns.
-const WINDOW: f64 = 0.5;
-
-/// Put in front of a model's name to make the LanceDB table its vectors live
-/// in. One table per model is the whole migration story: a new model is a new
-/// table beside the old one, embeddings are rebuilt into it at leisure, and
-/// nothing has to be dropped to try one out.
-///
-/// Not [`NAME_PREFIX`]: that one means "the rows of one memory", and a model's
-/// table is the opposite shape — every memory's vectors, one model.
-const EMBEDDING_PREFIX: &str = "embedding_";
-
-/// The column the embeddings themselves live in.
-const VECTOR_COLUMN: &str = "vector";
-
-/// Rows in a model's table before borhan indexes it.
-///
-/// LanceDB will not index an empty table — product quantisation trains 256
-/// centroids and refuses with "Not enough rows to train PQ" below that — so the
-/// index cannot be made when the table is. It is built by the first
-/// [`Vectors::add`] that takes the table over this line instead. 1024 rather
-/// than the 256 minimum because under a few thousand rows a flat scan of the
-/// whole column beats an approximate lookup, so indexing earlier would cost
-/// recall and buy nothing.
-const INDEX_THRESHOLD: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Could not create storage directory {path:?}")]
-    CreateDirectory {
+    #[error("memory name is empty")]
+    Empty,
+
+    #[error("memory name {name:?} is longer than {NAME_LIMIT} characters")]
+    Long { name: String },
+
+    #[error("memory name {name:?} has a character outside a-z, 0-9 and _")]
+    Charset { name: String },
+
+    #[error("description is longer than {DESCRIPTION_LIMIT} characters")]
+    Description,
+
+    #[error("languages is longer than {LANGUAGES_LIMIT} characters")]
+    Languages,
+
+    #[error("{what} {reference:?} is longer than {REFERENCE_LIMIT} characters")]
+    Reference {
+        what: &'static str,
+        reference: String,
+    },
+
+    #[error("memory {name:?} already exists at {path}")]
+    Exists { name: String, path: PathBuf },
+
+    #[error("no memory named {name:?} at {path} — `borhan memory create {name}` first")]
+    Missing { name: String, path: PathBuf },
+
+    #[error("could not create {path}")]
+    Create {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("Could not open SQLite database {path:?}")]
+    #[error("could not read {path}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("could not open the database at {path}")]
     Open {
         path: PathBuf,
         #[source]
         source: rusqlite::Error,
     },
 
-    #[error("Could not create the schema in SQLite database {path:?}")]
+    #[error("could not apply the schema to {path}")]
     Schema {
         path: PathBuf,
         #[source]
         source: rusqlite::Error,
     },
 
-    #[error("Memory name is {characters} characters, and it must be 1 to {NAME_LIMIT}")]
-    NameLength { characters: usize },
-
-    #[error("Memory name {name:?} contains {character:?}, and only a-z, 0-9 and _ are allowed")]
-    NameCharacter { name: String, character: char },
-
-    #[error("Memory {name:?} already exists")]
-    Duplicate { name: String },
-
-    #[error(
-        "Memory description is {characters} characters, and it must be at most {DESCRIPTION_LIMIT}"
-    )]
-    Description { characters: usize },
-
-    #[error("Could not look up memory {name:?} in SQLite database {path:?}")]
-    Lookup {
-        name: String,
+    #[error("could not write to {path}")]
+    Write {
         path: PathBuf,
         #[source]
         source: rusqlite::Error,
     },
 
-    #[error("Could not make an identifier for the memory")]
+    #[error("could not query {path}")]
+    Query {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    #[error("message {reference:?} is already stored in session {session:?}")]
+    Duplicate { session: String, reference: String },
+
+    #[error("no unit {id} in this memory")]
+    Unknown { id: String },
+
+    #[error("could not make a ULID")]
     Identifier {
         #[source]
         source: crate::ulid::Error,
     },
-
-    #[error("Could not open a transaction in SQLite database {path:?}")]
-    Transaction {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error("Could not create table {name:?} in SQLite database {path:?}")]
-    Table {
-        name: String,
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error("Could not insert the memory into SQLite database {path:?}")]
-    Insert {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error("Could not read the memories out of SQLite database {path:?}")]
-    List {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error("Memory {name:?} has a {length}-byte id, and a ULID is 16 bytes")]
-    Corrupt { name: String, length: usize },
-
-    #[error("Memory {name:?} is not stored under the {NAME_PREFIX:?} prefix that `create` writes")]
-    Prefix { name: String },
-
-    #[error("Could not count what is in table {table:?} of SQLite database {path:?}")]
-    Count {
-        table: String,
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error(
-        "Table {table:?} has a row of type {kind:?}, and a row is a session, a message, a paragraph or a sentence"
-    )]
-    Layer { table: String, kind: String },
-
-    #[error("No memory named {name:?}")]
-    Unknown { name: String },
-
-    #[error("Adding a {kind} needs {field}")]
-    Needs {
-        kind: &'static str,
-        field: &'static str,
-    },
-
-    #[error("Content is {characters} characters, and it must be 1 to {CONTENT_LIMIT}")]
-    Content { characters: usize },
-
-    #[error("Memory {memory:?} has no message {message:?} to hang a {kind} on")]
-    NoMessage {
-        memory: String,
-        message: String,
-        kind: &'static str,
-    },
-
-    #[error("Memory {memory:?} has no paragraph {paragraph} to hang a sentence on")]
-    NoParagraph { memory: String, paragraph: Ulid },
-
-    #[error("Memory {memory:?} already has a message {message:?}")]
-    DuplicateMessage { memory: String, message: String },
-
-    #[error("Model name is empty, and it has to name a LanceDB table")]
-    ModelEmpty,
-
-    #[error(
-        "Model name {model:?} contains {character:?}, and only a-z, A-Z, 0-9, _ and - are allowed"
-    )]
-    ModelCharacter { model: String, character: char },
-
-    #[error("Storage directory {path:?} is not valid UTF-8, and LanceDB is addressed by a URI")]
-    PathEncoding { path: PathBuf },
-
-    // `lancedb::Error` is over 130 bytes on its own, and every `Result` in this
-    // module would carry that width on the success path too, so the LanceDB
-    // sources below are boxed. The failures are all cold — a missing table, a
-    // refused write — and one allocation on the way out of them is nothing.
-    #[error("Could not open LanceDB in {path:?}")]
-    Connect {
-        path: PathBuf,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error("Could not list the LanceDB tables in {path:?}")]
-    Tables {
-        path: PathBuf,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error("Could not create LanceDB table {name:?} in {path:?}")]
-    CreateTable {
-        name: String,
-        path: PathBuf,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    // Says "the same --model" rather than naming one: what reaches here is the
-    // model's own name, and what the user typed may have been the directory it
-    // was loaded from, so any argument spelled out here would be a guess.
-    #[error(
-        "Storage {path:?} has no LanceDB table {name:?}: nothing has been embedded here with model {model}. Run `borhan init storage` with the same `--model` to make one."
-    )]
-    NoTable {
-        name: String,
-        model: String,
-        path: PathBuf,
-    },
-
-    #[error("Could not open LanceDB table {name:?} in {path:?}")]
-    OpenTable {
-        name: String,
-        path: PathBuf,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error("Could not read the schema of LanceDB table {name:?}")]
-    TableSchema {
-        name: String,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error(
-        "LanceDB table {name:?} has no {VECTOR_COLUMN:?} column of fixed-width floats, so it was not made by borhan"
-    )]
-    TableShape { name: String },
-
-    #[error(
-        "Embedding for {id} is {dimensions} numbers and LanceDB table {name:?} holds {expected}: that is a different model"
-    )]
-    Dimensions {
-        id: String,
-        name: String,
-        dimensions: usize,
-        expected: usize,
-    },
-
-    #[error("Could not build a record batch for LanceDB table {name:?}")]
-    Batch {
-        name: String,
-        #[source]
-        source: Box<arrow_schema::ArrowError>,
-    },
-
-    #[error("Could not write {count} embeddings to LanceDB table {name:?}")]
-    Add {
-        count: usize,
-        name: String,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error("Could not index column {column:?} of LanceDB table {name:?}")]
-    IndexColumn {
-        name: String,
-        column: String,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error("Could not search LanceDB table {name:?}")]
-    Search {
-        name: String,
-        #[source]
-        source: Box<lancedb::Error>,
-    },
-
-    #[error("Search of LanceDB table {name:?} returned no usable {column:?} column")]
-    Column { name: String, column: String },
 }
 
-/// One row of the `memory` table.
-#[derive(Debug, Clone)]
-pub struct Memory {
-    pub id: Ulid,
-
-    /// As the caller gave it to [`Storage::create`], with the [`NAME_PREFIX`]
-    /// taken back off. The prefix exists to keep table names in one namespace,
-    /// and that is nothing a reader has to look at.
-    pub name: String,
-    pub description: Option<String>,
-    /// Milliseconds since the Unix epoch; the same instant as `id`'s timestamp.
-    pub created_at: i64,
-
-    /// What is in the memory's own table.
-    pub counts: Counts,
-}
-
-/// How much a memory holds, counted out of its own table.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Counts {
-    pub sessions: u64,
-    pub messages: u64,
-    pub paragraphs: u64,
-    pub sentences: u64,
-
-    /// Messages whose `role` is `assistant`, and whose `role` is `user`.
-    ///
-    /// These need not add up to `messages`. `role` is not constrained by the
-    /// schema — nothing in SQLite is — so a row written by something other than
-    /// borhan can carry a third value or none at all, and it is counted in
-    /// `messages` and in neither of these. A reader showing the two as
-    /// percentages should expect them to fall short of 100 rather than assume
-    /// one is `messages` minus the other.
-    pub assistant: u64,
-    pub user: u64,
-}
-
-/// Which layer of a transcript a row covers.
-///
-/// The `type` column of a memory's table has a fourth value, `session`, which
-/// is not here on purpose: a session is a container, there is no text that *is*
-/// one, and embedding the whole of a day's conversation would return it for
-/// every query.
-///
-/// Two of the three left are embedded. `Paragraph` is not, any more: it is a
-/// row, a cursor and the thing a sentence hangs off, but it gets no vector.
-/// What it used to do for a search, [`WINDOW`] does inside the sentence's own
-/// vector, and for less — a paragraph is one sentence about two thirds of the
-/// time, which made a third of those vectors byte-identical copies of the
-/// sentence under them, competing with it for the same places in the results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Message,
-    Paragraph,
-    Sentence,
-}
-
-impl Kind {
-    /// What goes in the column, and what a filter compares against.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Message => "message",
-            Self::Paragraph => "paragraph",
-            Self::Sentence => "sentence",
-        }
-    }
-
-    /// Read one back, from a CLI flag or an API field.
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "message" => Some(Self::Message),
-            "paragraph" => Some(Self::Paragraph),
-            "sentence" => Some(Self::Sentence),
-            _ => None,
-        }
-    }
-}
-
-/// Who spoke.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Who wrote a message. A small enum because it is a filter — "only what the
+/// user said" is a question worth asking — and filters want an indexable
+/// integer, not a string compared a hundred thousand times.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
+    Tool,
 }
 
 impl Role {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
 
     pub fn parse(text: &str) -> Option<Self> {
         match text {
-            "user" => Some(Self::User),
-            "assistant" => Some(Self::Assistant),
+            "user" => Some(Role::User),
+            "assistant" => Some(Role::Assistant),
+            "tool" => Some(Role::Tool),
             _ => None,
+        }
+    }
+
+    pub fn code(&self) -> u64 {
+        match self {
+            Role::User => 0,
+            Role::Assistant => 1,
+            Role::Tool => 2,
+        }
+    }
+
+    pub fn from_code(code: u64) -> Role {
+        match code {
+            0 => Role::User,
+            2 => Role::Tool,
+            _ => Role::Assistant,
         }
     }
 }
 
-/// One row on its way into a memory's own table.
-///
-/// Which fields are needed depends on `kind`, and each layer is anchored to the
-/// one above it:
-///
-/// - `Message` needs `session`, `message` and `role`. It is the only kind that
-///   names a session, and adding one to a session nothing has mentioned yet
-///   writes the `session` row too.
-/// - `Paragraph` needs `message`, and takes the session, the role and the role
-///   name off that message's row.
-/// - `Sentence` needs `paragraph`, and takes everything off that paragraph's
-///   row.
-///
-/// So a row cannot be written without its parent already being there, and the
-/// ids on it cannot disagree with the ids above it — they are copied down, not
-/// supplied twice.
+/// One memory, as `memory list` shows it.
 #[derive(Debug, Clone)]
-pub struct Entry {
-    pub kind: Kind,
-
-    /// The feeder's session identifier. Only read for a `Message`.
-    pub session: Option<String>,
-
-    /// The feeder's message identifier: which message this is, for a
-    /// `Message`, or which one it belongs to, for a `Paragraph`.
-    pub message: Option<String>,
-
-    /// The paragraph a `Sentence` belongs to.
-    pub paragraph: Option<Ulid>,
-
-    /// Only read for a `Message`, where it is required.
-    pub role: Option<Role>,
-
-    /// The model's identifier or the user's name. Only read for a `Message`.
-    pub role_name: Option<String>,
-
-    /// The text, as Markdown. Broken into paragraphs and sentences by
-    /// [`Storage::add`] unless `kind` is `Sentence`, which is taken as written.
-    pub content: String,
-}
-
-/// One row [`Storage::add`] wrote, and the text a vector for it is made of.
-///
-/// The text is returned rather than read back out of the table because it is
-/// not in the table: a message's is the whole of what came in, which is kept
-/// only as its sentences, and a sentence's is that sentence *with its
-/// neighbours around it* (see [`WINDOW`]), which is a string that exists
-/// nowhere else. What a hit reads back is still the row itself — this is what
-/// the vector was built from, not what anyone is shown.
-#[derive(Debug, Clone)]
-pub struct Row {
+pub struct Memory {
     pub id: Ulid,
-    pub kind: Kind,
-    pub text: String,
-
-    /// Whether a vector should be made of `text`. False for a row under
-    /// [`MINIMUM_WORDS`], and false for every paragraph — see [`Kind`]. The row
-    /// is written either way — reassembling the message above it needs it, and
-    /// so does walking the cursor — it just does not become something a search
-    /// can land on directly.
-    pub embed: bool,
-}
-
-/// One row read back by [`Storage::get`], with its text put back together.
-///
-/// Only a sentence keeps its content, so `text` is reassembled for the layers
-/// above it: a paragraph's is its sentences in `position` order, and a
-/// message's is every sentence under it, ordered by its paragraph first and by
-/// itself second. That two-level ordering is the reason `position` exists — a
-/// message's sentences all number from zero inside their own paragraph, so
-/// sorting them by `position` alone would interleave the paragraphs, and
-/// sorting by `id` would scramble a split that happened inside one millisecond.
-#[derive(Debug, Clone)]
-pub struct Record {
-    pub id: Ulid,
-    pub kind: Kind,
-
-    /// The feeder's identifiers, as they were handed to [`Storage::add`].
-    pub session: String,
-    pub message: Option<String>,
-
-    /// The paragraph a sentence hangs off. `None` above that layer.
-    pub paragraph: Option<Ulid>,
-
-    /// Reading order among siblings: paragraphs within their message,
-    /// sentences within their paragraph, messages within their session.
-    pub position: i64,
-
-    pub role: Option<Role>,
-    pub role_name: Option<String>,
-
-    /// Unix milliseconds, the same value the `id` leads with.
+    pub name: String,
+    pub description: Option<String>,
+    pub languages: String,
     pub created_at: i64,
-
-    /// What the row says, whether or not the row is what stores it.
-    pub text: String,
+    pub sessions: u64,
+    pub messages: u64,
+    pub units: u64,
 }
 
-/// One embedding on its way into a model's table.
+/// A message on its way in.
 #[derive(Debug, Clone)]
-pub struct Vector {
-    /// The memory it belongs to, named as the user named it — no
-    /// [`NAME_PREFIX`], which never leaves this module.
-    pub memory: String,
+pub struct Entry<'a> {
+    /// The feeder's session identifier — a thread id, a channel, a filename.
+    pub session: &'a str,
+    /// The feeder's message identifier, if it has one. Used to reject a
+    /// double-send of the same message, and carried back out on every hit.
+    pub message: Option<&'a str>,
+    pub author: &'a str,
+    pub role: Role,
+    /// Unix milliseconds. Supplied rather than taken from the clock, because a
+    /// transcript is usually being replayed rather than watched.
+    pub ts: i64,
+    /// The text, verbatim. Read as Markdown when it is split, stored untouched.
+    pub body: &'a str,
+}
 
-    pub kind: Kind,
-
-    /// The row in `memory_<memory>` this was embedded from. Stored as the
-    /// 26-character text rather than the 16 bytes, because LanceDB filters are
-    /// SQL strings and a text literal is something you can write in one.
+/// A unit — a paragraph — as stored: an id and a byte range into the message.
+#[derive(Debug, Clone)]
+pub struct Unit {
     pub id: Ulid,
-
-    pub embedding: Vec<f32>,
+    pub start: usize,
+    pub end: usize,
 }
 
-/// One result of [`Vectors::search`].
-///
-/// No `memory` field: a search is filtered to one memory, so it would be the
-/// name the caller passed in, handed back.
+/// What [`Storage::add`] wrote, and what [`crate::index`] needs to index it.
 #[derive(Debug, Clone)]
-pub struct Hit {
-    /// As stored. Not parsed back into a [`Kind`]: it is on its way to a screen
-    /// or to a SQL predicate, and neither needs it typed.
-    pub kind: String,
-
-    /// The 26-character ULID of the row in `memory_<memory>`.
-    pub id: String,
-
-    /// Cosine distance, so 0 is identical and smaller is closer.
-    pub distance: f32,
+pub struct Written {
+    pub session: Ulid,
+    pub message: Ulid,
+    pub seq: i64,
+    pub units: Vec<Unit>,
 }
 
-/// What [`Storage::initialize`] found already there, and what it had to make.
-#[derive(Debug, Clone, Copy)]
-pub struct Initialized {
-    /// The storage directory was there before the call.
-    pub existing: bool,
-
-    /// The model's LanceDB table was made by this call.
-    pub vectors: bool,
+/// A unit resolved back to everything a result line needs, in one query.
+#[derive(Debug, Clone)]
+pub struct Located {
+    pub unit: Ulid,
+    pub unit_seq: i64,
+    pub message: Ulid,
+    pub message_ref: Option<String>,
+    pub session: Ulid,
+    pub session_ref: String,
+    pub seq: i64,
+    pub author: String,
+    pub role: Role,
+    pub ts: i64,
+    pub start: usize,
+    pub end: usize,
+    pub body: String,
 }
 
-/// An open storage directory.
+impl Located {
+    /// The unit's own text, sliced out of the message body it was never copied
+    /// from.
+    pub fn text(&self) -> &str {
+        &self.body[self.start..self.end]
+    }
+}
+
+/// A whole message, as the cursor tool returns it.
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub id: Ulid,
+    pub reference: Option<String>,
+    pub seq: i64,
+    pub author: String,
+    pub role: Role,
+    pub ts: i64,
+    pub body: String,
+    /// True for the message the cursor pointed at, so the caller can see where
+    /// in the window it landed.
+    pub anchor: bool,
+}
+
+/// One memory's SQLite database.
 pub struct Storage {
-    /// The directory itself: LanceDB is addressed by it, and it is what the
-    /// SQLite errors name.
-    directory: PathBuf,
-
-    /// Only for error messages; the connection knows its own path.
+    pub directory: PathBuf,
     database: PathBuf,
     connection: Connection,
 }
 
 impl Storage {
-    /// Make a storage directory, or finish making one that is half there:
-    /// the directory, the SQLite database and its tables, and the LanceDB
-    /// table for the model whose vectors it will hold.
-    ///
-    /// Every step is "create if missing", so running this twice is running it
-    /// once, and running it after a crash repairs whatever did not land.
-    /// [`Initialized`] says which parts were actually made, for the caller to
-    /// report.
-    ///
-    /// This is the only thing in borhan that creates anything. Every other
-    /// entry point goes through [`Storage::open`], which fails on a directory
-    /// that is not there — otherwise a typo'd `--home` would quietly answer
-    /// with an empty store instead of naming the mount that is missing.
-    pub async fn initialize<P: AsRef<Path>>(
-        directory: P,
-        model: &str,
-        dimensions: usize,
-    ) -> Result<Initialized, Error> {
-        let directory = directory.as_ref();
-        // Read before anything is made, because afterwards there is no way to
-        // tell "I just made this" from "it was already here".
-        let existing = directory.is_dir();
-        if let Err(source) = fs::create_dir_all(directory) {
-            return Err(Error::CreateDirectory {
-                path: directory.to_path_buf(),
+    /// Make a memory: its directory, its database, and the one row describing
+    /// it. Fails if the directory is already there, because a name that is
+    /// taken is the one thing a caller has to be told about rather than
+    /// silently joined to.
+    pub fn create(
+        root: &Path,
+        name: &str,
+        description: Option<&str>,
+        languages: &str,
+    ) -> Result<(Self, Ulid), Error> {
+        check_name(name)?;
+        if let Some(text) = description
+            && text.chars().count() > DESCRIPTION_LIMIT
+        {
+            return Err(Error::Description);
+        }
+        if languages.chars().count() > LANGUAGES_LIMIT {
+            return Err(Error::Languages);
+        }
+
+        let directory = root.join(name);
+        if directory.exists() {
+            return Err(Error::Exists {
+                name: name.to_string(),
+                path: directory,
+            });
+        }
+        if let Err(source) = fs::create_dir_all(&directory) {
+            return Err(Error::Create {
+                path: directory,
                 source,
             });
         }
 
-        // Opening is what makes the database file and, in `open`, its tables.
-        let storage = Self::open(directory)?;
-        let vectors = storage.create_vectors(model, dimensions).await?;
-        Ok(Initialized { existing, vectors })
+        let storage = Self::attach(directory)?;
+        let id = match Ulid::new() {
+            Ok(id) => id,
+            Err(source) => return Err(Error::Identifier { source }),
+        };
+        let written = storage.connection.execute(
+            "INSERT INTO memory (id, ulid, name, description, languages, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                id.bytes().as_slice(),
+                id.to_string(),
+                name,
+                description,
+                languages,
+                id.milliseconds() as i64,
+            ],
+        );
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: storage.database.clone(),
+                source,
+            });
+        }
+        Ok((storage, id))
     }
 
-    /// Open `<directory>/borhan.db`, creating the file and the tables if they
-    /// are missing — but not the directory. That one belongs to
-    /// [`Storage::initialize`], so that opening a storage which was never made
-    /// is an error rather than a new empty one.
-    pub fn open<P: AsRef<Path>>(directory: P) -> Result<Self, Error> {
-        let directory = directory.as_ref();
+    /// Open an existing memory. Will not create one: a wrong `--home` or a
+    /// misspelled name has to be an error naming what was looked for, never a
+    /// new empty memory that silently remembers nothing.
+    pub fn open(root: &Path, name: &str) -> Result<Self, Error> {
+        check_name(name)?;
+        let directory = root.join(name);
+        if !directory.join(DATABASE).exists() {
+            return Err(Error::Missing {
+                name: name.to_string(),
+                path: directory,
+            });
+        }
+        Self::attach(directory)
+    }
+
+    /// Every memory under `root`, oldest first, with its counts.
+    ///
+    /// There is no registry to read: a memory is a directory, so the listing is
+    /// the directory. A subdirectory without a database is skipped rather than
+    /// reported, because that is what a half-finished `create` and a stray
+    /// `mkdir` both look like.
+    pub fn list(root: &Path) -> Result<Vec<Memory>, Error> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(source) => {
+                return Err(Error::Read {
+                    path: root.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        let mut memories = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) => {
+                    return Err(Error::Read {
+                        path: root.to_path_buf(),
+                        source,
+                    });
+                }
+            };
+            let path = entry.path();
+            if !path.join(DATABASE).exists() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let storage = Self::open(root, name)?;
+            memories.push(storage.describe()?);
+        }
+        memories.sort_by_key(|memory| memory.created_at);
+        Ok(memories)
+    }
+
+    /// Open the database and apply the schema, without touching the directory.
+    fn attach(directory: PathBuf) -> Result<Self, Error> {
         let database = directory.join(DATABASE);
         let connection = match Connection::open(&database) {
             Ok(connection) => connection,
@@ -677,24 +413,90 @@ impl Storage {
             }
         };
 
-        // No `CHECK` and no `UNIQUE`: every rule about what a name may look
-        // like, and whether one is already taken, lives in `create` and only
-        // there. The widths in `VARCHAR(47)` are documentation — SQLite reads
-        // them as affinity and enforces nothing — so the table describes the
-        // shape and `create` is what holds it to it. 47 is the 40 characters a
-        // caller may pass plus the `memory_` `create` puts in front of them.
+        // Every primary key is a ULID stored as a 16-byte blob: byte order is
+        // time order and SQLite compares blobs with memcmp, so `ORDER BY id` is
+        // chronological and a time range is a contiguous key range.
         //
-        // The table keeps its implicit rowid. An FTS5 index over `name` and
-        // `description` needs one to point at (`content=memory`), and that is
-        // the next thing to land here.
+        // `message.seq` is gapless within a session and it is what makes the
+        // cursor tool a range scan. Timestamps collide, arrive out of order and
+        // are supplied by the feeder; an ordinal this code assigns cannot.
+        //
+        // `unit` and `sentence` hold offsets and no text. The offsets are byte
+        // offsets into `message.body`, which is the only copy of the text.
+        //
+        // The two log tables cost nothing today and are the entire training set
+        // for a reranker later: a search that returns twenty hits followed by a
+        // cursor call on the seventh is a relevance label generated for free
+        // during normal operation, and it cannot be recovered afterwards.
         let schema = "
             CREATE TABLE IF NOT EXISTS memory (
-                id          BLOB(16)      NOT NULL PRIMARY KEY,
-                ulid        TEXT          NOT NULL,
-                name        VARCHAR(47)   NOT NULL,
+                id          BLOB(16)    NOT NULL PRIMARY KEY,
+                ulid        TEXT        NOT NULL,
+                name        VARCHAR(40) NOT NULL,
                 description VARCHAR(2000),
-                created_at  INTEGER       NOT NULL
+                languages   VARCHAR(64) NOT NULL,
+                created_at  INTEGER     NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS session (
+                id           BLOB(16)    NOT NULL PRIMARY KEY,
+                ulid         TEXT        NOT NULL,
+                external_ref VARCHAR(64) NOT NULL UNIQUE,
+                started_at   INTEGER     NOT NULL,
+                ended_at     INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS message (
+                id           BLOB(16)    NOT NULL PRIMARY KEY,
+                ulid         TEXT        NOT NULL,
+                session_id   BLOB(16)    NOT NULL,
+                external_ref VARCHAR(64),
+                seq          INTEGER     NOT NULL,
+                author       VARCHAR(64) NOT NULL,
+                role         INTEGER     NOT NULL,
+                ts           INTEGER     NOT NULL,
+                body         TEXT        NOT NULL,
+                UNIQUE (session_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS message_ts ON message (ts);
+            CREATE UNIQUE INDEX IF NOT EXISTS message_ref
+                ON message (session_id, external_ref);
+
+            CREATE TABLE IF NOT EXISTS unit (
+                id         BLOB(16) NOT NULL PRIMARY KEY,
+                message_id BLOB(16) NOT NULL,
+                seq        INTEGER  NOT NULL,
+                byte_start INTEGER  NOT NULL,
+                byte_end   INTEGER  NOT NULL,
+                UNIQUE (message_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS sentence (
+                unit_id    BLOB(16) NOT NULL,
+                seq        INTEGER  NOT NULL,
+                byte_start INTEGER  NOT NULL,
+                byte_end   INTEGER  NOT NULL,
+                PRIMARY KEY (unit_id, seq)
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS index_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS search_log (
+                id            BLOB(16) NOT NULL PRIMARY KEY,
+                ts            INTEGER  NOT NULL,
+                groups_json   TEXT     NOT NULL,
+                returned_json TEXT     NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS expansion_log (
+                search_id BLOB(16) NOT NULL,
+                unit_id   BLOB(16) NOT NULL,
+                ts        INTEGER  NOT NULL,
+                PRIMARY KEY (search_id, unit_id)
+            ) WITHOUT ROWID;
         ";
         if let Err(source) = connection.execute_batch(schema) {
             return Err(Error::Schema {
@@ -704,791 +506,300 @@ impl Storage {
         }
 
         Ok(Self {
-            directory: directory.to_path_buf(),
+            directory,
             database,
             connection,
         })
     }
 
-    /// Store a new memory, give it its own table, and return the ULID it was
-    /// filed under. The row and the table are one transaction: a memory
-    /// without a table, or a table nothing knows about, is not a state
-    /// anything downstream has to handle.
-    ///
-    /// `name` is `a-z`, `0-9` and `_`, and unique across the table: it
-    /// identifies the memory to a human, and it has to survive being used as a
-    /// SQLite or LanceDB table name, where anything else would need quoting to
-    /// be safe. What goes in the column is [`NAME_PREFIX`] followed by what was
-    /// passed, so a caller can only ever name a table inside that namespace.
-    pub fn create(&self, name: &str, description: Option<&str>) -> Result<Ulid, Error> {
-        check_name(name)?;
-        if let Some(description) = description {
-            let characters = description.chars().count();
-            if characters > DESCRIPTION_LIMIT {
-                return Err(Error::Description { characters });
-            }
-        }
-
-        // The name as it is stored, which is also the name of any table this
-        // memory gets later. The prefix is what keeps a caller out of the rest
-        // of the database, and it doubles as the reason a leading digit is
-        // allowed here: `2024` on its own is not a SQLite identifier, but
-        // `memory_2024` is.
-        let stored = format!("{NAME_PREFIX}{name}");
-
-        // Last, because it is the only rule that costs a query. Nothing in the
-        // database enforces it, so it is a race between two writers by
-        // construction — one process is what borhan is built around, though:
-        // the server owns the storage, and the CLI either owns it or talks to
-        // that server. Add a `UNIQUE` index on `name` the day two things can
-        // write at once.
-        let taken = self.connection.query_row(
-            "SELECT count(*) FROM memory WHERE name = ?1",
-            [&stored],
-            |row| row.get::<_, i64>(0),
+    /// The memory's own row, plus the three counts `memory list` prints.
+    pub fn describe(&self) -> Result<Memory, Error> {
+        let row = self.connection.query_row(
+            "SELECT id, name, description, languages, created_at FROM memory LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
         );
-        match taken {
-            Ok(0) => {}
-            Ok(_) => {
-                return Err(Error::Duplicate {
-                    name: name.to_string(),
-                });
-            }
+        let (id, name, description, languages, created_at) = match row {
+            Ok(row) => row,
             Err(source) => {
-                return Err(Error::Lookup {
-                    name: name.to_string(),
+                return Err(Error::Query {
                     path: self.database.clone(),
                     source,
                 });
             }
+        };
+
+        let mut counts = [0u64; 3];
+        for (at, table) in ["session", "message", "unit"].iter().enumerate() {
+            let query = format!("SELECT COUNT(*) FROM {table}");
+            match self
+                .connection
+                .query_row(&query, [], |row| row.get::<_, i64>(0))
+            {
+                Ok(count) => counts[at] = count as u64,
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            }
         }
 
-        let id = match Ulid::new() {
+        Ok(Memory {
+            id: identifier(&id),
+            name,
+            description,
+            languages,
+            created_at,
+            sessions: counts[0],
+            messages: counts[1],
+            units: counts[2],
+        })
+    }
+
+    /// Persist one message and the units and sentences it splits into.
+    ///
+    /// All of it in one transaction, and the raw message written first. A crash
+    /// between the message and its units leaves a message that a rescan will
+    /// pick up; a crash that left half a message's units behind would leave a
+    /// unit that is invisible to search and undetectable afterwards.
+    ///
+    /// Indexing is *not* done here. The caller writes the returned units into
+    /// tantivy, because that index is derived and this module only ever writes
+    /// things that are not.
+    pub fn add(&mut self, entry: &Entry<'_>) -> Result<Written, Error> {
+        if entry.session.chars().count() > REFERENCE_LIMIT {
+            return Err(Error::Reference {
+                what: "session",
+                reference: entry.session.to_string(),
+            });
+        }
+        if let Some(reference) = entry.message
+            && reference.chars().count() > REFERENCE_LIMIT
+        {
+            return Err(Error::Reference {
+                what: "message",
+                reference: reference.to_string(),
+            });
+        }
+
+        let transaction = match self.connection.transaction() {
+            Ok(transaction) => transaction,
+            Err(source) => {
+                return Err(Error::Write {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+
+        // The session, found or made. `external_ref` is unique, so the second
+        // message of a conversation finds the row the first one wrote.
+        let found = transaction.query_row(
+            "SELECT id FROM session WHERE external_ref = ?1",
+            rusqlite::params![entry.session],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        let session = match found {
+            Ok(bytes) => identifier(&bytes),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let id = match Ulid::new() {
+                    Ok(id) => id,
+                    Err(source) => return Err(Error::Identifier { source }),
+                };
+                let written = transaction.execute(
+                    "INSERT INTO session (id, ulid, external_ref, started_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        id.bytes().as_slice(),
+                        id.to_string(),
+                        entry.session,
+                        entry.ts
+                    ],
+                );
+                if let Err(source) = written {
+                    return Err(Error::Write {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+                id
+            }
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+
+        // The next ordinal in this session. Gapless, assigned here, and never
+        // taken from the feeder: the cursor tool asks for "three messages
+        // before this one" and answers it as a range scan, which only works if
+        // the numbers are dense and monotonic.
+        let seq = match transaction.query_row(
+            "SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1",
+            rusqlite::params![session.bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(seq) => seq,
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+
+        let message = match Ulid::new() {
             Ok(id) => id,
             Err(source) => return Err(Error::Identifier { source }),
         };
-        // Milliseconds since the Unix epoch, read back out of the ULID rather
-        // than from a second clock reading, so the column can never disagree
-        // with the key beside it. The cast is lossless — a ULID timestamp is 48
-        // bits — and SQLite has no unsigned integer to store it as anyway.
-        // Rendering it as ISO-8601 is the CLI's and the API's job, not the
-        // table's: sorting, `BETWEEN` and arithmetic all want the number.
-        let created_at = id.milliseconds() as i64;
-
-        // The row and the memory's own table go in together. Either half on its
-        // own is a state every later command would have to know about: a memory
-        // that cannot be written to, or a table `memory list` never mentions.
-        let transaction = match self.connection.unchecked_transaction() {
-            Ok(transaction) => transaction,
-            Err(source) => {
-                return Err(Error::Transaction {
-                    path: self.database.clone(),
-                    source,
+        let written = transaction.execute(
+            "INSERT INTO message
+                (id, ulid, session_id, external_ref, seq, author, role, ts, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                message.bytes().as_slice(),
+                message.to_string(),
+                session.bytes().as_slice(),
+                entry.message,
+                seq,
+                entry.author,
+                entry.role.code() as i64,
+                entry.ts,
+                entry.body,
+            ],
+        );
+        if let Err(source) = written {
+            if let rusqlite::Error::SqliteFailure(error, _) = &source
+                && error.code == rusqlite::ErrorCode::ConstraintViolation
+                && let Some(reference) = entry.message
+            {
+                return Err(Error::Duplicate {
+                    session: entry.session.to_string(),
+                    reference: reference.to_string(),
                 });
             }
-        };
-
-        // The memory's own table: one row per session, message, paragraph and
-        // sentence, all four in the same shape, so that a hit coming back from
-        // LanceDB can be walked in any direction without a join.
-        //
-        // Every row carries the ids of everything above it, and its own:
-        //
-        //     type       session_id  message_id  paragraph_id  sentence_id  content
-        //     session    x
-        //     message    x           x
-        //     paragraph  x           x           x
-        //     sentence   x           x           x             x            x
-        //
-        // so a row *is* a cursor. LanceDB stores this table's `id` against each
-        // embedding — sentences and messages get one, paragraphs and whole
-        // sessions do not — which makes the way in a primary key lookup at any
-        // level. Every layer is a row here whether or not it is a vector there:
-        // a paragraph earns its row by being what sentences hang off and what
-        // reading order is counted in, not by being findable.
-        // From that row: the sentences of a paragraph share its `paragraph_id`,
-        // the paragraphs of a message share its `message_id`, and the next or
-        // previous one is `position` ± 1.
-        //
-        // `position` is which sentence of the paragraph, paragraph of the
-        // message or message of the session this is, counted from 0, and it is
-        // what the reading order actually is. `id` cannot be: a ULID is a
-        // millisecond plus 80 random bits, splitting a paragraph writes all its
-        // sentences inside one millisecond, and `ORDER BY id` would then be the
-        // order of the random halves. On a `session` row it is 0 — a session is
-        // not the nth of anything, and sessions arrive far enough apart that
-        // `id` orders them.
-        //
-        // `paragraph_id` and `sentence_id` are ULIDs, and on the row that *is*
-        // the paragraph or the sentence they repeat its `id`. Redundant on
-        // purpose: everything belonging to a paragraph, the paragraph included,
-        // is then one predicate — which is also what deleting one takes.
-        //
-        // `session_id` and `message_id` are text, because they are somebody
-        // else's identifiers: they come in with the transcript. 64 characters is
-        // room for a UUID and its hyphens, which is 36, and for whatever a
-        // feeder that does not use UUIDs hands over instead.
-        //
-        // Only sentences hold `content`, since a sentence is the unit that is
-        // kept; a paragraph or a message is read back by collecting them.
-        //
-        // `postfix` is what the author wrote *after* that content and before
-        // whatever came next: a space, a newline, a blank line, as many blank
-        // lines as they left. It is what makes collecting them lossless.
-        // Without it a paragraph read back is its sentences with a space
-        // between them, which turns a code block into one line and a heading
-        // into the first words of the prose under it; with it, the text comes
-        // back shaped the way it went in. Only the whitespace is kept, because
-        // everything else between two blocks is the next one's markup, and
-        // markup is not what a row stores. What is lost is the very first
-        // prefix — the `#` of a heading, the `- ` of the first list item —
-        // which nothing needs to read the text back.
-        //
-        // `role` and `role_name` say who spoke and, if it was a model, which
-        // one; a `session` row has neither.
-        //
-        // Three indexes, one per "the children of this row, in order": the
-        // messages of a session, the paragraphs of a message, the sentences of
-        // a paragraph. That is what [`Storage::walk`] asks for and what reading
-        // a transcript back *is*, so without them every step of a cursor is a
-        // scan of the whole memory. Each carries `position` as its second
-        // column so the ordering comes out of the index rather than a sort.
-        // Named after the table because index names are database-wide.
-        //
-        // Nothing indexes `type` or `role`: `memory list` groups by them once
-        // per listing, and one scan for a listing is not worth a fourth index
-        // on every write. Widths, the `type` and `role` vocabularies and which
-        // columns a given `type` fills are documentation: SQLite enforces none
-        // of it, and the rules live in the Rust that writes the rows.
-        //
-        // Interpolated rather than bound because a table name cannot be a
-        // parameter in SQLite. It is safe because `stored` is `memory_` and the
-        // characters the loop above let through, so there is nothing in it to
-        // quote or to escape. No `IF NOT EXISTS`: the name was free a moment
-        // ago, so a table already sitting there is not one borhan made, and
-        // writing rows into columns nobody has looked at is worse than stopping.
-        let table = format!(
-            "
-            CREATE TABLE {stored} (
-                id           BLOB(16)      NOT NULL PRIMARY KEY,
-                ulid         TEXT          NOT NULL,
-                type         VARCHAR(9)    NOT NULL,
-                session_id   VARCHAR(64)   NOT NULL,
-                message_id   VARCHAR(64),
-                paragraph_id BLOB(16),
-                sentence_id  BLOB(16),
-                position     INTEGER       NOT NULL,
-                content      VARCHAR(5000),
-                postfix      VARCHAR(16),
-                role         VARCHAR(9),
-                role_name    VARCHAR(64),
-                created_at   INTEGER       NOT NULL
-            );
-            CREATE INDEX {stored}_session   ON {stored} (session_id, position);
-            CREATE INDEX {stored}_message   ON {stored} (message_id, position);
-            CREATE INDEX {stored}_paragraph ON {stored} (paragraph_id, position);
-        "
-        );
-        if let Err(source) = transaction.execute_batch(&table) {
-            return Err(Error::Table {
-                name: stored,
+            return Err(Error::Write {
                 path: self.database.clone(),
                 source,
             });
         }
 
-        // `id` is the key everything joins on; `ulid` is the same value in the
-        // text form, carried along so that reading the table by hand does not
-        // mean decoding blobs. Deliberately unindexed.
-        let statement = "
-            INSERT INTO memory (id, ulid, name, description, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-        ";
-        if let Err(source) = transaction.execute(
-            statement,
-            rusqlite::params![
-                &id.bytes()[..],
-                id.to_string(),
-                stored,
-                description,
-                created_at
-            ],
-        ) {
-            return Err(Error::Insert {
-                path: self.database.clone(),
-                source,
-            });
-        }
+        let units = write_units(&transaction, &self.database, message, entry.body)?;
+
         if let Err(source) = transaction.commit() {
-            return Err(Error::Transaction {
+            return Err(Error::Write {
                 path: self.database.clone(),
                 source,
             });
         }
-        Ok(id)
+
+        Ok(Written {
+            session,
+            message,
+            seq,
+            units,
+        })
     }
 
-    /// Break a text into a memory's own table and return every row written,
-    /// each with the text a vector for it should be made of.
+    /// Drop every unit and sentence and split every stored message again, in
+    /// `(session, seq)` order, returning what the caller has to reindex.
     ///
-    /// What arrives is treated as **Markdown**, because what borhan is fed is a
-    /// chat transcript and that is what those are written in. A CommonMark
-    /// parser is what tells a fenced code block from a bullet list from a run
-    /// of prose, and splitting on blank lines cannot: it would glue a heading to
-    /// the paragraph under it, cut a code block wherever the code happened to
-    /// breathe, and run a whole list together into one unsearchable lump.
-    ///
-    /// The parent is looked up rather than described: a paragraph is given a
-    /// message id and inherits the session, the role and the role name off that
-    /// message's row; a sentence is given a paragraph and inherits all of it.
-    /// That is what makes an orphan unwriteable — there is no argument that
-    /// could name a parent which is not there — and it is why the ids on a row
-    /// cannot contradict the ids above it.
-    ///
-    /// `kind` says which layer the text is being attached at, and the splitting
-    /// happens below it: a `Message` becomes a message row, the paragraphs
-    /// under it and the sentences under those; a `Paragraph` becomes whatever
-    /// paragraphs its text holds, with their sentences, hung off an existing
-    /// message; a `Sentence` is taken as written and split no further.
-    ///
-    /// `position` is counted here too, so rows land in the order they arrive
-    /// and `ORDER BY position` reads the transcript back — which `ORDER BY id`
-    /// cannot, because one paragraph's sentences are all written inside the same
-    /// millisecond and a ULID has nothing but random bits to separate them.
-    ///
-    /// **Only sentence rows keep content**, and nothing is lost by it: every
-    /// text is broken all the way down, so the sentences under a paragraph are
-    /// that paragraph, and the sentences under a message are that message.
-    pub fn add(&self, memory: &str, entry: &Entry) -> Result<Vec<Row>, Error> {
-        check_name(memory)?;
-        if entry.content.trim().is_empty() {
-            return Err(Error::Content { characters: 0 });
-        }
-
-        let table = self.table(memory)?;
-
-        // Everything the row needs that was not passed in, read off the parent.
-        // `session` and `message` end up holding the feeder's identifiers for
-        // every kind, so the inserts below do not care which one it is.
-        let (session, message, role, role_name) = match entry.kind {
-            Kind::Message => {
-                let session = match &entry.session {
-                    Some(session) => session.clone(),
-                    None => {
-                        return Err(Error::Needs {
-                            kind: "message",
-                            field: "a session id",
-                        });
-                    }
-                };
-                let message = match &entry.message {
-                    Some(message) => message.clone(),
-                    None => {
-                        return Err(Error::Needs {
-                            kind: "message",
-                            field: "a message id",
-                        });
-                    }
-                };
-                // Required, not defaulted: a message nobody spoke is not a
-                // thing, and a guess here would quietly skew the shares that
-                // `memory list` reports.
-                let role = match entry.role {
-                    Some(role) => role,
-                    None => {
-                        return Err(Error::Needs {
-                            kind: "message",
-                            field: "a role",
-                        });
-                    }
-                };
-
-                // Two messages under one id would make the paragraph lookup
-                // below ambiguous, and it resolves silently to whichever came
-                // first — so it is refused here instead.
-                let query = format!(
-                    "SELECT count(*) FROM {table} WHERE type = 'message' AND message_id = ?1"
-                );
-                let existing = self
-                    .connection
-                    .query_row(&query, [&message], |row| row.get::<_, i64>(0));
-                match existing {
-                    Ok(0) => {}
-                    Ok(_) => {
-                        return Err(Error::DuplicateMessage {
-                            memory: memory.to_string(),
-                            message,
-                        });
-                    }
-                    Err(source) => {
-                        return Err(Error::Count {
-                            table,
-                            path: self.database.clone(),
-                            source,
-                        });
-                    }
-                }
-                (session, message, Some(role), entry.role_name.clone())
-            }
-
-            Kind::Paragraph => {
-                let message = match &entry.message {
-                    Some(message) => message.clone(),
-                    None => {
-                        return Err(Error::Needs {
-                            kind: "paragraph",
-                            field: "the message id it belongs to",
-                        });
-                    }
-                };
-                let query = format!(
-                    "SELECT session_id, role, role_name FROM {table}
-                     WHERE type = 'message' AND message_id = ?1"
-                );
-                let parent = self.connection.query_row(&query, [&message], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                });
-                match parent {
-                    Ok((session, role, role_name)) => {
-                        let role = match role {
-                            Some(role) => Role::parse(&role),
-                            None => None,
-                        };
-                        (session, message, role, role_name)
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        return Err(Error::NoMessage {
-                            memory: memory.to_string(),
-                            message,
-                            kind: "paragraph",
-                        });
-                    }
-                    Err(source) => {
-                        return Err(Error::Count {
-                            table,
-                            path: self.database.clone(),
-                            source,
-                        });
-                    }
-                }
-            }
-
-            Kind::Sentence => {
-                let paragraph = match entry.paragraph {
-                    Some(paragraph) => paragraph,
-                    None => {
-                        return Err(Error::Needs {
-                            kind: "sentence",
-                            field: "the paragraph it belongs to",
-                        });
-                    }
-                };
-                // A sentence is stored as written, so this is the one path
-                // where the limit is a refusal rather than somewhere to cut.
-                let characters = entry.content.chars().count();
-                if characters > CONTENT_LIMIT {
-                    return Err(Error::Content { characters });
-                }
-                // By `id`, not by `paragraph_id`: on a paragraph's own row the
-                // two are the same value, and `id` is the primary key.
-                let query = format!(
-                    "SELECT session_id, message_id, role, role_name FROM {table}
-                     WHERE type = 'paragraph' AND id = ?1"
-                );
-                let parent = self
-                    .connection
-                    .query_row(&query, [&paragraph.bytes()[..]], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                        ))
-                    });
-                match parent {
-                    Ok((session, message, role, role_name)) => {
-                        let message = match message {
-                            Some(message) => message,
-                            // A paragraph row always has one; this is a row
-                            // written by something other than `add`.
-                            None => {
-                                return Err(Error::NoParagraph {
-                                    memory: memory.to_string(),
-                                    paragraph,
-                                });
-                            }
-                        };
-                        let role = match role {
-                            Some(role) => Role::parse(&role),
-                            None => None,
-                        };
-                        (session, message, role, role_name)
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        return Err(Error::NoParagraph {
-                            memory: memory.to_string(),
-                            paragraph,
-                        });
-                    }
-                    Err(source) => {
-                        return Err(Error::Count {
-                            table,
-                            path: self.database.clone(),
-                            source,
-                        });
-                    }
-                }
-            }
-        };
-
-        // Split before the transaction opens: it reads nothing from the
-        // database, and a text that turns out to hold nothing worth storing
-        // should say so without having taken a write lock to find out.
-        let paragraphs = match entry.kind {
-            Kind::Sentence => Vec::new(),
-            _ => split(&entry.content),
-        };
-        if entry.kind != Kind::Sentence && paragraphs.is_empty() {
-            // Markdown that is all structure and no words — a horizontal rule,
-            // an empty list — leaves nothing to embed.
-            return Err(Error::Content { characters: 0 });
-        }
-
-        let statement = format!(
-            "INSERT INTO {table}
-                 (id, ulid, type, session_id, message_id, paragraph_id,
-                  sentence_id, position, content, postfix, role, role_name,
-                  created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
-        );
-        let transaction = match self.connection.unchecked_transaction() {
+    /// This is the operation the whole layer split exists for. Change the
+    /// normalizer or the splitter, bump [`crate::normalize::VERSION`], run
+    /// this. It is supported rather than improvised because it will be run
+    /// every time those rules are touched.
+    pub fn resplit(&mut self) -> Result<Vec<(Ulid, Written)>, Error> {
+        let transaction = match self.connection.transaction() {
             Ok(transaction) => transaction,
             Err(source) => {
-                return Err(Error::Transaction {
+                return Err(Error::Write {
                     path: self.database.clone(),
                     source,
                 });
             }
         };
 
-        let mut written = Vec::new();
-
-        // The session row, if this is the first message of one. Nothing else
-        // creates it: a session has no text of its own, so it is never added
-        // directly, and without a row here a cursor walking up from a message
-        // would have nothing to land on. It gets no vector either — see [`Kind`].
-        if entry.kind == Kind::Message {
-            let query =
-                format!("SELECT count(*) FROM {table} WHERE type = 'session' AND session_id = ?1");
-            let sessions = transaction.query_row(&query, [&session], |row| row.get::<_, i64>(0));
-            let sessions = match sessions {
-                Ok(sessions) => sessions,
-                Err(source) => {
-                    return Err(Error::Count {
-                        table,
-                        path: self.database.clone(),
-                        source,
-                    });
-                }
-            };
-            if sessions == 0 {
-                let id = match Ulid::new() {
-                    Ok(id) => id,
-                    Err(source) => return Err(Error::Identifier { source }),
-                };
-                // Position 0: a session is not the nth of anything. Role and
-                // role name are left out too — a session has no speaker.
-                let session_row = transaction.execute(
-                    &statement,
-                    rusqlite::params![
-                        &id.bytes()[..],
-                        id.to_string(),
-                        "session",
-                        &session,
-                        None::<String>,
-                        None::<Vec<u8>>,
-                        None::<Vec<u8>>,
-                        0,
-                        None::<String>,
-                        None::<String>,
-                        None::<String>,
-                        None::<String>,
-                        id.milliseconds() as i64
-                    ],
-                );
-                if let Err(source) = session_row {
-                    return Err(Error::Insert {
-                        path: self.database.clone(),
-                        source,
-                    });
-                }
-            }
+        if let Err(source) = transaction.execute_batch("DELETE FROM sentence; DELETE FROM unit;") {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
         }
 
-        // Which sibling the top row is. Counted inside the transaction, so the
-        // number cannot be stale by the time the row lands.
-        let (query, sibling) = match entry.kind {
-            Kind::Message => (
-                format!("SELECT count(*) FROM {table} WHERE type = 'message' AND session_id = ?1"),
-                session.clone(),
-            ),
-            Kind::Paragraph => (
-                format!(
-                    "SELECT count(*) FROM {table} WHERE type = 'paragraph' AND message_id = ?1"
-                ),
-                message.clone(),
-            ),
-            Kind::Sentence => (
-                format!(
-                    "SELECT count(*) FROM {table} WHERE type = 'sentence' AND paragraph_id = ?1"
-                ),
-                // Bound as a blob below rather than through this string.
-                String::new(),
-            ),
-        };
-        let counted = match entry.paragraph {
-            Some(paragraph) if entry.kind == Kind::Sentence => {
-                transaction.query_row(&query, [&paragraph.bytes()[..]], |row| row.get::<_, i64>(0))
-            }
-            _ => transaction.query_row(&query, [&sibling], |row| row.get::<_, i64>(0)),
-        };
-        let mut position = match counted {
-            Ok(position) => position,
-            Err(source) => {
-                return Err(Error::Count {
-                    table,
-                    path: self.database.clone(),
-                    source,
-                });
-            }
-        };
-
-        // A sentence added on its own: one row, the text as it was given.
-        if entry.kind == Kind::Sentence {
-            let id = match Ulid::new() {
-                Ok(id) => id,
-                Err(source) => return Err(Error::Identifier { source }),
-            };
-            let paragraph = match entry.paragraph {
-                Some(paragraph) => paragraph,
-                None => {
-                    return Err(Error::Needs {
-                        kind: "sentence",
-                        field: "the paragraph it belongs to",
+        let mut messages = Vec::new();
+        {
+            let mut statement = match transaction.prepare(
+                "SELECT m.id, m.session_id, m.seq, m.body
+                 FROM message m JOIN session s ON s.id = m.session_id
+                 ORDER BY s.id, m.seq",
+            ) {
+                Ok(statement) => statement,
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
                     });
                 }
             };
-            let row = transaction.execute(
-                &statement,
-                rusqlite::params![
-                    &id.bytes()[..],
-                    id.to_string(),
-                    Kind::Sentence.as_str(),
-                    &session,
-                    Some(&message),
-                    paragraph.bytes().to_vec(),
-                    id.bytes().to_vec(),
-                    position,
-                    Some(entry.content.as_str()),
-                    // A space, because nothing here knows what will follow it:
-                    // a sentence added on its own has no next block to read a
-                    // gap from, and a space is what keeps it off the words of
-                    // whatever lands after it.
-                    Some(" "),
-                    role.map(|role| role.as_str()),
-                    &role_name,
-                    id.milliseconds() as i64
-                ],
-            );
-            if let Err(source) = row {
-                return Err(Error::Insert {
-                    path: self.database.clone(),
-                    source,
-                });
-            }
-            written.push(Row {
-                id,
-                kind: Kind::Sentence,
-                // No [`WINDOW`] here: a sentence added on its own has no
-                // neighbours to take. The one before it is in the table and the
-                // one after it has not been written yet, so a window would be
-                // half a window, and giving it one would mean re-embedding the
-                // row before it on every append.
-                text: entry.content.clone(),
-                embed: entry.content.split_whitespace().count() >= MINIMUM_WORDS,
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             });
-        } else {
-            // A message row first, when that is the layer being attached at.
-            // Its text is the whole of what came in: a message-level vector is
-            // meant to answer "which message was this discussed in", so it is
-            // embedded whole even though what is *kept* is its sentences.
-            if entry.kind == Kind::Message {
-                let id = match Ulid::new() {
-                    Ok(id) => id,
-                    Err(source) => return Err(Error::Identifier { source }),
-                };
-                let row = transaction.execute(
-                    &statement,
-                    rusqlite::params![
-                        &id.bytes()[..],
-                        id.to_string(),
-                        Kind::Message.as_str(),
-                        &session,
-                        Some(&message),
-                        None::<Vec<u8>>,
-                        None::<Vec<u8>>,
-                        position,
-                        None::<String>,
-                        None::<String>,
-                        role.map(|role| role.as_str()),
-                        &role_name,
-                        id.milliseconds() as i64
-                    ],
-                );
-                if let Err(source) = row {
-                    return Err(Error::Insert {
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(source) => {
+                    return Err(Error::Query {
                         path: self.database.clone(),
                         source,
                     });
                 }
-                written.push(Row {
-                    id,
-                    kind: Kind::Message,
-                    text: entry.content.clone(),
-                    // A message is always embedded. It is a whole turn of a
-                    // conversation, and one that short is somebody saying
-                    // "yes" -- which is little to search for but is still the
-                    // thing that was said.
-                    embed: true,
-                });
-                // Paragraphs of a brand new message start at 0; paragraphs
-                // added to an existing one carry on from what it already has,
-                // which is what `position` already holds.
-                position = 0;
-            }
-
-            // Every sentence about to be written, in reading order, so each
-            // one's vector can take in the ones beside it. Flat on purpose: the
-            // window runs across paragraph boundaries, because a block break is
-            // the writer's formatting and not a break in what is being said —
-            // the first sentence of a paragraph is very often what the last
-            // sentence of the one before it was leading up to.
-            //
-            // The window reaches only as far as this one call, so a sentence at
-            // either end of it has a shorter one. That is the seam of an append,
-            // and closing it would mean re-embedding a row already written.
-            let sentences: Vec<&str> = paragraphs
-                .iter()
-                .flatten()
-                .map(|(sentence, _)| sentence.as_str())
-                .collect();
-            // Which of them the next one written is. Not `position`, which
-            // restarts inside every paragraph.
-            let mut ordinal = 0;
-
-            for paragraph in &paragraphs {
-                let id = match Ulid::new() {
-                    Ok(id) => id,
-                    Err(source) => return Err(Error::Identifier { source }),
-                };
-                // Content and postfix, straight through, which is the same
-                // string [`Storage::get`] hands back. The last postfix is the
-                // gap to the next paragraph and belongs between them, not at
-                // the end of this one.
-                let mut text = String::new();
-                for (sentence, postfix) in paragraph {
-                    text.push_str(sentence);
-                    text.push_str(postfix);
-                }
-                let text = text.trim_end().to_string();
-                let row = transaction.execute(
-                    &statement,
-                    rusqlite::params![
-                        &id.bytes()[..],
-                        id.to_string(),
-                        Kind::Paragraph.as_str(),
-                        &session,
-                        Some(&message),
-                        // Its own id, repeated in the column naming its layer,
-                        // so "everything under this paragraph" stays one
-                        // predicate.
-                        id.bytes().to_vec(),
-                        None::<Vec<u8>>,
-                        position,
-                        None::<String>,
-                        None::<String>,
-                        role.map(|role| role.as_str()),
-                        &role_name,
-                        id.milliseconds() as i64
-                    ],
-                );
-                if let Err(source) = row {
-                    return Err(Error::Insert {
-                        path: self.database.clone(),
-                        source,
-                    });
-                }
-                written.push(Row {
-                    id,
-                    kind: Kind::Paragraph,
-                    text,
-                    // No vector, whatever its length — see [`Kind`]. The text
-                    // is still handed back, because it is the paragraph and a
-                    // caller may want it; nothing here embeds it.
-                    embed: false,
-                });
-                position += 1;
-
-                for (index, (sentence, postfix)) in paragraph.iter().enumerate() {
-                    let sentence_id = match Ulid::new() {
-                        Ok(sentence_id) => sentence_id,
-                        Err(source) => return Err(Error::Identifier { source }),
-                    };
-                    let row = transaction.execute(
-                        &statement,
-                        rusqlite::params![
-                            &sentence_id.bytes()[..],
-                            sentence_id.to_string(),
-                            Kind::Sentence.as_str(),
-                            &session,
-                            Some(&message),
-                            id.bytes().to_vec(),
-                            sentence_id.bytes().to_vec(),
-                            index as i64,
-                            Some(sentence.as_str()),
-                            Some(postfix.as_str()),
-                            role.map(|role| role.as_str()),
-                            &role_name,
-                            sentence_id.milliseconds() as i64
-                        ],
-                    );
-                    if let Err(source) = row {
-                        return Err(Error::Insert {
+            };
+            for row in rows {
+                match row {
+                    Ok(row) => messages.push(row),
+                    Err(source) => {
+                        return Err(Error::Query {
                             path: self.database.clone(),
                             source,
                         });
                     }
-                    written.push(Row {
-                        id: sentence_id,
-                        kind: Kind::Sentence,
-                        text: window(&sentences, ordinal),
-                        // Measured on the sentence, not on the window: the
-                        // window is context for finding this row, and it should
-                        // not be able to talk a row into the index that has
-                        // nothing in it to find.
-                        embed: sentence.split_whitespace().count() >= MINIMUM_WORDS,
-                    });
-                    ordinal += 1;
                 }
             }
+        }
+
+        let mut written = Vec::new();
+        for (message, session, seq, body) in &messages {
+            let message = identifier(message);
+            let units = write_units(&transaction, &self.database, message, body)?;
+            written.push((
+                message,
+                Written {
+                    session: identifier(session),
+                    message,
+                    seq: *seq,
+                    units,
+                },
+            ));
         }
 
         if let Err(source) = transaction.commit() {
-            return Err(Error::Transaction {
+            return Err(Error::Write {
                 path: self.database.clone(),
                 source,
             });
@@ -1496,1356 +807,583 @@ impl Storage {
         Ok(written)
     }
 
-    /// The table a memory lives in, once the name is known to be well formed
-    /// and the memory known to be there.
-    ///
-    /// Both readers of a memory's own table need the same three things, and
-    /// the check has to happen before the name is interpolated into SQL, which
-    /// is the whole reason [`check_name`] exists.
-    fn table(&self, memory: &str) -> Result<String, Error> {
-        check_name(memory)?;
-        let table = format!("{NAME_PREFIX}{memory}");
-        let taken = self.connection.query_row(
-            "SELECT count(*) FROM memory WHERE name = ?1",
-            [&table],
-            |row| row.get::<_, i64>(0),
-        );
-        match taken {
-            Ok(0) => Err(Error::Unknown {
-                name: memory.to_string(),
-            }),
-            Ok(_) => Ok(table),
-            Err(source) => Err(Error::Lookup {
-                name: memory.to_string(),
+    /// The body, role and timestamp of a message: everything the index needs
+    /// to write its units again, in one query rather than three.
+    pub fn message(&self, message: Ulid) -> Result<(String, u64, i64), Error> {
+        match self.connection.query_row(
+            "SELECT body, role, ts FROM message WHERE id = ?1",
+            rusqlite::params![message.bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        ) {
+            Ok(row) => Ok(row),
+            Err(source) => Err(Error::Query {
                 path: self.database.clone(),
                 source,
             }),
         }
     }
 
-    /// Read rows back by id, in the order they were asked for.
+    /// Resolve units to everything a result line needs, in one query per unit.
     ///
-    /// This is what turns a search result into something a person can read: a
-    /// hit is a ULID, and a ULID says nothing.
-    ///
-    /// Ids that are not there are left out rather than reported. The two
-    /// callers both do better with that than with an error — a search resolving
-    /// its own hits would otherwise lose a whole page because one vector
-    /// outlived its row, and `memory get` can see it asked for more than it
-    /// got. Session rows are not addressable here: they hold no text and are
-    /// never embedded, so there is nothing to hand back.
-    ///
-    /// The reassembled text of a paragraph is its sentences with their
-    /// postfixes put back — which is exactly the string its vector was built
-    /// from in [`Storage::add`], so what this prints is what the search
-    /// actually matched on, down to the whitespace. A code block comes back as
-    /// lines, a heading comes back above the prose it labels, and paragraphs of
-    /// a message come back with the blank lines between them.
-    pub fn get(&self, memory: &str, ids: &[Ulid]) -> Result<Vec<Record>, Error> {
-        let table = self.table(memory)?;
-
-        let query = format!(
-            "SELECT type, session_id, message_id, paragraph_id, position,
-                    content, role, role_name, created_at
-               FROM {table}
-              WHERE id = ?1 AND type IN ('message', 'paragraph', 'sentence')"
-        );
-        let sentences_of_paragraph = format!(
-            "SELECT content, postfix FROM {table}
-              WHERE type = 'sentence' AND paragraph_id = ?1
-              ORDER BY position"
-        );
-        // Two levels of ordering, through the paragraph row: a sentence's
-        // `position` counts from zero inside its own paragraph, so ordering a
-        // whole message by it alone would interleave the paragraphs.
-        let sentences_of_message = format!(
-            "SELECT sentence.content, sentence.postfix
-               FROM {table} AS sentence
-               JOIN {table} AS paragraph
-                 ON paragraph.id = sentence.paragraph_id
-                AND paragraph.type = 'paragraph'
-              WHERE sentence.type = 'sentence' AND sentence.message_id = ?1
-              ORDER BY paragraph.position, sentence.position"
-        );
-
-        let mut records = Vec::with_capacity(ids.len());
+    /// Units that no longer exist are skipped rather than reported: the caller
+    /// got them from the index, and an id in the index that is not in the
+    /// database means the two are out of step, which `rescan` fixes and a
+    /// missing row in a result set does not.
+    pub fn locate(&self, ids: &[Ulid]) -> Result<Vec<Located>, Error> {
+        let mut located = Vec::with_capacity(ids.len());
         for id in ids {
-            let found = self.connection.query_row(&query, [&id.bytes()[..]], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
-                ))
-            });
-            let (kind, session, message, paragraph, position, content, role, role_name, created_at) =
-                match found {
-                    Ok(row) => row,
-                    Err(rusqlite::Error::QueryReturnedNoRows) => continue,
-                    Err(source) => {
-                        return Err(Error::Lookup {
-                            name: memory.to_string(),
-                            path: self.database.clone(),
-                            source,
-                        });
-                    }
-                };
-
-            let kind = match Kind::parse(&kind) {
-                Some(kind) => kind,
-                None => return Err(Error::Layer { table, kind }),
-            };
-            // `BLOB(16)` is affinity and not a rule, so a column written by
-            // anything other than `add` can be the wrong width.
-            let paragraph = match paragraph {
-                Some(bytes) => {
-                    let length = bytes.len();
-                    match <[u8; 16]>::try_from(bytes) {
-                        Ok(bytes) => Some(Ulid::from_bytes(bytes)),
-                        Err(_) => {
-                            return Err(Error::Corrupt {
-                                name: memory.to_string(),
-                                length,
-                            });
-                        }
-                    }
-                }
-                None => None,
-            };
-            let role = match role {
-                Some(role) => match Role::parse(&role) {
-                    Some(role) => Some(role),
-                    None => return Err(Error::Layer { table, kind: role }),
+            let row = self.connection.query_row(
+                "SELECT u.seq, u.byte_start, u.byte_end,
+                        m.id, m.external_ref, m.seq, m.author, m.role, m.ts, m.body,
+                        s.id, s.external_ref
+                 FROM unit u
+                 JOIN message m ON m.id = u.message_id
+                 JOIN session s ON s.id = m.session_id
+                 WHERE u.id = ?1",
+                rusqlite::params![id.bytes().as_slice()],
+                |row| {
+                    Ok(Located {
+                        unit: *id,
+                        unit_seq: row.get(0)?,
+                        start: row.get::<_, i64>(1)? as usize,
+                        end: row.get::<_, i64>(2)? as usize,
+                        message: identifier(&row.get::<_, Vec<u8>>(3)?),
+                        message_ref: row.get(4)?,
+                        seq: row.get(5)?,
+                        author: row.get(6)?,
+                        role: Role::from_code(row.get::<_, i64>(7)? as u64),
+                        ts: row.get(8)?,
+                        body: row.get(9)?,
+                        session: identifier(&row.get::<_, Vec<u8>>(10)?),
+                        session_ref: row.get(11)?,
+                    })
                 },
-                None => None,
-            };
-
-            // Only a sentence stores what it says; the layers above it are put
-            // back together out of the sentences underneath.
-            let text = match kind {
-                Kind::Sentence => content.unwrap_or_default(),
-                Kind::Paragraph => self.sentences(&sentences_of_paragraph, [&id.bytes()[..]])?,
-                Kind::Message => match &message {
-                    Some(message) => self.sentences(&sentences_of_message, [message])?,
-                    None => String::new(),
-                },
-            };
-
-            records.push(Record {
-                id: *id,
-                kind,
-                session,
-                message,
-                paragraph,
-                position,
-                role,
-                role_name,
-                created_at,
-                text,
-            });
-        }
-        Ok(records)
-    }
-
-    /// Read the children of one row, in the order they were written.
-    ///
-    /// This is the other way in, and the one that does not need a ULID. A
-    /// search hands back ids; everything else a reader wants — the message
-    /// before this one, the rest of this document, what a session actually
-    /// holds — is "the children of something I can name", and the names are
-    /// the feeder's own. Which layer comes back is decided by how much is
-    /// given, so that each answer is the layer below the deepest thing named:
-    ///
-    /// | Given | What comes back |
-    /// |-------|-----------------|
-    /// | `session` | the messages of that session |
-    /// | `session` and `message` | the paragraphs of that message |
-    /// | `paragraph` | the sentences of that paragraph |
-    ///
-    /// A paragraph is named by ULID and needs no session, since a ULID is
-    /// already unique across the memory.
-    ///
-    /// `from` and `count` are a window on that list, counted in `position` —
-    /// which is the reading order and the reason the column exists. A `from`
-    /// past the end is an empty result and not an error: walking off the end of
-    /// a document is how a reader finds out where it ends.
-    pub fn walk(
-        &self,
-        memory: &str,
-        session: Option<&str>,
-        message: Option<&str>,
-        paragraph: Option<Ulid>,
-        from: i64,
-        count: i64,
-    ) -> Result<Vec<Record>, Error> {
-        let table = self.table(memory)?;
-
-        // Ids first and the text after, through [`Storage::get`], rather than
-        // one wider query: reassembling a row out of the rows under it is the
-        // whole of what `get` does, and doing it twice is how the two readers
-        // start disagreeing about what a paragraph's text is.
-        //
-        // The parent is a `Value` and not bytes, because the three columns are
-        // not one type: a paragraph id is a blob and the feeder's two are text,
-        // and SQLite compares a blob to a string as unequal rather than as an
-        // error — so binding the wrong one finds nothing and says nothing.
-        let (query, parent) = match (paragraph, session, message) {
-            (Some(paragraph), _, _) => (
-                format!(
-                    "SELECT id FROM {table}
-                      WHERE type = 'sentence' AND paragraph_id = ?1
-                      ORDER BY position LIMIT ?2 OFFSET ?3"
-                ),
-                rusqlite::types::Value::Blob(paragraph.bytes().to_vec()),
-            ),
-            (None, Some(_), Some(message)) => (
-                format!(
-                    "SELECT id FROM {table}
-                      WHERE type = 'paragraph' AND message_id = ?1
-                      ORDER BY position LIMIT ?2 OFFSET ?3"
-                ),
-                rusqlite::types::Value::Text(message.to_string()),
-            ),
-            (None, Some(session), None) => (
-                format!(
-                    "SELECT id FROM {table}
-                      WHERE type = 'message' AND session_id = ?1
-                      ORDER BY position LIMIT ?2 OFFSET ?3"
-                ),
-                rusqlite::types::Value::Text(session.to_string()),
-            ),
-            // The caller named nothing to walk from. Checked at the boundary
-            // that built the arguments, so this is the impossible fourth case
-            // rather than a state a user can reach.
-            (None, None, _) => {
-                return Err(Error::Needs {
-                    kind: "walk",
-                    field: "a session or a paragraph to walk from",
-                });
-            }
-        };
-
-        let mut statement = match self.connection.prepare(&query) {
-            Ok(statement) => statement,
-            Err(source) => {
-                return Err(Error::List {
-                    path: self.database.clone(),
-                    source,
-                });
-            }
-        };
-        let found = statement.query_map(rusqlite::params![parent, count, from], |row| {
-            row.get::<_, Vec<u8>>(0)
-        });
-        let found = match found {
-            Ok(found) => found,
-            Err(source) => {
-                return Err(Error::List {
-                    path: self.database.clone(),
-                    source,
-                });
-            }
-        };
-
-        let mut ids = Vec::new();
-        for row in found {
-            let bytes = match row {
-                Ok(bytes) => bytes,
+            );
+            match row {
+                Ok(row) => located.push(row),
+                Err(rusqlite::Error::QueryReturnedNoRows) => continue,
                 Err(source) => {
-                    return Err(Error::List {
+                    return Err(Error::Query {
                         path: self.database.clone(),
                         source,
                     });
                 }
-            };
-            // `BLOB(16)` is affinity and not a rule, so a column written by
-            // anything other than `add` can be the wrong width.
-            let length = bytes.len();
-            match <[u8; 16]>::try_from(bytes) {
-                Ok(bytes) => ids.push(Ulid::from_bytes(bytes)),
-                Err(_) => {
-                    return Err(Error::Corrupt {
-                        name: memory.to_string(),
-                        length,
-                    });
-                }
             }
         }
-        self.get(memory, &ids)
+        Ok(located)
     }
 
-    /// Run one of [`Storage::get`]'s two child queries and put back together
-    /// what comes back: each sentence followed by the text it was followed by.
-    ///
-    /// A sentence with no postfix stored is one that arrived on its own rather
-    /// than out of [`split`], and gets a space so that it does not run into the
-    /// next one. The trailing postfix is the gap to whatever comes *after* what
-    /// was asked for, and goes with it.
-    fn sentences<P: rusqlite::Params>(&self, query: &str, parameters: P) -> Result<String, Error> {
-        let mut statement = match self.connection.prepare(query) {
+    /// The sentence offsets of a unit, in order. Used to cut a snippet tighter
+    /// than the whole paragraph when a match sits in one sentence of it.
+    pub fn sentences(&self, unit: Ulid) -> Result<Vec<(usize, usize)>, Error> {
+        let mut statement = match self
+            .connection
+            .prepare("SELECT byte_start, byte_end FROM sentence WHERE unit_id = ?1 ORDER BY seq")
+        {
             Ok(statement) => statement,
             Err(source) => {
-                return Err(Error::List {
+                return Err(Error::Query {
                     path: self.database.clone(),
                     source,
                 });
             }
         };
-        let rows = statement.query_map(parameters, |row| {
+        let rows = statement.query_map(rusqlite::params![unit.bytes().as_slice()], |row| {
             Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
             ))
         });
         let rows = match rows {
             Ok(rows) => rows,
             Err(source) => {
-                return Err(Error::List {
+                return Err(Error::Query {
                     path: self.database.clone(),
                     source,
                 });
             }
         };
-
-        let mut text = String::new();
+        let mut sentences = Vec::new();
         for row in rows {
             match row {
-                Ok((Some(content), postfix)) => {
-                    text.push_str(&content);
-                    match postfix {
-                        Some(postfix) if !postfix.is_empty() => text.push_str(&postfix),
-                        _ => text.push(' '),
-                    }
-                }
-                Ok((None, _)) => {}
+                Ok(row) => sentences.push(row),
                 Err(source) => {
-                    return Err(Error::List {
+                    return Err(Error::Query {
                         path: self.database.clone(),
                         source,
                     });
                 }
             }
         }
-        Ok(text.trim_end().to_string())
+        Ok(sentences)
     }
 
-    /// Every memory, oldest first, with names as the caller wrote them: the
-    /// [`NAME_PREFIX`] goes on in [`Storage::create`] and comes off here, so it
-    /// never leaves this module.
+    /// The messages around a unit: the cursor tool's whole implementation.
     ///
-    /// `ORDER BY id` is chronological: a ULID leads with its timestamp and
-    /// SQLite compares blobs with `memcmp`, so the primary key already sorts
-    /// the way a reader expects and `created_at` needs no index.
-    ///
-    /// Reads the whole table into memory. That is the right shape while a
-    /// memory is a name and a paragraph and the table is a few thousand rows;
-    /// the day it is not, this grows a limit and an offset rather than a
-    /// streaming iterator, because the caller is a CLI printing a page.
-    pub fn list(&self) -> Result<Vec<Memory>, Error> {
-        // `id` is read rather than `ulid`: the blob is the value the table is
-        // keyed and ordered by, and the text column is a copy kept for human
-        // eyes. Nothing checks that the two agree, so a program reads the one
-        // that decides.
-        let query = "SELECT id, name, description, created_at FROM memory ORDER BY id";
-        let mut statement = match self.connection.prepare(query) {
-            Ok(statement) => statement,
+    /// A range scan on `(session_id, seq)`, which is exact and index-only
+    /// because the ordinals are gapless. No scoring and no snippets — the
+    /// caller has already decided this region is worth reading, and cutting it
+    /// down again would be answering a question it did not ask.
+    pub fn around(&self, unit: Ulid, before: i64, after: i64) -> Result<Vec<Message>, Error> {
+        let anchor = self.connection.query_row(
+            "SELECT m.session_id, m.seq FROM unit u JOIN message m ON m.id = u.message_id
+             WHERE u.id = ?1",
+            rusqlite::params![unit.bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let (session, seq) = match anchor {
+            Ok(anchor) => anchor,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Error::Unknown {
+                    id: unit.to_string(),
+                });
+            }
             Err(source) => {
-                return Err(Error::List {
+                return Err(Error::Query {
                     path: self.database.clone(),
                     source,
                 });
             }
         };
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        });
+
+        let mut statement = match self.connection.prepare(
+            "SELECT id, external_ref, seq, author, role, ts, body FROM message
+             WHERE session_id = ?1 AND seq >= ?2 AND seq <= ?3
+             ORDER BY seq",
+        ) {
+            Ok(statement) => statement,
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+        let rows = statement.query_map(
+            rusqlite::params![session, seq - before, seq + after],
+            |row| {
+                let at: i64 = row.get(2)?;
+                Ok(Message {
+                    id: identifier(&row.get::<_, Vec<u8>>(0)?),
+                    reference: row.get(1)?,
+                    seq: at,
+                    author: row.get(3)?,
+                    role: Role::from_code(row.get::<_, i64>(4)? as u64),
+                    ts: row.get(5)?,
+                    body: row.get(6)?,
+                    anchor: at == seq,
+                })
+            },
+        );
         let rows = match rows {
             Ok(rows) => rows,
             Err(source) => {
-                return Err(Error::List {
+                return Err(Error::Query {
                     path: self.database.clone(),
                     source,
                 });
             }
         };
-
-        let mut memories = Vec::new();
+        let mut messages = Vec::new();
         for row in rows {
-            let (id, name, description, created_at) = match row {
-                Ok(row) => row,
+            match row {
+                Ok(row) => messages.push(row),
                 Err(source) => {
-                    return Err(Error::List {
+                    return Err(Error::Query {
                         path: self.database.clone(),
                         source,
                     });
-                }
-            };
-            // `BLOB(16)` is affinity, not a rule, so a row that came from
-            // somewhere other than `create` can be any length.
-            let length = id.len();
-            let id = match <[u8; 16]>::try_from(id) {
-                Ok(bytes) => Ulid::from_bytes(bytes),
-                Err(_) => return Err(Error::Corrupt { name, length }),
-            };
-            // The memory's own table is named by the value in this column, so
-            // hold on to it before the prefix comes off.
-            let table = name.clone();
-
-            // Off again on the way out: the prefix is how the table keeps
-            // callers inside one namespace, and the caller only ever knew the
-            // name it passed in. A row without it was not written by `create`,
-            // and guessing what it means is worse than saying so.
-            let name = match name.strip_prefix(NAME_PREFIX) {
-                Some(name) => name.to_string(),
-                None => return Err(Error::Prefix { name }),
-            };
-            // Run over the name again on the way out, not because `create` let
-            // anything through, but because the table name below is pasted into
-            // SQL and cannot be bound — a parameter cannot be an identifier.
-            // After this it is `memory_` and `[a-z0-9_]`, with nothing in it to
-            // quote or escape.
-            check_name(&name)?;
-
-            // One query per memory. That is a scan of each table, since nothing
-            // indexes `type` — fine while `memory list` is a handful of
-            // memories on a terminal, and the day it is not, the fix is an
-            // index on `(type, role)` or a counts row kept up to date by the
-            // writer, not a cleverer query.
-            let query = format!("SELECT type, role, count(*) FROM {table} GROUP BY type, role");
-            let mut counters = match self.connection.prepare(&query) {
-                Ok(counters) => counters,
-                Err(source) => {
-                    return Err(Error::Count {
-                        table,
-                        path: self.database.clone(),
-                        source,
-                    });
-                }
-            };
-            let grouped = counters.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            });
-            let grouped = match grouped {
-                Ok(grouped) => grouped,
-                Err(source) => {
-                    return Err(Error::Count {
-                        table,
-                        path: self.database.clone(),
-                        source,
-                    });
-                }
-            };
-
-            let mut counts = Counts::default();
-            for group in grouped {
-                let (kind, role, total) = match group {
-                    Ok(group) => group,
-                    Err(source) => {
-                        return Err(Error::Count {
-                            table,
-                            path: self.database.clone(),
-                            source,
-                        });
-                    }
-                };
-                // `count(*)` cannot be negative, and SQLite has no unsigned
-                // integer to have returned it as.
-                let total = total as u64;
-                match kind.as_str() {
-                    "session" => counts.sessions += total,
-                    "message" => {
-                        counts.messages += total;
-                        // An unrecognised role is counted in `messages` and in
-                        // neither share, which is the one place this is lenient:
-                        // `role` says who spoke and a fifth speaker is odd but
-                        // legible, while a fifth `type` would mean the row is
-                        // not one of the four things a memory is made of.
-                        match role.as_deref() {
-                            Some("assistant") => counts.assistant += total,
-                            Some("user") => counts.user += total,
-                            _ => {}
-                        }
-                    }
-                    "paragraph" => counts.paragraphs += total,
-                    "sentence" => counts.sentences += total,
-                    _ => return Err(Error::Layer { table, kind }),
                 }
             }
-
-            memories.push(Memory {
-                id,
-                name,
-                description,
-                created_at,
-                counts,
-            });
         }
-        Ok(memories)
+        Ok(messages)
     }
 
-    /// Make the LanceDB table one model's vectors live in, unless it is already
-    /// there; the bool says which happened.
+    /// Record a query and what it returned.
     ///
-    /// Only `init storage` calls this. Everything else opens the table with
-    /// [`Storage::open_vectors`] and fails if it is missing, which is the same
-    /// rule the SQLite side follows: borhan creates nothing behind the user's
-    /// back, because the alternative is a wrong `--model` quietly starting a
-    /// second, empty index instead of saying so.
-    pub async fn create_vectors(&self, model: &str, dimensions: usize) -> Result<bool, Error> {
-        let name = embedding_table(model)?;
-        let connection = self.connect().await?;
-        let names = match connection.table_names().execute().await {
-            Ok(names) => names,
-            Err(source) => {
-                return Err(Error::Tables {
-                    path: self.directory.clone(),
-                    source: Box::new(source),
-                });
-            }
+    /// Free to write and impossible to recover later: when the agent searches,
+    /// gets twenty results and then reaches for the cursor on the seventh, that
+    /// pair of rows is a relevance judgement produced by normal use.
+    pub fn log_search(&self, groups: &str, returned: &str) -> Result<Ulid, Error> {
+        let id = match Ulid::new() {
+            Ok(id) => id,
+            Err(source) => return Err(Error::Identifier { source }),
         };
-        for existing in &names {
-            if existing == &name {
-                return Ok(false);
-            }
-        }
-
-        // `memory` is the name the user gave, without the SQLite prefix, and
-        // `id` is the 26-character ULID of the row in `memory_<memory>` this
-        // was embedded from — text on both counts, because a LanceDB filter is
-        // a SQL string and a text literal is something you can write into one.
-        //
-        // `type` is the layer ([`Kind`]), so that a search can ask for
-        // sentences and not be crowded out by the paragraph and the message
-        // that contain the same words.
-        //
-        // The width of `vector` is the model's, which is what keeps the tables
-        // honest: point `--model` at a different model whose directory happens
-        // to share a name and the write is rejected here rather than silently
-        // mixing 256- and 512-dimension vectors.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("memory", DataType::Utf8, false),
-            Field::new("type", DataType::Utf8, false),
-            Field::new("id", DataType::Utf8, false),
-            Field::new(
-                VECTOR_COLUMN,
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    dimensions as i32,
-                ),
-                false,
-            ),
-        ]));
-        if let Err(source) = connection.create_empty_table(&name, schema).execute().await {
-            return Err(Error::CreateTable {
-                name,
-                path: self.directory.clone(),
-                source: Box::new(source),
-            });
-        }
-        Ok(true)
-    }
-
-    /// Open one model's table. Does not create it — see
-    /// [`Storage::create_vectors`].
-    pub async fn open_vectors(&self, model: &str) -> Result<Vectors, Error> {
-        let name = embedding_table(model)?;
-        let connection = self.connect().await?;
-        let names = match connection.table_names().execute().await {
-            Ok(names) => names,
-            Err(source) => {
-                return Err(Error::Tables {
-                    path: self.directory.clone(),
-                    source: Box::new(source),
-                });
-            }
-        };
-        // Asked separately rather than reading it off `open_table`'s error,
-        // because "you have not embedded anything with this model" is the
-        // likely cause and it has a one-line fix worth naming.
-        let mut found = false;
-        for existing in &names {
-            if existing == &name {
-                found = true;
-            }
-        }
-        if !found {
-            return Err(Error::NoTable {
-                name,
-                model: model.to_string(),
-                path: self.directory.clone(),
-            });
-        }
-
-        let table = match connection.open_table(&name).execute().await {
-            Ok(table) => table,
-            Err(source) => {
-                return Err(Error::OpenTable {
-                    name,
-                    path: self.directory.clone(),
-                    source: Box::new(source),
-                });
-            }
-        };
-        Ok(Vectors { name, table })
-    }
-
-    /// LanceDB's handle on the storage directory. Cheap enough to make per
-    /// command — it is a directory listing, not a server — and not held on
-    /// [`Storage`] because that would make opening the SQLite database async.
-    async fn connect(&self) -> Result<lancedb::Connection, Error> {
-        let uri = match self.directory.to_str() {
-            Some(uri) => uri,
-            None => {
-                return Err(Error::PathEncoding {
-                    path: self.directory.clone(),
-                });
-            }
-        };
-        match lancedb::connect(uri).execute().await {
-            Ok(connection) => Ok(connection),
-            Err(source) => Err(Error::Connect {
-                path: self.directory.clone(),
-                source: Box::new(source),
-            }),
-        }
-    }
-}
-
-/// One model's vectors: every memory's, one table.
-pub struct Vectors {
-    /// `embedding_<model>`, for error messages.
-    name: String,
-    table: lancedb::Table,
-}
-
-impl Vectors {
-    /// Store embeddings, and index the table once there are enough of them.
-    pub async fn add(&self, vectors: &[Vector]) -> Result<(), Error> {
-        if vectors.is_empty() {
-            return Ok(());
-        }
-
-        let schema = match self.table.schema().await {
-            Ok(schema) => schema,
-            Err(source) => {
-                return Err(Error::TableSchema {
-                    name: self.name.clone(),
-                    source: Box::new(source),
-                });
-            }
-        };
-        // The model's width, read off the table rather than passed in, so the
-        // check below compares against what is actually stored.
-        let expected = match schema.field_with_name(VECTOR_COLUMN) {
-            Ok(field) => match field.data_type() {
-                DataType::FixedSizeList(_, width) => *width as usize,
-                _ => {
-                    return Err(Error::TableShape {
-                        name: self.name.clone(),
-                    });
-                }
-            },
-            Err(_) => {
-                return Err(Error::TableShape {
-                    name: self.name.clone(),
-                });
-            }
-        };
-
-        let mut memories = Vec::with_capacity(vectors.len());
-        let mut kinds = Vec::with_capacity(vectors.len());
-        let mut identifiers = Vec::with_capacity(vectors.len());
-        let mut embeddings = Vec::with_capacity(vectors.len());
-        for vector in vectors {
-            // Checked here rather than left to arrow, which panics on a ragged
-            // fixed-size list instead of returning.
-            if vector.embedding.len() != expected {
-                return Err(Error::Dimensions {
-                    id: vector.id.to_string(),
-                    name: self.name.clone(),
-                    dimensions: vector.embedding.len(),
-                    expected,
-                });
-            }
-            memories.push(vector.memory.clone());
-            kinds.push(vector.kind.as_str());
-            identifiers.push(vector.id.to_string());
-            let mut embedding = Vec::with_capacity(expected);
-            for number in &vector.embedding {
-                embedding.push(Some(*number));
-            }
-            embeddings.push(Some(embedding));
-        }
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(memories)),
-                Arc::new(StringArray::from(kinds)),
-                Arc::new(StringArray::from(identifiers)),
-                Arc::new(
-                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                        embeddings,
-                        expected as i32,
-                    ),
-                ),
+        let written = self.connection.execute(
+            "INSERT INTO search_log (id, ts, groups_json, returned_json) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                id.bytes().as_slice(),
+                id.milliseconds() as i64,
+                groups,
+                returned
             ],
         );
-        let batch = match batch {
-            Ok(batch) => batch,
-            Err(source) => {
-                return Err(Error::Batch {
-                    name: self.name.clone(),
-                    source: Box::new(source),
-                });
-            }
-        };
-        if let Err(source) = self.table.add(vec![batch]).execute().await {
-            return Err(Error::Add {
-                count: vectors.len(),
-                name: self.name.clone(),
-                source: Box::new(source),
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
             });
         }
-        self.index().await
+        Ok(id)
     }
 
-    /// Build the indexes, once, when the table is big enough to want them.
+    /// Record that a unit returned by some earlier search was expanded.
     ///
-    /// Rows written after this runs are not *in* the vector index until a
-    /// `optimize` folds them in; LanceDB still finds them by scanning the
-    /// unindexed tail, so a search stays correct and only gets slower.
-    async fn index(&self) -> Result<(), Error> {
-        let rows = match self.table.count_rows(None).await {
-            Ok(rows) => rows,
+    /// The search it belongs to is the most recent one that returned this unit,
+    /// found here rather than passed in, because the caller of the cursor tool
+    /// holds an opaque string and should not have to also carry a search id
+    /// around to make the log work.
+    pub fn log_expansion(&self, unit: Ulid) -> Result<(), Error> {
+        let found = self.connection.query_row(
+            "SELECT id FROM search_log WHERE returned_json LIKE ?1 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![format!("%{}%", unit)],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        let search = match found {
+            Ok(search) => search,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
             Err(source) => {
-                return Err(Error::IndexColumn {
-                    name: self.name.clone(),
-                    column: VECTOR_COLUMN.to_string(),
-                    source: Box::new(source),
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
                 });
             }
         };
-        if rows < INDEX_THRESHOLD {
-            return Ok(());
-        }
-        let indices = match self.table.list_indices().await {
-            Ok(indices) => indices,
-            Err(source) => {
-                return Err(Error::IndexColumn {
-                    name: self.name.clone(),
-                    column: VECTOR_COLUMN.to_string(),
-                    source: Box::new(source),
-                });
-            }
-        };
-        if !indices.is_empty() {
-            return Ok(());
-        }
-
-        // Cosine because the model normalises its output, which makes cosine
-        // and dot rank identically and both of them cheaper to reason about
-        // than L2 — and because the builder's default is L2, so leaving it
-        // unsaid would pick the other one.
-        let vectors = self
-            .table
-            .create_index(
-                &[VECTOR_COLUMN],
-                Index::IvfPq(IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine)),
-            )
-            .execute()
-            .await;
-        if let Err(source) = vectors {
-            return Err(Error::IndexColumn {
-                name: self.name.clone(),
-                column: VECTOR_COLUMN.to_string(),
-                source: Box::new(source),
+        let written = self.connection.execute(
+            "INSERT OR IGNORE INTO expansion_log (search_id, unit_id, ts) VALUES (?1, ?2, ?3)",
+            rusqlite::params![search, unit.bytes().as_slice(), Ulid::now()],
+        );
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
             });
-        }
-
-        // The scalar pair matters more than it looks. A search is always
-        // filtered to one memory, and an approximate vector index answers a
-        // filtered query by walking partitions — so when a memory is a small
-        // slice of the table, its rows are scattered and real hits get missed.
-        // With these, the filter is resolved first and the vector search runs
-        // over what survives.
-        for column in ["memory", "type"] {
-            let scalar = self
-                .table
-                .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await;
-            if let Err(source) = scalar {
-                return Err(Error::IndexColumn {
-                    name: self.name.clone(),
-                    column: column.to_string(),
-                    source: Box::new(source),
-                });
-            }
         }
         Ok(())
     }
 
-    /// The `limit` rows of `memory` closest to `query`, nearest first.
-    ///
-    /// `kind` narrows it to one layer. Without it a sentence, the paragraph
-    /// holding it and the message holding that are three separate rows of
-    /// nearly the same text, and they will take three of the results.
-    pub async fn search(
-        &self,
-        memory: &str,
-        kind: Option<Kind>,
-        query: &[f32],
-        limit: usize,
-    ) -> Result<Vec<Hit>, Error> {
-        // The filter is a SQL string with the name pasted into it, so the name
-        // has to have been through the same gate `create` uses — after which it
-        // is `[a-z0-9_]` and holds no quote to break out with.
-        check_name(memory)?;
-        let mut filter = format!("memory = '{memory}'");
-        if let Some(kind) = kind {
-            filter.push_str(&format!(" AND type = '{}'", kind.as_str()));
+    /// Read one `index_meta` value.
+    pub fn meta(&self, key: &str) -> Result<Option<String>, Error> {
+        match self.connection.query_row(
+            "SELECT value FROM index_meta WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(Error::Query {
+                path: self.database.clone(),
+                source,
+            }),
         }
-
-        let search = match self.table.query().nearest_to(query) {
-            Ok(search) => search,
-            Err(source) => {
-                return Err(Error::Search {
-                    name: self.name.clone(),
-                    source: Box::new(source),
-                });
-            }
-        };
-        // Said again here: the index knows it was built for cosine, but a table
-        // too small to have one is scanned flat, and that path defaults to L2.
-        let stream = search
-            .distance_type(DistanceType::Cosine)
-            .only_if(filter)
-            .limit(limit)
-            .execute()
-            .await;
-        let mut stream = match stream {
-            Ok(stream) => stream,
-            Err(source) => {
-                return Err(Error::Search {
-                    name: self.name.clone(),
-                    source: Box::new(source),
-                });
-            }
-        };
-
-        let mut hits = Vec::new();
-        loop {
-            let batch = match stream.try_next().await {
-                Ok(Some(batch)) => batch,
-                Ok(None) => break,
-                Err(source) => {
-                    return Err(Error::Search {
-                        name: self.name.clone(),
-                        source: Box::new(source),
-                    });
-                }
-            };
-            let kinds = self.text(&batch, "type")?;
-            let identifiers = self.text(&batch, "id")?;
-            // LanceDB adds this one to the results; it is not in the schema.
-            let distances = match batch.column_by_name("_distance") {
-                Some(column) => match column.as_any().downcast_ref::<Float32Array>() {
-                    Some(distances) => distances.clone(),
-                    None => {
-                        return Err(Error::Column {
-                            name: self.name.clone(),
-                            column: "_distance".to_string(),
-                        });
-                    }
-                },
-                None => {
-                    return Err(Error::Column {
-                        name: self.name.clone(),
-                        column: "_distance".to_string(),
-                    });
-                }
-            };
-
-            for row in 0..batch.num_rows() {
-                hits.push(Hit {
-                    kind: kinds.value(row).to_string(),
-                    id: identifiers.value(row).to_string(),
-                    distance: distances.value(row),
-                });
-            }
-        }
-        Ok(hits)
     }
 
-    /// One text column of a result batch, or the error naming which one was
-    /// not what the schema promised.
-    fn text(&self, batch: &RecordBatch, column: &str) -> Result<StringArray, Error> {
-        if let Some(values) = batch.column_by_name(column)
-            && let Some(values) = values.as_any().downcast_ref::<StringArray>()
-        {
-            return Ok(values.clone());
+    /// Write one `index_meta` value.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), Error> {
+        let written = self.connection.execute(
+            "INSERT INTO index_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = ?2",
+            rusqlite::params![key, value],
+        );
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
         }
-        Err(Error::Column {
-            name: self.name.clone(),
-            column: column.to_string(),
-        })
+        Ok(())
     }
 }
 
-/// One CommonMark block on its way to becoming a paragraph, with where it sat
-/// in the source so that what followed it can be kept.
+/// Split a message body and write its `unit` and `sentence` rows.
+///
+/// Shared by [`Storage::add`] and [`Storage::resplit`] — the two callers that
+/// must not disagree, because the second one exists to reproduce the first.
+fn write_units(
+    transaction: &rusqlite::Transaction<'_>,
+    database: &Path,
+    message: Ulid,
+    body: &str,
+) -> Result<Vec<Unit>, Error> {
+    let mut units = Vec::new();
+    for (seq, block) in split(body).into_iter().enumerate() {
+        let id = match Ulid::new() {
+            Ok(id) => id,
+            Err(source) => return Err(Error::Identifier { source }),
+        };
+        let written = transaction.execute(
+            "INSERT INTO unit (id, message_id, seq, byte_start, byte_end)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                id.bytes().as_slice(),
+                message.bytes().as_slice(),
+                seq as i64,
+                block.start as i64,
+                block.end as i64,
+            ],
+        );
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: database.to_path_buf(),
+                source,
+            });
+        }
+
+        for (at, (start, end)) in sentences(body, &block).into_iter().enumerate() {
+            let written = transaction.execute(
+                "INSERT INTO sentence (unit_id, seq, byte_start, byte_end)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id.bytes().as_slice(), at as i64, start as i64, end as i64],
+            );
+            if let Err(source) = written {
+                return Err(Error::Write {
+                    path: database.to_path_buf(),
+                    source,
+                });
+            }
+        }
+
+        units.push(Unit {
+            id,
+            start: block.start,
+            end: block.end,
+        });
+    }
+    Ok(units)
+}
+
+/// One block of a message: a byte range, and whether it is code.
+#[derive(Debug, Clone, Copy)]
 struct Block {
-    /// The block's sentences, markup already gone.
-    sentences: Vec<String>,
-    /// Kept exactly as written, one sentence per line, and cut into paragraphs
-    /// of at most [`CODE_LINES`] lines.
-    code: bool,
-    /// A heading does not become a paragraph of its own: the block after it
-    /// joins it. A title with nothing under it is not what anybody is looking
-    /// for, and the prose under it is much easier to place with its title in
-    /// front of it — which is as true of a vector as it is of a reader.
-    heading: bool,
-    /// Where the block's source starts and ends. Everything between one
-    /// block's `end` and the next one's `start` is what the author put between
-    /// them, and that is what becomes a postfix.
     start: usize,
     end: usize,
+    code: bool,
 }
 
-/// The text one sentence's vector is built from: the back [`WINDOW`] of the
-/// sentence before it, the sentence itself, and the front [`WINDOW`] of the one
-/// after.
+/// Cut a message body into units.
 ///
-/// `sentences` is one whole `add` in reading order and `at` is which of them
-/// this is, so the ends of it get a one-sided window and a lone sentence gets
-/// itself. Neighbours go in whatever their own length — the [`MINIMUM_WORDS`]
-/// gate decides which rows are embedded, not which words may be borrowed. A
-/// heading, too short to be a vector of its own, is exactly the kind of
-/// neighbour worth having.
+/// The text is read as Markdown, because that is what a chat transcript is, and
+/// a CommonMark parser is what tells a fenced code block from a list item from
+/// a run of prose — which is the difference between splitting on blank lines
+/// and splitting on meaning. Everything is a byte range into the input; nothing
+/// is copied.
 ///
-/// Halves are counted in words and rounded down, so a one-word neighbour
-/// contributes nothing rather than all of itself.
-fn window(sentences: &[&str], at: usize) -> String {
-    let mut text = String::new();
-    if at > 0 {
-        let words: Vec<&str> = sentences[at - 1].split_whitespace().collect();
-        let take = (words.len() as f64 * WINDOW) as usize;
-        if take > 0 {
-            // The *back* half of the one before: what leads into this sentence,
-            // not how its own paragraph opened.
-            text.push_str(&words[words.len() - take..].join(" "));
-            text.push(' ');
-        }
-    }
-    text.push_str(sentences[at]);
-    if let Some(next) = sentences.get(at + 1) {
-        let words: Vec<&str> = next.split_whitespace().collect();
-        let take = (words.len() as f64 * WINDOW) as usize;
-        if take > 0 {
-            text.push(' ');
-            text.push_str(&words[..take].join(" "));
-        }
-    }
-    text
-}
-
-/// Break a Markdown text into paragraphs, each already broken into sentences,
-/// each sentence carrying the text that followed it.
-///
-/// Empty paragraphs never come back, so an empty result means the text held no
-/// words — a horizontal rule, an empty list, nothing but markup.
-///
-/// The unit of a paragraph is a CommonMark *block*, not a run between blank
-/// lines: a paragraph, one item of a list, one row of a table, a fenced code
-/// block. That is the whole reason a parser is here. Splitting on blank lines
-/// would run a bullet list together into one lump and cut a code block wherever
-/// the code happened to breathe — and both of those are worse units to embed
-/// than what the author actually wrote.
-///
-/// A heading is the exception, and joins the block under it. It is a label for
-/// that block and nothing on its own: `## Motivation` answers no question, and
-/// as a row of its own it is two words that sit close to every query mentioning
-/// motivation.
-///
-/// The second half of each pair is the **postfix**: the whitespace the author
-/// left between this sentence and whatever came next — a space inside a
-/// paragraph, a newline between the lines of code, a blank line between blocks,
-/// as many blank lines as were actually written. Concatenating content and
-/// postfix through a paragraph or a whole message gives the text back with its
-/// shape, which is what [`Storage::get`] prints. What that cannot give back is the markup this deliberately drops
-/// and the line wrapping inside a paragraph, which CommonMark itself treats as
-/// insignificant. Nor the very first prefix, which is markup too — the `- ` of
-/// the first list item, the `#` of a heading.
-///
-/// Markup is dropped, not stored: what a row keeps is the words. `**bold**` is
-/// `bold`, a link is its text, and nothing that reaches a model or a screen has
-/// a bracket in it that the author did not type. Code blocks are the exception
-/// and keep their literal lines, because in code the punctuation *is* the
-/// content.
-///
-/// What this deliberately does not do is understand abbreviations. "Dr. Smith"
-/// is two sentences here. The fix for that is a real sentence segmenter with a
-/// per-language model, not a longer list of special cases, and until one is
-/// worth the dependency the cost is one short extra row.
-fn split(text: &str) -> Vec<Vec<(String, String)>> {
+/// The unit is the retrieval granularity, so the rule is the innermost block
+/// that holds text: a paragraph, a heading, a table row, a list item, a fenced
+/// block. A list item that contains a paragraph yields the paragraph; one that
+/// does not — a tight list, where CommonMark puts the text straight in the item
+/// — yields the item, cut short at whatever is nested inside it so no text is
+/// counted twice.
+fn split(text: &str) -> Vec<Block> {
     let mut options = Options::empty();
-    // Tables and task lists because transcripts are full of them, and without
-    // these their syntax arrives as literal `|` and `[ ]` in the prose.
-    // Strikethrough so that struck text is still text rather than `~~`.
     options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
 
-    let mut blocks: Vec<Block> = Vec::new();
-    // The prose of the block being read, with its markup already gone.
-    let mut current = String::new();
-    // Set while inside a fenced or indented code block, where the text is kept
-    // exactly as written instead.
-    let mut code = false;
-
-    // Offsets and not just events, because the postfix is the source between
-    // two blocks and no event carries it: the parser reports the words, and
-    // the whitespace around them is exactly what it is there to throw away.
+    let mut leaves: Vec<Block> = Vec::new();
+    let mut items: Vec<(usize, usize)> = Vec::new();
     for (event, range) in Parser::new_ext(text, options).into_offset_iter() {
-        // A code block is its own path: its text is kept as written, and one
-        // block of it can become several paragraphs.
-        if let Event::End(TagEnd::CodeBlock) = event {
-            // One sentence per line, blank lines dropped. A file of code is not
-            // prose and has no sentences to find in it; a line is the unit that
-            // gets read, quoted and searched for.
-            let mut lines = Vec::new();
-            for line in current.lines() {
-                if !line.trim().is_empty() {
-                    lines.push(cut(line.trim_end()));
-                }
-            }
-            if !lines.is_empty() {
-                blocks.push(Block {
-                    sentences: lines,
-                    code: true,
-                    heading: false,
-                    start: range.start,
-                    end: range.end,
-                });
-            }
-            current.clear();
-            code = false;
+        let Event::Start(tag) = event else {
             continue;
-        }
-
-        // An HTML block is markup wrapped around prose: a `<details>`, a
-        // `<div class="note">`, a hand-written `<table>`. Its own path because
-        // the tags have to come off in one piece -- a comment can span several
-        // `Event::Html` lines, so there is nothing to strip until the block
-        // ends.
-        if let Event::End(TagEnd::HtmlBlock) = event {
-            // Tags are how the words were laid out, not something written to be
-            // read, and they go the way `#` and `- ` go. A comment is not read
-            // either: `<!-- prettier-ignore -->` is a note to a tool.
-            let mut stripped = String::new();
-            let mut rest = current.as_str();
-            while let Some(open) = rest.find('<') {
-                stripped.push_str(&rest[..open]);
-                let tag = &rest[open..];
-                let (skip, close) = match tag.starts_with("<!--") {
-                    true => (4, "-->"),
-                    false => (1, ">"),
-                };
-                match tag[skip..].find(close) {
-                    Some(end) => {
-                        // A tag is a gap between words, not nothing: `<td>a</td>
-                        // <td>b</td>` on one line is two cells, and dropping the
-                        // markup outright would leave `ab`, a word nobody wrote
-                        // and nobody can search for.
-                        match stripped.chars().next_back() {
-                            Some(last) if !last.is_whitespace() => stripped.push(' '),
-                            _ => {}
-                        }
-                        rest = &tag[skip + end + close.len()..];
-                    }
-                    // A `<` with no `>` after it is a less-than sign.
-                    None => {
-                        stripped.push_str(tag);
-                        rest = "";
-                        break;
-                    }
-                }
-            }
-            stripped.push_str(rest);
-            if let Some(sentences) = prose(&stripped) {
-                blocks.push(Block {
-                    sentences,
-                    code: false,
-                    heading: false,
-                    start: range.start,
-                    end: range.end,
-                });
-            }
-            current.clear();
-            continue;
-        }
-
-        // Every other block boundary: whatever has been collected is one block,
-        // and the next one starts here. Both ends are matched because a block
-        // can open right after another closes; an `End` gives the boundary the
-        // block really reached, a `Start` only where the next one begins.
-        let boundary = match &event {
-            Event::End(TagEnd::Heading(_)) => Some((true, range.start, range.end)),
-            Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow | TagEnd::TableHead) => {
-                Some((false, range.start, range.end))
-            }
-            Event::Start(
-                Tag::CodeBlock(_)
-                | Tag::Paragraph
-                | Tag::Heading { .. }
-                | Tag::Item
-                | Tag::TableRow
-                | Tag::TableHead
-                | Tag::HtmlBlock,
-            ) => Some((false, range.start, range.start)),
-            _ => None,
         };
-        if let Some((heading, start, end)) = boundary {
-            if let Some(sentences) = prose(&current) {
-                blocks.push(Block {
-                    sentences,
-                    code: false,
-                    heading,
-                    start,
-                    end,
-                });
-            }
-            current.clear();
-            if matches!(event, Event::Start(Tag::CodeBlock(_))) {
-                code = true;
-            }
-            continue;
-        }
-
-        match event {
-            // Inline text, and inline code, which is prose about code and reads
-            // as part of the sentence around it.
-            Event::Text(text) | Event::Code(text) => current.push_str(&text),
-
-            // One line of an HTML block, its line break included. Collected
-            // raw and taken apart when the block ends.
-            Event::Html(html) => current.push_str(&html),
-
-            // An inline tag is markup around text that arrives on its own, so
-            // `<b>` goes and `inline` stays. Except a break, which is a break
-            // wherever it is written.
-            Event::InlineHtml(html) => {
-                let tag = html.trim_start_matches('<').trim_start_matches('/');
-                if tag.starts_with("br") {
-                    current.push('\n');
-                }
-            }
-
-            // A wrapped line inside one paragraph is not a boundary; a hard
-            // break is one the author asked for.
-            Event::SoftBreak => current.push(if code { '\n' } else { ' ' }),
-            Event::HardBreak => current.push('\n'),
-
-            // A row is one sentence, its cells divided the way the author
-            // divided them. Not a sentence each: "lancedb" on its own row is
-            // half a fact, and it is "lancedb | vectors" that answers a
-            // question. The separator goes in front so the row has no trailing
-            // one, and no punctuation is invented that was never written.
-            Event::Start(Tag::TableCell) if !current.is_empty() => current.push_str(" | "),
-
+        match tag {
+            Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::HtmlBlock
+            | Tag::TableRow
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition => leaves.push(Block {
+                start: range.start,
+                end: range.end,
+                code: false,
+            }),
+            Tag::CodeBlock(_) => leaves.push(Block {
+                start: range.start,
+                end: range.end,
+                code: true,
+            }),
+            Tag::Item => items.push((range.start, range.end)),
             _ => {}
         }
     }
-    if let Some(sentences) = prose(&current) {
-        blocks.push(Block {
-            sentences,
+
+    // Innermost items first, so an item that only contains other items is
+    // trimmed against them rather than the other way round.
+    items.sort_by_key(|(start, end)| end - start);
+    for (start, end) in items {
+        let mut cut = end;
+        let mut inside = false;
+        for block in &leaves {
+            if block.start >= start && block.end <= end {
+                inside = true;
+                cut = cut.min(block.start);
+            }
+        }
+        // An item whose whole content is a nested block contributes nothing of
+        // its own; one with a line of its own in front of the nesting keeps
+        // that line and nothing after it.
+        if inside && text[start..cut].trim().is_empty() {
+            continue;
+        }
+        leaves.push(Block {
+            start,
+            end: cut,
             code: false,
-            heading: false,
-            start: text.len(),
-            end: text.len(),
         });
     }
 
-    let mut paragraphs: Vec<Vec<(String, String)>> = Vec::new();
-    // The paragraph being built. Usually one block, but a heading hands its
-    // sentences to the block after it and this is where they wait.
-    let mut sentences: Vec<(String, String)> = Vec::new();
-    for (index, block) in blocks.iter().enumerate() {
-        // What the author left between this block and the next: one newline
-        // inside a list, two between paragraphs, more where somebody wanted the
-        // gap. Only the whitespace of it — the rest is the next block's own
-        // markup, the `- ` of a list item or the `#` of a heading, and markup
-        // is not what a row keeps. The last block is followed by nothing.
-        let mut gap = String::new();
-        if let Some(next) = blocks.get(index + 1) {
-            if let Some(between) = text.get(block.end..next.start) {
-                for character in between.chars() {
-                    if !character.is_whitespace() || gap.chars().count() == POSTFIX_LIMIT {
-                        break;
-                    }
-                    gap.push(character);
-                }
-            }
-            // Two blocks with nothing between them cannot happen in Markdown,
-            // and a range that did not land on a character boundary is the
-            // parser disagreeing with itself. Either way, keep the words apart.
-            if gap.is_empty() {
-                gap.push_str("\n\n");
-            }
-        }
+    leaves.sort_by_key(|block| (block.start, block.end));
 
-        let separator = if block.code { "\n" } else { " " };
-        // A code block longer than a screenful is several paragraphs: a
-        // 500-line file as one vector answers every query about it equally.
-        // Prose is one paragraph however many sentences it holds.
-        let size = if block.code {
-            CODE_LINES
-        } else {
-            block.sentences.len()
+    // Trim the edges and drop what is left of an empty block. The ranges a
+    // parser hands back run to the start of the next block, so most of them end
+    // in the newline that separated them.
+    let mut units: Vec<Block> = Vec::new();
+    for block in leaves {
+        let slice = &text[block.start..block.end];
+        let front = slice.len() - slice.trim_start().len();
+        let back = slice.len() - slice.trim_end().len();
+        if front + back >= slice.len() {
+            continue;
+        }
+        let block = Block {
+            start: block.start + front,
+            end: block.end - back,
+            code: block.code,
         };
-        let chunks: Vec<&[String]> = block.sentences.chunks(size.max(1)).collect();
-        for (number, chunk) in chunks.iter().enumerate() {
-            for (position, sentence) in chunk.iter().enumerate() {
-                let postfix = if position + 1 < chunk.len() {
-                    separator.to_string()
-                } else if number + 1 < chunks.len() {
-                    // The cut is borhan's, not the author's: the lines run on.
-                    String::from("\n")
-                } else {
-                    gap.clone()
-                };
-                sentences.push((sentence.clone(), postfix));
-            }
-            if !block.heading {
-                paragraphs.push(std::mem::take(&mut sentences));
-            }
+        // A block fully inside one already taken is the outer block's text a
+        // second time, and a duplicated unit is a duplicated hit.
+        if let Some(last) = units.last()
+            && block.start >= last.start
+            && block.end <= last.end
+        {
+            continue;
         }
+        units.push(block);
     }
-    // A heading with nothing under it: the last thing in the text, or followed
-    // only by markup that held no words.
-    if !sentences.is_empty() {
-        paragraphs.push(sentences);
+
+    // A message with no Markdown structure at all — a single line with no
+    // trailing newline is still a paragraph to CommonMark, but an empty body
+    // is not, and a unitless message would be stored and never findable.
+    if units.is_empty() && !text.trim().is_empty() {
+        let front = text.len() - text.trim_start().len();
+        let back = text.len() - text.trim_end().len();
+        units.push(Block {
+            start: front,
+            end: text.len() - back,
+            code: false,
+        });
     }
-    paragraphs
+    units
 }
 
-/// Break one block of prose into sentences, or `None` if it holds no words.
+/// Cut a unit into sentences, as byte ranges into the whole message body.
 ///
-/// A sentence ends at `.`, `!`, `?` or their counterparts in the scripts borhan
-/// is likely to be fed — Persian `؟`, the full-width CJK three — when what
-/// follows is whitespace or the end of the block. That last condition is what
-/// keeps `3.14` and `e.g.` in one piece as long as nothing separates them.
-fn prose(text: &str) -> Option<Vec<String>> {
-    let terminators = ['.', '!', '?', '؟', '。', '！', '？', '…', '؛'];
-    let characters: Vec<char> = text.chars().collect();
+/// Persian is more forgiving here than it looks: `؟`, `!` and `.` all end a
+/// sentence and `؛` is a strong enough break to treat as one. What has to be
+/// caught is the full stop that is not one — inside `3.14`, `e.g.` or a URL —
+/// which is why a terminator only counts when what follows it is whitespace.
+///
+/// Code has no sentences, so a run of lines stands in for one.
+fn sentences(text: &str, block: &Block) -> Vec<(usize, usize)> {
+    let slice = &text[block.start..block.end];
+    let mut cuts = Vec::new();
 
-    let mut sentences = Vec::new();
-    let mut current = String::new();
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index];
-        index += 1;
-        current.push(character);
-
-        // A hard break is the author ending a line on purpose.
-        let mut boundary = character == '\n';
-        if terminators.contains(&character) {
-            // `?!` and `...` end one sentence, not three.
-            while index < characters.len() && terminators.contains(&characters[index]) {
-                current.push(characters[index]);
-                index += 1;
+    if block.code {
+        let mut start = 0;
+        let mut lines = 0;
+        for (at, character) in slice.char_indices() {
+            if character != '\n' {
+                continue;
             }
-            boundary = match characters.get(index) {
-                Some(next) => next.is_whitespace(),
+            lines += 1;
+            if lines < CODE_LINES {
+                continue;
+            }
+            cuts.push((start, at + 1));
+            start = at + 1;
+            lines = 0;
+        }
+        if start < slice.len() {
+            cuts.push((start, slice.len()));
+        }
+    } else {
+        let mut start = 0;
+        let characters: Vec<(usize, char)> = slice.char_indices().collect();
+        for (at, (offset, character)) in characters.iter().enumerate() {
+            if !matches!(character, '.' | '!' | '?' | '؟' | '؛' | '\n') {
+                continue;
+            }
+            let next = characters.get(at + 1);
+            let ends = match next {
                 None => true,
+                Some((_, following)) => following.is_whitespace(),
             };
+            if !ends {
+                continue;
+            }
+            let end = offset + character.len_utf8();
+            if slice[start..end].trim().is_empty() {
+                start = end;
+                continue;
+            }
+            cuts.push((start, end));
+            start = end;
         }
-        // Nothing in the text says where to break, so break where the column
-        // ends. Losing the tail would be worse, and refusing the whole text
-        // over one long line worse still.
-        if current.chars().count() >= CONTENT_LIMIT {
-            boundary = true;
+        if !slice[start..].trim().is_empty() {
+            cuts.push((start, slice.len()));
         }
+    }
 
-        if boundary && !current.trim().is_empty() {
-            sentences.push(current.trim().to_string());
-            current.clear();
+    let mut sentences = Vec::with_capacity(cuts.len());
+    for (start, end) in cuts {
+        let piece = &slice[start..end];
+        let front = piece.len() - piece.trim_start().len();
+        let back = piece.len() - piece.trim_end().len();
+        if front + back >= piece.len() {
+            continue;
         }
+        sentences.push((block.start + start + front, block.start + end - back));
     }
-    if !current.trim().is_empty() {
-        sentences.push(current.trim().to_string());
-    }
-
-    if sentences.is_empty() {
-        return None;
-    }
-    Some(sentences)
+    sentences
 }
 
-/// A line of code, cut to what the column can hold.
+/// A ULID back out of a `BLOB(16)` column.
 ///
-/// Only a minified bundle or a base64 blob reaches this; real code does not
-/// have 5000-character lines. The tail is dropped rather than wrapped, because
-/// a second row holding the middle of a line is not something anyone would
-/// search for or want to read.
-fn cut(line: &str) -> String {
-    let mut text = String::new();
-    for character in line.chars().take(CONTENT_LIMIT) {
-        text.push(character);
-    }
-    text
+/// The columns this reads are written by this module and are always sixteen
+/// bytes; the padding is here so that a truncated database is a wrong id rather
+/// than a panic in the middle of a result set.
+fn identifier(bytes: &[u8]) -> Ulid {
+    let mut key = [0u8; 16];
+    let take = bytes.len().min(16);
+    key[..take].copy_from_slice(&bytes[..take]);
+    Ulid::from_bytes(key)
 }
 
-/// The rule every memory name goes through, on the way in and on the way back
-/// out into a LanceDB filter.
+/// A name is `a-z`, `0-9` and `_`. It is a directory name, it is what every
+/// command takes to find the memory, and it goes into paths and log lines, so
+/// anything that would need quoting or escaping is refused at the door.
 fn check_name(name: &str) -> Result<(), Error> {
-    let characters = name.chars().count();
-    if characters == 0 || characters > NAME_LIMIT {
-        return Err(Error::NameLength { characters });
+    if name.is_empty() {
+        return Err(Error::Empty);
+    }
+    if name.chars().count() > NAME_LIMIT {
+        return Err(Error::Long {
+            name: name.to_string(),
+        });
     }
     for character in name.chars() {
         if !character.is_ascii_lowercase() && !character.is_ascii_digit() && character != '_' {
-            return Err(Error::NameCharacter {
+            return Err(Error::Charset {
                 name: name.to_string(),
-                character,
             });
         }
     }
     Ok(())
-}
-
-/// The LanceDB table a model's vectors live in.
-///
-/// A model name is looser than a memory name — `potion-retrieval-32M` has
-/// hyphens and capitals — so it is taken as written, and only what cannot be
-/// part of a table name is refused. That includes `.` and `/`, which matters
-/// because a `--model` pointing at a directory takes its name from that path.
-fn embedding_table(model: &str) -> Result<String, Error> {
-    if model.is_empty() {
-        return Err(Error::ModelEmpty);
-    }
-    for character in model.chars() {
-        if !character.is_ascii_alphanumeric() && character != '_' && character != '-' {
-            return Err(Error::ModelCharacter {
-                model: model.to_string(),
-                character,
-            });
-        }
-    }
-    Ok(format!("{EMBEDDING_PREFIX}{model}"))
 }

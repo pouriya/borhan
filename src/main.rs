@@ -1,4 +1,6 @@
-mod embedding;
+mod index;
+mod normalize;
+mod search;
 mod storage;
 mod ulid;
 
@@ -12,8 +14,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{filter::LevelFilter, fmt};
 
-use crate::embedding::Embedding;
-use crate::storage::Storage;
+use crate::index::Index;
+use crate::search::{Filter, Group};
+use crate::storage::{Entry, Role, Storage};
 use crate::ulid::Ulid;
 
 /// Name of the environment variable holding the user's home directory.
@@ -31,9 +34,11 @@ const DEFAULT_HOME_DIRECTORY: &str = ".borhan";
 // Everything borhan owns sits under `--home`, and nothing outside it:
 //
 //     ~/.borhan/
-//       storage/      SQLite database and LanceDB tables. Created by `init`.
-//       remote.toml   Present => this instance is a client of a running server.
-//       server.toml   Read by `serve`. Absent => every default applies.
+//       storage/            One directory per memory. Created by `init`.
+//         <name>/borhan.db  The messages. Never derived, never rebuilt.
+//         <name>/index/     The tantivy index. Entirely derived; `rescan` fodder.
+//       remote.toml         Present => this instance is a client of a server.
+//       server.toml         Read by `serve`. Absent => every default applies.
 //
 // None of it is created implicitly: `init` is the only thing that writes the
 // layout, so a missing directory always means "this machine was never set up",
@@ -49,26 +54,42 @@ const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:1995";
 /// listing is one line per memory, so the full text is not what is wanted here.
 const SUMMARY_LIMIT: usize = 60;
 
-/// Words of a row's text shown on one line of `memory search` results, before
-/// an ellipsis takes over.
+/// Words of a snippet shown on one line of `memory search` results.
 ///
-/// Enough that a sentence and most paragraphs arrive whole, so the ranking can
-/// be read without a second command, and short enough that a message — which is
-/// a whole document — does not bury the hits under it. Whatever is shown keeps
-/// the spacing it was stored with, with the newlines escaped, because a hit has
-/// to stay one line for the columns beside it to line up.
-const PREVIEW_WORDS: usize = 100;
+/// The snippet is already the best sentence of the unit rather than the whole
+/// paragraph, so this is a backstop for a paragraph that has no sentence
+/// boundaries in it — a long line of prose, or a table row. Whatever is shown
+/// keeps the spacing it was stored with, with the newlines escaped, because a
+/// hit has to stay one line for the columns beside it to line up.
+const PREVIEW_WORDS: usize = 60;
 
-/// How many times `--limit` a search asks LanceDB for, so that the rows thrown
-/// away afterwards — past the distance floor, or the same text as a nearer hit
-/// — come out of the surplus instead of out of the page. Three, because on a
-/// corpus that repeats itself about one hit in eight was a duplicate, and three
-/// times over covers far worse than that without asking for a page of vectors
-/// nobody will look at.
-const OVERFETCH: usize = 3;
-
+/// Memory store: a SQLite source of truth under a tantivy index.
+///
+/// A memory holds messages. Every message is split into units — a paragraph, a
+/// heading, a list item, a table row, a fenced code block — and a unit is what
+/// search scores and returns. Nothing is created implicitly: `borhan init`
+/// writes the layout, and every command reads `--home`, or `BORHAN_HOME`,
+/// which defaults to `~/.borhan`.
+///
+/// If none of this is familiar yet, the order to work in is:
+///
+/// `memory list` — what memories exist, how large each is, and which languages
+/// it was tagged with.
+///
+/// `memory lexicon <name> <words>…` — whether the words you are about to
+/// search for are in that memory at all, and what they fold to. This is the
+/// step most callers skip and should not: a search for a word the memory has
+/// never seen returns other things rather than nothing, and a result set full
+/// of other things looks exactly like a result set full of answers.
+///
+/// `memory search <name> <groups>…` — concept groups, not a sentence.
+///
+/// `memory cursor <name> <cursor>` — read the messages around a hit, once
+/// search has told you where to look.
+///
+/// `memory get <name> <ids>…` — the full text of units, by id.
 #[derive(Debug, Clone, Parser)]
-#[command(about, version, author)]
+#[command(version, author, disable_help_flag = true)]
 pub struct CommandLine {
     /// Directory holding the storage and the configuration files.
     ///
@@ -93,6 +114,13 @@ pub struct CommandLine {
     #[arg(long, global = true)]
     pub quiet: bool,
 
+    /// Print help. `-h` and `--help` print the same thing: there is no
+    /// abbreviated form, because the reader of a help text here is as likely to
+    /// be a model composing its first query as a person who has run the command
+    /// before, and the short form omits exactly what the first reader needs.
+    #[arg(short = 'h', long = "help", global = true, action = clap::ArgAction::HelpLong)]
+    pub help: Option<bool>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -113,25 +141,12 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<MemoryCommand>,
     },
-
-    /// Inspect and exercise embedding models.
-    Embedding {
-        #[command(subcommand)]
-        command: EmbeddingCommand,
-    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum InitCommand {
     /// Create the local storage. The default when `init` is given no subcommand.
-    Storage {
-        /// Model whose vectors this storage will hold; "default" is the one
-        /// built into the binary. Each model gets its own LanceDB table, so
-        /// re-running with a second model adds one beside the first rather than
-        /// replacing it.
-        #[arg(long, default_value = embedding::DEFAULT_MODEL)]
-        model: String,
-    },
+    Storage,
 
     /// Point this instance at a running server by writing `remote.toml`.
     Remote {
@@ -150,24 +165,41 @@ pub enum MemoryCommand {
     /// Store a new memory and print the ULID it was filed under.
     Create {
         /// Short name, 1 to 40 characters of a-z, 0-9 and _, not already taken.
-        /// Stored, and used as a table name, with a `memory_` in front.
+        /// It is the memory's directory name.
         name: String,
 
-        /// Longer text, up to 2000 characters.
+        /// Longer text, up to 2000 characters. Shown to the calling model, so
+        /// it should say what is in here and what is not.
         #[arg(long)]
         description: Option<String>,
+
+        /// Comma-separated language tags, like `fa,en`. Reported by `memory
+        /// list` so a caller composing a query knows which languages a concept
+        /// group is worth expanding into.
+        #[arg(long, default_value = "fa,en")]
+        languages: String,
     },
 
     /// List the memories, oldest first. The default when `memory` is given no
     /// subcommand.
+    ///
+    /// One line per memory, six columns: the id, when it was created, the name,
+    /// what is in it, the language tags, and the description cut to 60
+    /// characters.
+    ///
+    /// The name is the first argument of every other subcommand. The language
+    /// tags are a hint from whoever created the memory about which languages a
+    /// concept group is worth expanding into — they are not enforced, and a
+    /// memory tagged `fa` can still hold English. The description says what is
+    /// in the memory and what is not, which is what to read before deciding
+    /// this is the one to search.
     List,
 
-    /// Add a message to a memory, broken into paragraphs and sentences.
+    /// Add a message to a memory, split into units and indexed.
     ///
-    /// The text is read as Markdown: a heading, a bullet, a table row and a
-    /// fenced code block each become a paragraph, and prose is cut into
-    /// sentences. Every piece is stored and embedded, so a search can answer at
-    /// whichever grain the question was asked at.
+    /// The text is read as Markdown: a paragraph, a heading, a list item, a
+    /// table row and a fenced code block each become a unit, which is the
+    /// granularity search scores and returns.
     Add {
         /// The memory to file it under. It has to exist already.
         name: String,
@@ -175,134 +207,218 @@ pub enum MemoryCommand {
         /// The text, as Markdown.
         text: String,
 
-        /// Which layer to attach at. The splitting happens below it, so
-        /// `paragraph` hangs new paragraphs off an existing message and
-        /// `sentence` stores exactly what it is given.
-        #[arg(long = "type", default_value = "message")]
-        kind: String,
-
-        /// The feeder's session identifier — a UUID, usually. Required for a
-        /// message; a paragraph and a sentence take it off their parent. The
-        /// first message of a session also writes the session row.
+        /// The feeder's session identifier — a thread id, a channel, a
+        /// filename. The first message of a session writes the session row.
         #[arg(long)]
-        session: Option<String>,
+        session: String,
 
-        /// The feeder's message identifier. Required for a message, and for a
-        /// paragraph, which is how it finds the message it belongs to.
+        /// The feeder's message identifier, if it has one. Two messages with
+        /// the same one in the same session is an error, so a replay that
+        /// overlaps what is already stored fails loudly.
         #[arg(long)]
         message: Option<String>,
 
-        /// The ULID of the paragraph a sentence belongs to, as `memory add
-        /// --type paragraph` printed it. Required for a sentence.
+        /// user, assistant or tool.
+        #[arg(long, default_value = "user")]
+        role: String,
+
+        /// Display name of the author. Defaults to the role.
         #[arg(long)]
-        paragraph: Option<String>,
+        author: Option<String>,
 
-        /// user or assistant. Required for a message; inherited below it.
+        /// Unix milliseconds. Defaults to now. Supplied rather than assumed
+        /// because a transcript is usually replayed, not watched.
         #[arg(long)]
-        role: Option<String>,
-
-        /// Who that was: a model identifier, or the user's name.
-        #[arg(long = "role-name")]
-        role_name: Option<String>,
-
-        /// "default" for the model built into the binary, or a model directory.
-        /// It must be one this storage was initialized with.
-        #[arg(long, default_value = embedding::DEFAULT_MODEL)]
-        model: String,
+        ts: Option<i64>,
     },
 
-    /// Print rows, with their text put back together.
+    /// Print units back by id, in the order asked.
     ///
-    /// Either by ULID, as many as you care to give it, in any order, printed
-    /// back in the order asked — so the output of `memory search` pipes
-    /// straight in and keeps its ranking.
+    /// A search result shows one sentence of a unit; this shows the unit.
     ///
-    /// Or by walking, with `--session`, `--message` and `--paragraph`, which
-    /// take the feeder's own identifiers and need no ULID at all. Each names
-    /// something and gets back the layer under it: a session gives its
-    /// messages, a message its paragraphs, a paragraph its sentences. That is
-    /// how you read around a hit rather than only at it.
+    /// borhan memory get notes 01J8… 01J9…
     Get {
-        /// The memory the rows belong to.
+        /// The memory the units are in.
         name: String,
 
-        /// One or more 26-character ULIDs, as `memory search` printed them.
-        /// A session's id is not one of them: a session stores no text.
+        /// Unit ULIDs: the `cursor` column of a `memory search` result, which
+        /// is the third field of the first line of each hit.
         ids: Vec<String>,
 
-        /// The session to walk, named as whatever fed borhan named it. On its
-        /// own it gives that session's messages.
-        #[arg(long)]
-        session: Option<String>,
-
-        /// The message to walk, within `--session`: gives its paragraphs.
-        #[arg(long, requires = "session")]
-        message: Option<String>,
-
-        /// The paragraph to walk, by ULID: gives its sentences. Needs no
-        /// session, since a ULID is already unique across the memory.
-        #[arg(long)]
-        paragraph: Option<String>,
-
-        /// Which child to start at, counted from 0 in reading order. Past the
-        /// end is an empty result, which is how you find out where the end is.
-        #[arg(long, default_value_t = 0)]
-        from: i64,
-
-        /// How many to print. A window, because a session can hold a whole
-        /// corpus and a message a whole document.
-        #[arg(long, default_value_t = 20)]
-        count: i64,
-
-        /// Print a JSON array instead of text blocks: one object per row, with
-        /// the cursor columns alongside the text.
+        /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
     },
 
-    /// Print what in a memory is closest to a text.
+    /// Search a memory with concept groups.
+    ///
+    /// A group is a comma-separated list of words that mean the same thing,
+    /// across languages if that is what the memory holds. Groups are the
+    /// arguments; there is no flag, and nothing to repeat:
+    ///
+    /// borhan memory search notes error,fault,خطا '!timeout'
+    ///
+    /// Words inside one group are alternatives competing for a single slot and
+    /// only the best of them scores, so one group should hold every spelling,
+    /// inflection and translation of one idea, and never two different ideas.
+    /// Separate groups are separate things being asked about, and how many of
+    /// them a unit matches — its coverage — is the largest term in the score.
+    /// Three groups of two words each ask a far better question than one group
+    /// of six.
+    ///
+    /// A leading `!` makes a group required: units that miss it are dropped
+    /// rather than ranked lower. `label=word,word` names a group so the result
+    /// line can report which ones hit; unlabelled, the first word is the label.
+    ///
+    /// Do not paste a sentence in. Reduce it to the two to four things that
+    /// have to co-occur, then expand each one into its synonyms. So "why does
+    /// the borrow checker reject this mutable alias" becomes three groups:
+    ///
+    /// borrow,borrowck,borrowing mutable,mutably,mut alias,aliasing
+    ///
+    /// Two lines come back per hit, under a header that names the columns:
+    ///
+    /// 0.847  2/3  01J8…  session  message  75 words  [site,sx]
+    ///
+    /// "the best sentence of the unit, quoted"
+    ///
+    /// `score` is relative to the best hit in this result set, which is always
+    /// 1.000; it orders these hits and means nothing next to the score of a
+    /// different search. `cover` is how many groups the unit matched out of how
+    /// many were asked, and it is the more trustworthy of the two — prefer 3/3
+    /// at a middling score over 1/3 at a high one. `cursor` is what both
+    /// `memory cursor` and `memory get` take.
+    ///
+    /// Hits go to standard output and nothing else does. The header, the
+    /// unknown-word lines, `No hits.` and the closing vocabulary line all go to
+    /// standard error, so a pipeline reading stdout receives only results.
+    ///
+    /// Read the unknown-word lines. `unknown: "cva" (group "dx") matched
+    /// nothing` is the difference between "this memory disagrees with you" and
+    /// "this memory has never heard that word", and only the second is a reason
+    /// to search again with different wording. `memory lexicon` answers the
+    /// same question before a search rather than after it.
+    ///
+    /// The closing line lists frequent terms that appear across these results
+    /// and were not asked for. It is the cheapest source of a better second
+    /// query: it is how you learn that the corpus says `x-ray` where you said
+    /// `radiograph`.
     Search {
-        /// The memory to search.
+        /// The memory to search, by the name `memory list` prints.
         name: String,
 
-        /// What to search for.
-        text: String,
+        /// One or more groups, each a comma-separated list of alternatives.
+        /// Quote a group only when it starts with `!`, which the shell would
+        /// otherwise take.
+        #[arg(required = true, num_args = 1..)]
+        groups: Vec<String>,
 
-        /// Only look at one layer: message or sentence. Without it a sentence
-        /// and its message compete for the same places in the results.
-        /// Paragraphs are not embedded and so are never found by a search,
-        /// whatever this says; anything stored before that changed still is.
-        #[arg(long = "type")]
-        kind: Option<String>,
-
-        /// How many to print.
+        /// Hits to return, at most.
         #[arg(long, default_value_t = 10)]
         limit: usize,
 
-        /// Drop anything further than this. Distance, so 0 is identical and
-        /// smaller is closer; without it a search returns its `--limit` rows
-        /// however far away they are, and "nothing here matches" looks exactly
-        /// like a good answer. What counts as far depends on the model and on
-        /// what is stored, so there is no default worth guessing.
-        #[arg(long)]
-        max_distance: Option<f32>,
+        /// Units returned from any one message. Twenty hits from one message is
+        /// a wasted result set; the cursor is how you read the rest of it.
+        #[arg(long, default_value_t = 2)]
+        max_per_message: usize,
 
-        /// "default" for the model built into the binary, or a model directory.
-        /// Searching with a different model than you stored with finds nothing:
-        /// the vectors are in another table.
-        #[arg(long, default_value = embedding::DEFAULT_MODEL)]
-        model: String,
+        /// Confine the search to one session, by its ULID.
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Only messages at or after this unix-millisecond timestamp.
+        #[arg(long)]
+        after: Option<i64>,
+
+        /// Only messages at or before this unix-millisecond timestamp.
+        #[arg(long)]
+        before: Option<i64>,
+
+        /// Repeatable: user, assistant or tool.
+        #[arg(long = "role")]
+        roles: Vec<String>,
+
+        /// Emit one JSON object holding `hits`, `unknown` and `hints` instead
+        /// of the table. All of it goes to standard output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read the messages around a hit.
+    ///
+    /// The second half of the retrieval loop: recall a gist from a partial cue,
+    /// then elaborate around it deliberately. No scoring and no snippets — the
+    /// caller has already decided this region is worth reading.
+    ///
+    /// borhan memory cursor notes 01J8… --before 2 --after 2
+    Cursor {
+        /// The memory the hit came from.
+        name: String,
+
+        /// The `cursor` of a hit, as `memory search` printed it: the third
+        /// field of the first line of the hit.
+        cursor: String,
+
+        /// Messages to include before the anchor. Whole messages, not units, so
+        /// `--before 0 --after 0` returns the one message the hit came from.
+        #[arg(long, default_value_t = 2)]
+        before: i64,
+
+        /// Messages to include after the anchor.
+        #[arg(long, default_value_t = 2)]
+        after: i64,
+
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ask what a word looks like in this memory before searching for it.
+    ///
+    /// borhan memory lexicon notes error errors خطا
+    ///
+    /// One line per word:
+    ///
+    /// errors  surface=errors (12)  lemma=error (175)  context=(0)
+    ///
+    /// `surface` is that exact spelling and the number of units holding it.
+    /// `lemma` is what the word folds to — Snowball for English, affix
+    /// stripping and letter folding for Persian — and the number of units
+    /// holding anything that folds to the same thing. The lemma count is the
+    /// one that matters, because it is what search ranks on.
+    ///
+    /// `context` counts units the term was propagated into from a neighbour
+    /// rather than occurring in. A term with a high context count and a low
+    /// lemma count is one the memory talks around without naming.
+    ///
+    /// A lemma count of 0 means this memory has never seen the idea. Searching
+    /// for it anyway returns other things rather than nothing, and after the
+    /// fact there is no way to tell those apart from an answer.
+    ///
+    /// It is also how to find the word a corpus actually uses: if `radiograph`
+    /// is 0, try `x-ray`; if `بریدگی` is 0, try `زخم`.
+    Lexicon {
+        /// The memory to look in.
+        name: String,
+
+        /// Words to look up, any number of them, in any language the memory
+        /// holds. They are looked up exactly as written, so pass the word you
+        /// were about to search with, not a stem of it.
+        words: Vec<String>,
+    },
+
+    /// Split every stored message again and rebuild the index from scratch.
+    ///
+    /// The supported way to change the normalizer or the splitter: change it,
+    /// bump the version, run this. Nothing is lost, because everything this
+    /// destroys was derived from the messages, which are not touched.
+    Rescan {
+        /// The memory to rebuild.
+        name: String,
     },
 }
 
-/// `<home>/remote.toml`.
-///
-/// Its *presence* is the mode switch: with the file there this instance owns no
-/// storage of its own and talks to the `borhan serve` named by `server`;
-/// without it, everything happens against `<home>/storage` locally.
-///
-/// Written by `init remote` and read on every startup, so the two directions go
-/// through the same struct and cannot drift apart.
+/// `<home>/remote.toml`. Present means this instance is a client.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
@@ -327,26 +443,6 @@ pub struct Server {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Clone, Subcommand)]
-pub enum EmbeddingCommand {
-    /// Load a model from a directory and report what it found.
-    Load {
-        /// Directory holding config.json, tokenizer.json and model.safetensors.
-        directory: PathBuf,
-    },
-
-    /// Embed a text and print the resulting vector.
-    #[command(name = "do")]
-    Do {
-        /// "default" for the model built into the binary, or a model directory.
-        #[arg(long, default_value = embedding::DEFAULT_MODEL)]
-        model: String,
-
-        /// The text to embed.
-        text: String,
-    },
-}
-
 impl CommandLine {
     pub fn logging_level(&self) -> LevelFilter {
         if self.quiet {
@@ -359,6 +455,75 @@ impl CommandLine {
             LevelFilter::INFO
         }
     }
+}
+
+/// One group argument.
+///
+/// `label=a,b,c` names the group, a leading `!` makes it required, and the
+/// label defaults to the first word so that a result set is readable without
+/// the caller having named anything.
+fn parse_group(text: &str) -> anyhow::Result<Group> {
+    let (required, rest) = match text.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+
+    // Split on the first `=` only, so a label is a label and everything after
+    // it is words. A word containing `=` is not a word.
+    let (label, list) = match rest.split_once('=') {
+        Some((label, list)) => (Some(label.trim().to_string()), list),
+        None => (None, rest),
+    };
+
+    let mut words = Vec::new();
+    for word in list.split(',') {
+        let word = word.trim();
+        if word.is_empty() {
+            continue;
+        }
+        words.push(word.to_string());
+    }
+    if words.is_empty() {
+        anyhow::bail!("Group {text:?} has no words in it");
+    }
+
+    let label = match label {
+        Some(label) if !label.is_empty() => label,
+        _ => words[0].clone(),
+    };
+    Ok(Group {
+        label,
+        words,
+        required,
+    })
+}
+
+/// Cut a text to [`PREVIEW_WORDS`] and escape what would break the column
+/// alignment. Whatever survives keeps the spacing it was stored with, so a code
+/// block still reads as a code block.
+fn preview(text: &str) -> String {
+    let mut words = 0;
+    let mut cut = text.len();
+    for (at, character) in text.char_indices() {
+        if !character.is_whitespace() {
+            continue;
+        }
+        words += 1;
+        if words >= PREVIEW_WORDS {
+            cut = at;
+            break;
+        }
+    }
+    let mut preview = text[..cut]
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    if cut < text.len() {
+        preview.push('…');
+    }
+    preview
 }
 
 /// `~/.borhan`, resolving the home directory the way the `dirs` crate does but
@@ -518,10 +683,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match settings.command {
-        Command::Init { command } => match command.unwrap_or(InitCommand::Storage {
-            model: embedding::DEFAULT_MODEL.to_string(),
-        }) {
-            InitCommand::Storage { model } => {
+        Command::Init { command } => match command.unwrap_or(InitCommand::Storage) {
+            InitCommand::Storage => {
                 if let Some(remote) = remote {
                     anyhow::bail!(
                         "{remote_configuration:?} makes this instance a client of {}, and a \
@@ -531,41 +694,19 @@ async fn main() -> anyhow::Result<()> {
                         remote.server
                     );
                 }
-                // The model is loaded here because its width is what the vector
-                // table is shaped by, and its name is what that table is called
-                // — so `init` has to have the model in hand before it can make
-                // one. Everything else about making a storage lives in
-                // `Storage::initialize`, which is the single call below.
-                tracing::debug!(msg = "Loading embedding model", model = model);
-                let embedder = embedding::load(&model)?;
-                let report =
-                    Storage::initialize(&storage, embedder.name(), embedder.dimensions()).await?;
-                tracing::info!(
-                    msg = "Initialized storage",
-                    directory = ?storage,
-                    existing = report.existing,
-                    model = embedder.name(),
-                    dimensions = embedder.dimensions(),
-                    vectors = report.vectors
-                );
 
-                if report.existing {
+                // The whole of making a storage, now that a memory is a
+                // directory rather than a table: there is nothing to shape
+                // ahead of time, so this is a mkdir and the announcement that
+                // it happened.
+                let existing = storage.is_dir();
+                fs::create_dir_all(&storage)
+                    .with_context(|| format!("Could not create {storage:?}"))?;
+                tracing::info!(msg = "Initialized storage", directory = ?storage, existing = existing);
+                if existing {
                     println!("Already initialized: {}", storage.display());
                 } else {
                     println!("Initialized {}", storage.display());
-                }
-                if report.vectors {
-                    println!(
-                        "Added vectors for {} ({} dimensions)",
-                        embedder.name(),
-                        embedder.dimensions()
-                    );
-                } else {
-                    println!(
-                        "Already has vectors for {} ({} dimensions)",
-                        embedder.name(),
-                        embedder.dimensions()
-                    );
                 }
                 Ok(())
             }
@@ -676,7 +817,11 @@ async fn main() -> anyhow::Result<()> {
             }
 
             match command.unwrap_or(MemoryCommand::List) {
-                MemoryCommand::Create { name, description } => {
+                MemoryCommand::Create {
+                    name,
+                    description,
+                    languages,
+                } => {
                     check_storage(&settings.home, &storage, "memory create ...")?;
 
                     tracing::debug!(
@@ -684,8 +829,15 @@ async fn main() -> anyhow::Result<()> {
                         name = name,
                         description = description.is_some()
                     );
-                    let store = Storage::open(&storage)?;
-                    let id = store.create(&name, description.as_deref())?;
+                    let (store, id) =
+                        Storage::create(&storage, &name, description.as_deref(), &languages)?;
+                    // The index is made now rather than on the first `add`, so
+                    // that a memory is either wholly there or wholly not.
+                    let built = Index::attach(&store.directory.join(index::DIRECTORY))?;
+                    store.set_meta(index::VERSION_KEY, &normalize::VERSION.to_string())?;
+                    store.set_meta(index::BUILT_KEY, &Ulid::now().to_string())?;
+                    drop(built);
+
                     tracing::info!(msg = "Created memory", ulid = %id, name = name);
                     println!("{id}");
                     Ok(())
@@ -694,126 +846,57 @@ async fn main() -> anyhow::Result<()> {
                 MemoryCommand::List => {
                     check_storage(&settings.home, &storage, "memory list")?;
 
-                    let store = Storage::open(&storage)?;
-                    let memories = store.list()?;
+                    let memories = Storage::list(&storage)?;
                     tracing::info!(msg = "Listed memories", count = memories.len());
                     if memories.is_empty() {
-                        // Nothing on stdout, so a pipe reading this sees an
-                        // empty list rather than a sentence about one.
-                        eprintln!("No memories in {}", storage.display());
+                        eprintln!("No memories yet — `borhan memory create <name>`.");
                         return Ok(());
                     }
 
-                    // Rendered first, then measured, then printed: the columns
-                    // are as wide as what goes in them, and a number's width is
-                    // not something to predict.
-                    let mut rows = Vec::with_capacity(memories.len());
+                    let mut widths = (0, 0, 0);
+                    let mut rows = Vec::new();
                     for memory in &memories {
-                        let created =
-                            match chrono::DateTime::from_timestamp_millis(memory.created_at) {
-                                Some(created) => {
-                                    created.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                                }
-                                // Only reachable for a row written by something
-                                // other than `create`; show the number rather than
-                                // refusing to list the rest of the table.
-                                None => format!("{}ms", memory.created_at),
-                            };
-                        // First line only, cut to length: a description is up
-                        // to 2000 characters and may hold newlines, and one
-                        // memory has to stay one row.
-                        let mut summary = String::new();
-                        if let Some(description) = &memory.description
-                            && let Some(first) = description.lines().next()
-                        {
-                            for character in first.chars().take(SUMMARY_LIMIT) {
-                                summary.push(character);
+                        let created = chrono::DateTime::from_timestamp_millis(memory.created_at);
+                        let created = match created {
+                            Some(created) => {
+                                created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                             }
-                            // Bytes, not characters: `summary` is a prefix of
-                            // `first`, which is a prefix of the whole
-                            // description, so shorter means something was left
-                            // out either way.
-                            if summary.len() < first.len() || first.len() < description.len() {
-                                summary.push('…');
-                            }
-                        }
-
-                        // Rounded to whole percents, and they will not always
-                        // add up to 100: `role` is not constrained by the
-                        // schema, so a message written by something other than
-                        // borhan can carry neither value and is counted in
-                        // `messages` alone.
-                        let counts = &memory.counts;
-                        let share = if counts.messages == 0 {
-                            // Nothing spoke, so there is no split to show. A
-                            // pair of zero percents would read as a fact.
-                            "-".to_string()
-                        } else {
-                            let percent =
-                                |part: u64| (part * 200 + counts.messages) / (counts.messages * 2);
-                            format!("{}%/{}%", percent(counts.assistant), percent(counts.user))
+                            None => "-".to_string(),
                         };
+                        let counts = format!(
+                            "{} sessions, {} messages, {} units",
+                            memory.sessions, memory.messages, memory.units
+                        );
+                        let summary = match &memory.description {
+                            Some(description) => {
+                                let line = description.lines().next().unwrap_or("");
+                                if line.chars().count() > SUMMARY_LIMIT {
+                                    let cut: String =
+                                        line.chars().take(SUMMARY_LIMIT).collect::<String>();
+                                    format!("{cut}…")
+                                } else {
+                                    line.to_string()
+                                }
+                            }
+                            None => String::new(),
+                        };
+                        widths.0 = widths.0.max(memory.name.len());
+                        widths.1 = widths.1.max(counts.len());
+                        widths.2 = widths.2.max(memory.languages.len());
                         rows.push((
+                            memory.id.to_string(),
                             created,
                             memory.name.clone(),
-                            counts.sessions.to_string(),
-                            counts.messages.to_string(),
-                            counts.paragraphs.to_string(),
-                            counts.sentences.to_string(),
-                            share,
+                            counts,
+                            memory.languages.clone(),
                             summary,
                         ));
                     }
-
-                    // Wide enough for the heading as well, since that is what
-                    // the numbers line up under.
-                    let mut name = "NAME".len();
-                    let mut sessions = "SESS".len();
-                    let mut messages = "MSG".len();
-                    let mut paragraphs = "PARA".len();
-                    let mut sentences = "SENT".len();
-                    let mut share = "A/U".len();
-                    for row in &rows {
-                        // Names are ASCII by construction and so are the
-                        // numbers, so their length in bytes is their width on
-                        // screen and the columns line up.
-                        if row.1.len() > name {
-                            name = row.1.len();
-                        }
-                        if row.2.len() > sessions {
-                            sessions = row.2.len();
-                        }
-                        if row.3.len() > messages {
-                            messages = row.3.len();
-                        }
-                        if row.4.len() > paragraphs {
-                            paragraphs = row.4.len();
-                        }
-                        if row.5.len() > sentences {
-                            sentences = row.5.len();
-                        }
-                        if row.6.len() > share {
-                            share = row.6.len();
-                        }
-                    }
-
-                    // The heading goes to stderr for the same reason the "no
-                    // memories" sentence does: stdout stays nothing but rows,
-                    // so a pipe reads data and a terminal still gets told what
-                    // the columns are.
-                    eprintln!(
-                        "{:26}  {:24}  {:name$}  {:>sessions$}  {:>messages$}  {:>paragraphs$}  \
-                         {:>sentences$}  {:>share$}  DESCRIPTION",
-                        "ULID", "CREATED", "NAME", "SESS", "MSG", "PARA", "SENT", "A/U"
-                    );
-                    for (index, memory) in memories.iter().enumerate() {
-                        let row = &rows[index];
-                        let line = format!(
-                            "{}  {}  {:name$}  {:>sessions$}  {:>messages$}  {:>paragraphs$}  \
-                             {:>sentences$}  {:>share$}  {}",
-                            memory.id, row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7
+                    for (id, created, name, counts, languages, summary) in rows {
+                        println!(
+                            "{id}  {created}  {name:<0$}  {counts:<1$}  {languages:<2$}  {summary}",
+                            widths.0, widths.1, widths.2
                         );
-                        println!("{}", line.trim_end());
                     }
                     Ok(())
                 }
@@ -821,262 +904,116 @@ async fn main() -> anyhow::Result<()> {
                 MemoryCommand::Add {
                     name,
                     text,
-                    kind,
                     session,
                     message,
-                    paragraph,
                     role,
-                    role_name,
-                    model,
+                    author,
+                    ts,
                 } => {
                     check_storage(&settings.home, &storage, "memory add ...")?;
-                    let kind = match storage::Kind::parse(&kind) {
-                        Some(kind) => kind,
-                        None => anyhow::bail!(
-                            "Unknown type {kind:?}: a row is a message, a paragraph or a \
-                             sentence. A session row is written for you, with the first \
-                             message that names one."
-                        ),
+
+                    let Some(role) = Role::parse(&role) else {
+                        anyhow::bail!("Role {role:?} is not one of user, assistant or tool");
                     };
-                    let role = match role {
-                        Some(role) => match storage::Role::parse(&role) {
-                            Some(role) => Some(role),
-                            None => anyhow::bail!("Unknown role {role:?}: it is user or assistant"),
-                        },
-                        None => None,
+                    let mut store = Storage::open(&storage, &name)?;
+                    let built = Index::open(&store)?;
+
+                    let ts = match ts {
+                        Some(ts) => ts,
+                        None => Ulid::now(),
                     };
-                    let paragraph = match paragraph {
-                        Some(paragraph) => Some(Ulid::parse(&paragraph)?),
-                        None => None,
+                    let author = match &author {
+                        Some(author) => author.as_str(),
+                        None => role.as_str(),
                     };
-
-                    let store = Storage::open(&storage)?;
-                    tracing::debug!(msg = "Loading embedding model", model = model);
-                    let embedder = embedding::load(&model)?;
-                    // Opened before anything is written, so that a storage
-                    // holding no table for this model fails here rather than
-                    // after the rows have landed.
-                    let vectors = store.open_vectors(embedder.name()).await?;
-
-                    // The rows first, because they are what mint the ids the
-                    // vectors are filed under, and because splitting is where
-                    // most of what can go wrong goes wrong. SQLite and LanceDB
-                    // cannot be one transaction, so this order decides which
-                    // way a crash between them breaks: rows with no vectors are
-                    // invisible to search but still reachable by walking the
-                    // cursor, while vectors with no rows would put ids into
-                    // search results that resolve to nothing.
-                    let rows = store.add(
-                        &name,
-                        &storage::Entry {
-                            kind,
-                            session,
-                            message,
-                            paragraph,
-                            role,
-                            role_name,
-                            content: text,
-                        },
-                    )?;
-
-                    // One call for the lot: model2vec is a lookup table, and
-                    // the per-call cost is loading it, not the text. Rows too
-                    // short to be worth a vector are left out here — they are
-                    // written either way, and `add` has already said which.
-                    let mut embedded = Vec::new();
-                    let mut texts = Vec::new();
-                    for row in &rows {
-                        if row.embed {
-                            embedded.push(row);
-                            texts.push(row.text.clone());
-                        }
-                    }
-                    let embeddings = embedder.embed(&texts);
-                    if embeddings.len() != embedded.len() {
-                        anyhow::bail!("Embedded {} of {} rows", embeddings.len(), embedded.len());
-                    }
-                    let mut written = Vec::with_capacity(embedded.len());
-                    for (row, embedding) in embedded.iter().zip(embeddings) {
-                        written.push(storage::Vector {
-                            memory: name.clone(),
-                            kind: row.kind,
-                            id: row.id,
-                            embedding,
-                        });
-                    }
-                    vectors.add(&written).await?;
-
-                    // Counted for the log and the summary line, since "added a
-                    // message" says nothing about how much went in.
-                    let mut paragraphs = 0;
-                    let mut sentences = 0;
-                    for row in &rows {
-                        match row.kind {
-                            storage::Kind::Paragraph => paragraphs += 1,
-                            storage::Kind::Sentence => sentences += 1,
-                            storage::Kind::Message => {}
-                        }
-                    }
-                    tracing::info!(
-                        msg = "Added to memory",
+                    tracing::debug!(
+                        msg = "Adding message",
                         memory = name,
-                        kind = kind.as_str(),
-                        rows = rows.len(),
-                        paragraphs = paragraphs,
-                        sentences = sentences,
-                        vectors = written.len(),
-                        model = embedder.name()
+                        session = session,
+                        bytes = text.len()
                     );
 
-                    // The top row's ULID on stdout and nothing else, so it
-                    // pipes into the `--paragraph` of whatever goes in next.
-                    // What it was broken into goes to stderr.
-                    match rows.first() {
-                        Some(row) => println!("{}", row.id),
-                        // `add` returns at least the row it was asked for.
-                        None => anyhow::bail!("Nothing was written"),
-                    }
-                    eprintln!(
-                        "{} paragraph{}, {} sentence{}",
-                        paragraphs,
-                        if paragraphs == 1 { "" } else { "s" },
-                        sentences,
-                        if sentences == 1 { "" } else { "s" }
+                    // Layer one first and on its own. If indexing fails after
+                    // this, the message is still stored and `rescan` recovers
+                    // it; the other order loses it.
+                    let written = store.add(&Entry {
+                        session: &session,
+                        message: message.as_deref(),
+                        author,
+                        role,
+                        ts,
+                        body: &text,
+                    })?;
+
+                    let mut writer = built.writer()?;
+                    built.add(&writer, &written, role.code(), ts, &text)?;
+                    built.commit(&mut writer)?;
+
+                    tracing::info!(
+                        msg = "Added message",
+                        memory = name,
+                        ulid = %written.message,
+                        seq = written.seq,
+                        units = written.units.len()
                     );
+                    eprintln!("{} units", written.units.len());
+                    println!("{}", written.message);
                     Ok(())
                 }
 
-                MemoryCommand::Get {
-                    name,
-                    ids,
-                    session,
-                    message,
-                    paragraph,
-                    from,
-                    count,
-                    json,
-                } => {
+                MemoryCommand::Get { name, ids, json } => {
                     check_storage(&settings.home, &storage, "memory get ...")?;
-
-                    // Two ways in, and asking for both is asking for two
-                    // different things at once. Checked here rather than with
-                    // a clap group so the message can say what to do instead.
-                    let walking = session.is_some() || paragraph.is_some();
-                    if !ids.is_empty() && walking {
-                        anyhow::bail!(
-                            "Give ULIDs or give --session/--paragraph, not both: one reads \
-                             the rows you name, the other reads what is under them."
-                        );
-                    }
-                    if ids.is_empty() && !walking {
-                        anyhow::bail!(
-                            "Nothing to read: give one or more ULIDs, or --session NAME to \
-                             walk a session, or --paragraph ULID to walk a paragraph."
-                        );
+                    if ids.is_empty() {
+                        anyhow::bail!("Pass at least one unit ULID to read back");
                     }
 
-                    // Parsed before the storage is opened: a typo in a ULID is
-                    // the caller's mistake and should not read like the store
-                    // is broken.
-                    let mut parsed = Vec::with_capacity(ids.len());
+                    let store = Storage::open(&storage, &name)?;
+                    let mut units = Vec::new();
                     for id in &ids {
-                        parsed.push(Ulid::parse(id)?);
+                        match Ulid::parse(id) {
+                            Ok(id) => units.push(id),
+                            Err(error) => {
+                                return Err(anyhow::Error::new(error)
+                                    .context(format!("{id:?} is not a ULID")));
+                            }
+                        }
                     }
-                    let paragraph = match &paragraph {
-                        Some(paragraph) => Some(Ulid::parse(paragraph)?),
-                        None => None,
-                    };
-
-                    let store = Storage::open(&storage)?;
-                    let records = if walking {
-                        store.walk(
-                            &name,
-                            session.as_deref(),
-                            message.as_deref(),
-                            paragraph,
-                            from,
-                            count,
-                        )?
-                    } else {
-                        store.get(&name, &parsed)?
-                    };
-                    tracing::info!(
-                        msg = "Read rows",
-                        memory = name,
-                        asked = parsed.len(),
-                        found = records.len()
-                    );
+                    let located = store.locate(&units)?;
+                    for id in &units {
+                        if !located.iter().any(|row| row.unit == *id) {
+                            eprintln!("No unit {id}");
+                        }
+                    }
 
                     if json {
-                        let mut array = Vec::with_capacity(records.len());
-                        for record in &records {
-                            let created =
-                                match chrono::DateTime::from_timestamp_millis(record.created_at) {
-                                    Some(created) => {
-                                        created.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                                    }
-                                    None => record.created_at.to_string(),
-                                };
+                        let mut array = Vec::new();
+                        for row in &located {
                             array.push(serde_json::json!({
-                                "id": record.id.to_string(),
-                                "type": record.kind.as_str(),
-                                "session": record.session,
-                                "message": record.message,
-                                "paragraph": record.paragraph.map(|id| id.to_string()),
-                                "position": record.position,
-                                "role": record.role.map(|role| role.as_str()),
-                                "role_name": record.role_name,
-                                "created_at": created,
-                                "words": record.text.split_whitespace().count(),
-                                "text": record.text,
+                                "unit": row.unit.to_string(),
+                                "message": row.message.to_string(),
+                                "message_ref": row.message_ref,
+                                "session": row.session.to_string(),
+                                "session_ref": row.session_ref,
+                                "seq": row.seq,
+                                "unit_seq": row.unit_seq,
+                                "author": row.author,
+                                "role": row.role.as_str(),
+                                "ts": row.ts,
+                                "text": row.text(),
                             }));
                         }
-                        // An array even for one id, and an empty one when
-                        // nothing resolved: whatever reads this should not have
-                        // to branch on how many were asked for.
                         println!("{}", serde_json::Value::Array(array));
                     } else {
-                        for (index, record) in records.iter().enumerate() {
-                            // Blank line between rows, none before the first,
-                            // so one id prints as one paragraph of text.
-                            if index > 0 {
-                                println!();
-                            }
-                            let mut location = record.session.clone();
-                            if let Some(message) = &record.message {
-                                location.push('/');
-                                location.push_str(message);
-                            }
-                            let speaker = match (record.role, &record.role_name) {
-                                (Some(role), Some(name)) => format!("{}/{name}", role.as_str()),
-                                (Some(role), None) => role.as_str().to_string(),
-                                (None, _) => String::from("-"),
-                            };
+                        for row in &located {
                             println!(
-                                "{}  {}  {}#{}  {}  {} words",
-                                record.id,
-                                record.kind.as_str(),
-                                location,
-                                record.position,
-                                speaker,
-                                record.text.split_whitespace().count()
+                                "{}  {}  {}  unit {}",
+                                row.unit,
+                                row.role.as_str(),
+                                row.session_ref,
+                                row.unit_seq
                             );
-                            println!("{}", record.text);
-                        }
-                    }
-
-                    // Named one by one rather than counted: an id that resolved
-                    // to nothing is either a typo or a vector that outlived its
-                    // row, and both are things you want to see spelled out.
-                    for id in &parsed {
-                        let mut found = false;
-                        for record in &records {
-                            if record.id == *id {
-                                found = true;
-                            }
-                        }
-                        if !found {
-                            eprintln!("No row {id} in memory {name:?}");
+                            println!("{}", row.text());
+                            println!();
                         }
                     }
                     Ok(())
@@ -1084,310 +1021,342 @@ async fn main() -> anyhow::Result<()> {
 
                 MemoryCommand::Search {
                     name,
-                    text,
-                    kind,
+                    groups,
                     limit,
-                    max_distance,
-                    model,
+                    max_per_message,
+                    session,
+                    after,
+                    before,
+                    roles,
+                    json,
                 } => {
                     check_storage(&settings.home, &storage, "memory search ...")?;
-                    let kind = match kind {
-                        Some(kind) => match storage::Kind::parse(&kind) {
-                            Some(kind) => Some(kind),
-                            None => anyhow::bail!(
-                                "Unknown type {kind:?}: a vector covers a message or a \
-                                 sentence. Paragraphs and whole sessions are not embedded."
-                            ),
-                        },
-                        None => None,
-                    };
 
-                    let store = Storage::open(&storage)?;
-                    tracing::debug!(msg = "Loading embedding model", model = model);
-                    let embedder = embedding::load(&model)?;
-                    let query = match embedder.embed(&[text]).into_iter().next() {
-                        Some(query) => query,
-                        None => anyhow::bail!("Embedding produced no vector"),
+                    let mut parsed = Vec::new();
+                    for group in &groups {
+                        parsed.push(parse_group(group)?);
+                    }
+                    let mut filter = Filter {
+                        after,
+                        before,
+                        ..Filter::default()
                     };
-
-                    let vectors = store.open_vectors(embedder.name()).await?;
-                    // More than asked for, because two of the next steps throw
-                    // rows away: the distance floor and the duplicate check.
-                    // Asking for exactly `limit` and then dropping some of it
-                    // is how a full page turns into four rows.
-                    let mut hits = vectors
-                        .search(&name, kind, &query, limit * OVERFETCH)
-                        .await?;
-                    tracing::info!(
-                        msg = "Searched memory",
-                        memory = name,
-                        model = embedder.name(),
-                        hits = hits.len()
-                    );
-                    if hits.is_empty() {
-                        // Nothing on stdout, as in `memory list`. A search with
-                        // no distance floor returns everything it has up to
-                        // `limit`, so an empty result is not "nothing matched
-                        // well enough" — there is nothing there at all.
-                        let layer = match kind {
-                            Some(kind) => format!(" of type {}", kind.as_str()),
-                            None => String::new(),
+                    if let Some(session) = &session {
+                        match Ulid::parse(session) {
+                            Ok(session) => filter.session = Some(session),
+                            Err(error) => {
+                                return Err(anyhow::Error::new(error).context(format!(
+                                    "--session takes a session ULID, and {session:?} is not one"
+                                )));
+                            }
+                        }
+                    }
+                    for role in &roles {
+                        let Some(role) = Role::parse(role) else {
+                            anyhow::bail!("Role {role:?} is not one of user, assistant or tool");
                         };
-                        eprintln!(
-                            "Memory {name:?} has nothing{layer} stored under {}",
-                            embedder.name()
-                        );
-                        return Ok(());
-                    }
-                    // Nearest first, said here rather than assumed: LanceDB
-                    // hands back one batch per partition, and everything below
-                    // — the floor, the duplicate check, the page — takes the
-                    // first row it sees as the best one.
-                    hits.sort_by(|left, right| left.distance.total_cmp(&right.distance));
-                    if let Some(max) = max_distance {
-                        hits.retain(|hit| hit.distance <= max);
+                        filter.roles.push(role);
                     }
 
-                    // A hit is a ULID, and a ULID says nothing, so the rows go
-                    // straight back out of SQLite. Only a sentence stores its
-                    // own text; a paragraph and a message are put back together
-                    // from the sentences under them, which is also exactly the
-                    // string their vector was built from.
-                    let mut parsed = Vec::with_capacity(hits.len());
-                    for hit in &hits {
-                        parsed.push(Ulid::parse(&hit.id)?);
-                    }
-                    let records = store.get(&name, &parsed)?;
-
-                    // The same string twice is one answer, however many rows
-                    // hold it — a corpus repeats a line of code, a licence
-                    // header, a stock sentence, and each copy is its own row
-                    // with its own vector and its own place in the ranking.
-                    // The nearest copy is kept because the sort above already
-                    // put it first.
-                    let mut seen: Vec<&str> = Vec::new();
-                    let mut ranked = Vec::with_capacity(limit);
-                    for hit in &hits {
-                        if ranked.len() == limit {
-                            break;
-                        }
-                        let mut text = "";
-                        for record in &records {
-                            if record.id.to_string() == hit.id {
-                                text = &record.text;
-                            }
-                        }
-                        if seen.contains(&text) {
-                            continue;
-                        }
-                        seen.push(text);
-                        ranked.push(hit);
-                    }
-                    let hits = ranked;
-                    if hits.is_empty() {
-                        // Everything found was past the floor. Not the same as
-                        // the memory being empty, so it does not say so.
-                        eprintln!(
-                            "Nothing in memory {name:?} is within {} of that",
-                            match max_distance {
-                                Some(max) => max.to_string(),
-                                None => String::from("range"),
-                            }
-                        );
-                        return Ok(());
-                    }
-
-                    // Rendered first, then measured, then printed, as in
-                    // `memory list`: the session and message columns hold the
-                    // feeder's own identifiers — a UUID, a filename — and their
-                    // width is not something to predict.
-                    //
-                    // All four ids of a hit go out, so that the row says where
-                    // it sits without a second query: whose session, which
-                    // message of it, which paragraph, which sentence. A `-` is
-                    // a layer the hit is above, not one that is missing — a
-                    // paragraph has no sentence.
-                    let mut rows = Vec::with_capacity(hits.len());
-                    for hit in &hits {
-                        let mut session = String::new();
-                        let mut message = String::new();
-                        let mut paragraph = String::from("-");
-                        let mut sentence = String::from("-");
-                        // Cut to the first words, because a message's text is
-                        // the whole message and this is one row of a ranking.
-                        // The count beside it is the honest size of what was
-                        // matched, not of what is shown.
-                        let mut preview = String::new();
-                        let mut words = 0;
-                        for record in &records {
-                            if record.id.to_string() != hit.id {
-                                continue;
-                            }
-                            session = record.session.clone();
-                            message = match &record.message {
-                                Some(message) => message.clone(),
-                                // Only a row written by something other than
-                                // `add`, which requires one for every layer.
-                                None => String::from("-"),
-                            };
-                            if let Some(id) = record.paragraph {
-                                paragraph = id.to_string();
-                            }
-                            if record.kind == storage::Kind::Sentence {
-                                sentence = record.id.to_string();
-                            }
-
-                            // Walked by hand rather than through
-                            // `split_whitespace`, because the spacing between
-                            // the words is part of what is being shown: it is
-                            // what tells a code block from a paragraph.
-                            let mut end = None;
-                            let mut inside = false;
-                            for (offset, character) in record.text.char_indices() {
-                                if character.is_whitespace() {
-                                    inside = false;
-                                    continue;
-                                }
-                                if inside {
-                                    continue;
-                                }
-                                inside = true;
-                                words += 1;
-                                if words == PREVIEW_WORDS + 1 {
-                                    end = Some(offset);
-                                }
-                            }
-                            let shown = match end {
-                                Some(end) => &record.text[..end],
-                                None => &record.text,
-                            };
-                            // Escaped, not dropped: a hit has to stay one line
-                            // for the columns to line up, and a code block that
-                            // came back as prose would be a lie about what is
-                            // stored.
-                            for character in shown.trim().chars() {
-                                match character {
-                                    '\n' => preview.push_str("\\n"),
-                                    '\r' => preview.push_str("\\r"),
-                                    '\t' => preview.push_str("\\t"),
-                                    character => preview.push(character),
-                                }
-                            }
-                            if end.is_some() {
-                                preview.push_str(" …");
-                            }
-                        }
-                        rows.push((
-                            session,
-                            message,
-                            paragraph,
-                            sentence,
-                            words.to_string(),
-                            preview,
-                        ));
-                    }
-
-                    // Wide enough for the heading as well, since that is what
-                    // the values line up under. Characters, not bytes: a
-                    // feeder's identifiers are its own and need not be ASCII.
-                    let mut session = "session".len();
-                    let mut message = "message".len();
-                    let mut paragraph = "paragraph".len();
-                    let mut sentence = "sentence".len();
-                    let mut words = "words".len();
-                    for row in &rows {
-                        if row.0.chars().count() > session {
-                            session = row.0.chars().count();
-                        }
-                        if row.1.chars().count() > message {
-                            message = row.1.chars().count();
-                        }
-                        if row.2.len() > paragraph {
-                            paragraph = row.2.len();
-                        }
-                        if row.3.len() > sentence {
-                            sentence = row.3.len();
-                        }
-                        if row.4.len() > words {
-                            words = row.4.len();
-                        }
-                    }
-
-                    // Header to stderr and rows to stdout, as in `memory list`,
-                    // so a pipe reading this gets results and nothing else.
-                    eprintln!(
-                        "{:6}  {:9}  {:26}  {:session$}  {:message$}  {:paragraph$}  \
-                         {:sentence$}  {:>words$}  text",
-                        "score",
-                        "type",
-                        "id",
-                        "session",
-                        "message",
-                        "paragraph",
-                        "sentence",
-                        "words"
+                    let store = Storage::open(&storage, &name)?;
+                    let built = Index::open(&store)?;
+                    tracing::debug!(
+                        msg = "Searching",
+                        memory = name,
+                        groups = parsed.len(),
+                        limit = limit
                     );
-                    for (index, hit) in hits.iter().enumerate() {
-                        let row = &rows[index];
+                    let outcome =
+                        search::search(&store, &built, &parsed, &filter, limit, max_per_message)?;
+
+                    // Logged before it is printed, so that the cursor call that
+                    // follows a search has something to attach itself to.
+                    let mut returned = Vec::new();
+                    for hit in &outcome.hits {
+                        returned.push(serde_json::json!({
+                            "unit": hit.unit.to_string(),
+                            "score": hit.score,
+                            "coverage": [hit.coverage.0, hit.coverage.1],
+                        }));
+                    }
+                    let asked = serde_json::to_string(&serde_json::Value::Array(
+                        parsed
+                            .iter()
+                            .map(|group| {
+                                serde_json::json!({
+                                    "label": group.label,
+                                    "words": group.words,
+                                    "required": group.required,
+                                })
+                            })
+                            .collect(),
+                    ))?;
+                    let logged = serde_json::to_string(&serde_json::Value::Array(returned))?;
+                    store.log_search(&asked, &logged)?;
+
+                    tracing::info!(
+                        msg = "Searched",
+                        memory = name,
+                        hits = outcome.hits.len(),
+                        unknown = outcome.unknown.len()
+                    );
+
+                    if json {
+                        let mut array = Vec::new();
+                        for hit in &outcome.hits {
+                            array.push(serde_json::json!({
+                                "cursor": hit.cursor,
+                                "unit": hit.unit.to_string(),
+                                "score": hit.score,
+                                "raw": hit.raw,
+                                "coverage": [hit.coverage.0, hit.coverage.1],
+                                "matched": hit.matched,
+                                "session": hit.session,
+                                "message": hit.message,
+                                "author": hit.author,
+                                "role": hit.role.as_str(),
+                                "ts": hit.ts,
+                                "words": hit.words,
+                                "snippet": hit.snippet,
+                            }));
+                        }
+                        let unknown: Vec<serde_json::Value> = outcome
+                            .unknown
+                            .iter()
+                            .map(|unknown| {
+                                serde_json::json!({
+                                    "group": unknown.group,
+                                    "word": unknown.word,
+                                })
+                            })
+                            .collect();
+                        let hints: Vec<serde_json::Value> = outcome
+                            .hints
+                            .iter()
+                            .map(|(term, df)| serde_json::json!({"term": term, "units": df}))
+                            .collect();
                         println!(
-                            "{:.4}  {:9}  {:26}  {:session$}  {:message$}  {:paragraph$}  \
-                             {:sentence$}  {:>words$}  {}",
-                            hit.distance,
-                            hit.kind,
-                            hit.id,
-                            row.0,
-                            row.1,
-                            row.2,
-                            row.3,
-                            row.4,
-                            row.5
+                            "{}",
+                            serde_json::json!({
+                                "hits": array,
+                                "unknown": unknown,
+                                "hints": hints,
+                            })
                         );
-                        // A blank line after every hit, the last one included:
-                        // a hundred words of preview wraps across a terminal,
-                        // and without it a ranking reads as one block of text
-                        // with no telling where one result ends.
+                        return Ok(());
+                    }
+
+                    for unknown in &outcome.unknown {
+                        eprintln!(
+                            "unknown: {:?} (group {:?}) matched nothing",
+                            unknown.word, unknown.group
+                        );
+                    }
+                    if outcome.hits.is_empty() {
+                        eprintln!("No hits.");
+                    }
+
+                    // Column widths are measured from the result set rather
+                    // than fixed, because a session and a message are whatever
+                    // the feeder decided to call them, and a header that does
+                    // not sit over the column it names is worse than no header.
+                    //
+                    // The header goes to stderr, where everything else this
+                    // command says *about* its answer already goes — the
+                    // unknown words, `No hits.`, the vocabulary line. Standard
+                    // output stays hits and nothing else, so `head -n 1 | awk
+                    // '{print $3}'` still means "the cursor of the top hit".
+                    const HEADER: [&str; 6] =
+                        ["score", "cover", "cursor", "session", "message", "size"];
+                    let rows: Vec<[String; 6]> = outcome
+                        .hits
+                        .iter()
+                        .map(|hit| {
+                            [
+                                format!("{:.3}", hit.score),
+                                format!("{}/{}", hit.coverage.0, hit.coverage.1),
+                                hit.cursor.to_string(),
+                                hit.session.to_string(),
+                                hit.message.as_deref().unwrap_or("-").to_string(),
+                                format!("{} words", hit.words),
+                            ]
+                        })
+                        .collect();
+                    let mut widths = HEADER.map(|title| title.len());
+                    for row in &rows {
+                        for (width, cell) in widths.iter_mut().zip(row) {
+                            *width = (*width).max(cell.chars().count());
+                        }
+                    }
+
+                    let lay = |cells: &[String; 6], last: &str| {
+                        let mut line = String::new();
+                        for (cell, width) in cells.iter().zip(widths) {
+                            line.push_str(&format!("{cell:<width$}  "));
+                        }
+                        line.push_str(last);
+                        line
+                    };
+
+                    if !rows.is_empty() {
+                        let titles = HEADER.map(|title| title.to_string());
+                        eprintln!("{}", lay(&titles, "matched"));
+                    }
+                    for (row, hit) in rows.iter().zip(&outcome.hits) {
+                        println!("{}", lay(row, &format!("[{}]", hit.matched.join(","))));
+                        // Quoted so that the sentence is one selectable run:
+                        // a double-click takes a word and a triple-click takes
+                        // the line, but the quotes are what make the boundary
+                        // of the text visible when it ends in whitespace or
+                        // starts with a dash.
+                        println!("\"{}\"", preview(&hit.snippet));
                         println!();
                     }
+                    if !outcome.hints.is_empty() {
+                        let mut hints = Vec::new();
+                        for (term, units) in &outcome.hints {
+                            hints.push(format!("{term} ({units})"));
+                        }
+                        eprintln!("also in these results: {}", hints.join(", "));
+                    }
+                    Ok(())
+                }
+
+                MemoryCommand::Cursor {
+                    name,
+                    cursor,
+                    before,
+                    after,
+                    json,
+                } => {
+                    check_storage(&settings.home, &storage, "memory cursor ...")?;
+
+                    let unit = match Ulid::parse(&cursor) {
+                        Ok(unit) => unit,
+                        Err(error) => {
+                            return Err(anyhow::Error::new(error)
+                                .context(format!("{cursor:?} is not a cursor from a search hit")));
+                        }
+                    };
+                    let store = Storage::open(&storage, &name)?;
+                    let messages = store.around(unit, before, after)?;
+                    // The label this produces is the whole reason the log
+                    // exists: the caller reaching for a hit is the caller
+                    // telling us that hit was the right one.
+                    store.log_expansion(unit)?;
+
+                    tracing::info!(
+                        msg = "Expanded a cursor",
+                        memory = name,
+                        unit = %unit,
+                        messages = messages.len()
+                    );
+
+                    if json {
+                        let mut array = Vec::new();
+                        for message in &messages {
+                            array.push(serde_json::json!({
+                                "message": message.id.to_string(),
+                                "message_ref": message.reference,
+                                "seq": message.seq,
+                                "author": message.author,
+                                "role": message.role.as_str(),
+                                "ts": message.ts,
+                                "anchor": message.anchor,
+                                "body": message.body,
+                            }));
+                        }
+                        println!("{}", serde_json::Value::Array(array));
+                    } else {
+                        for message in &messages {
+                            let mark = if message.anchor { "→" } else { " " };
+                            println!(
+                                "{mark} {}  {}  {}  seq {}",
+                                message.id,
+                                message.author,
+                                message.role.as_str(),
+                                message.seq
+                            );
+                            println!("{}", message.body);
+                            println!();
+                        }
+                    }
+                    Ok(())
+                }
+
+                MemoryCommand::Lexicon { name, words } => {
+                    check_storage(&settings.home, &storage, "memory lexicon ...")?;
+                    if words.is_empty() {
+                        anyhow::bail!("Pass at least one word to look up");
+                    }
+
+                    let store = Storage::open(&storage, &name)?;
+                    let built = Index::open(&store)?;
+                    let searcher = built.reader.searcher();
+
+                    for word in &words {
+                        let segmented = normalize::segment(word);
+                        let script = match segmented.first() {
+                            Some(word) => word.script,
+                            None => normalize::Script::Other,
+                        };
+                        let surface = normalize::surface(word);
+                        let lemma = normalize::lemma(word, script);
+
+                        let counts = [
+                            (built.fields.surface, surface.as_str()),
+                            (built.fields.lemma, lemma.as_str()),
+                            (built.fields.context, lemma.as_str()),
+                        ];
+                        let mut frequencies = [0u64; 3];
+                        for (at, (field, text)) in counts.iter().enumerate() {
+                            if text.is_empty() {
+                                continue;
+                            }
+                            let term = tantivy::Term::from_field_text(*field, text);
+                            frequencies[at] = searcher.doc_freq(&term)?;
+                        }
+                        println!(
+                            "{word}  surface={surface} ({})  lemma={lemma} ({})  context=({})",
+                            frequencies[0], frequencies[1], frequencies[2]
+                        );
+                    }
+                    Ok(())
+                }
+
+                MemoryCommand::Rescan { name } => {
+                    check_storage(&settings.home, &storage, "memory rescan ...")?;
+
+                    let mut store = Storage::open(&storage, &name)?;
+                    // Deliberately not `Index::open`: this is the command whose
+                    // entire job is to make a stale index current, so refusing
+                    // to open a stale one here would leave no way out.
+                    let built = Index::attach(&store.directory.join(index::DIRECTORY))?;
+                    let mut writer = built.writer()?;
+                    built.clear(&mut writer)?;
+                    built.commit(&mut writer)?;
+
+                    let written = store.resplit()?;
+                    let mut units = 0;
+                    for (message, written) in &written {
+                        let (body, role, ts) = store.message(*message)?;
+                        built.add(&writer, written, role, ts, &body)?;
+                        units += written.units.len();
+                    }
+                    built.commit(&mut writer)?;
+                    store.set_meta(index::VERSION_KEY, &normalize::VERSION.to_string())?;
+                    store.set_meta(index::BUILT_KEY, &Ulid::now().to_string())?;
+
+                    tracing::info!(
+                        msg = "Rescanned memory",
+                        memory = name,
+                        messages = written.len(),
+                        units = units
+                    );
+                    eprintln!("{} messages, {units} units", written.len());
                     Ok(())
                 }
             }
         }
-
-        Command::Embedding { command } => match command {
-            EmbeddingCommand::Load { directory } => {
-                tracing::debug!(msg = "Loading embedding model", directory = ?directory);
-                let model = embedding::Directory::new(&directory)?;
-                tracing::info!(
-                    msg = "Loaded embedding model",
-                    model = model.name(),
-                    dimensions = model.dimensions()
-                );
-                println!("{} ({} dimensions)", model.name(), model.dimensions());
-                Ok(())
-            }
-
-            EmbeddingCommand::Do { model, text } => {
-                tracing::debug!(msg = "Loading embedding model", model = model);
-                let embedder = embedding::load(&model)?;
-                tracing::debug!(
-                    msg = "Embedding text",
-                    model = embedder.name(),
-                    characters = text.len()
-                );
-                match embedder.embed(&[text]).into_iter().next() {
-                    Some(vector) => {
-                        tracing::info!(
-                            msg = "Embedded text",
-                            model = embedder.name(),
-                            dimensions = vector.len()
-                        );
-                        println!("{vector:?}");
-                        Ok(())
-                    }
-                    // `embed` returns one vector per input and it was given one.
-                    None => anyhow::bail!("Embedding produced no vector"),
-                }
-            }
-        },
     }
 }
