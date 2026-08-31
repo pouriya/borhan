@@ -1,5 +1,6 @@
 TARGET ?= $(shell rustc -vV | awk '$$1 == "host:"{print $$2}')
 BUILD_DIR=$(CURDIR)/build
+CARGO_TARGET_DIR ?= $(CURDIR)/target
 VERSION=$(shell cat Cargo.toml | awk 'BEGIN{FS="[ \"]"}$$1 == "version"{print $$4;exit}')
 BINARY_NAME := $(if $(findstring windows,$(TARGET)),borhan.exe,borhan)
 RELEASE_FILENAME_POSTFIX := $(if $(findstring windows,$(TARGET)),.exe,)
@@ -34,18 +35,18 @@ all: dev clippy test check-style
 
 release: ${BUILD_DIR}
 	cargo build --release --target ${TARGET}
-	@ cp ./target/${TARGET}/release/$(BINARY_NAME) ${CMD}
+	@ cp ${CARGO_TARGET_DIR}/${TARGET}/release/$(BINARY_NAME) ${CMD}
 	@ ls -sh ${BUILD_DIR}/borhan-*
 
 
 dev: ${BUILD_DIR}
 	cargo build --target ${TARGET}
-	@ cp ./target/${TARGET}/debug/$(BINARY_NAME) ${DEV_CMD}
+	@ cp ${CARGO_TARGET_DIR}/${TARGET}/debug/$(BINARY_NAME) ${DEV_CMD}
 	@ ls -sh ${BUILD_DIR}/borhan-*dev*
 
 
 start-dev: dev
-	${DEV_CMD} --debug serve
+	${DEV_CMD} --home ${SEED_HOME} --debug serve
 
 
 clippy:
@@ -94,7 +95,7 @@ seed-scan: release seed-fetch
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet init storage
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory create ${SEED_NAME} \
 		--languages en \
-		--description "${SEED_REPO} ${SEED_PATH}/, scanned by make seed"
+		--description "Rust RFCs from ${SEED_REPO} under ${SEED_PATH}/, scanned by make seed as a local memory corpus"
 	@ start=`date +%s`; count=0; \
 	for file in `find ${SEED_DIR}/${SEED_PATH} -name '*.md' | sort | head -n ${SEED_LIMIT}`; do \
 		name=`echo $$file | sed -e 's|^${SEED_DIR}/${SEED_PATH}/||' \

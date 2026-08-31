@@ -72,6 +72,9 @@ pub enum Error {
     #[error("description is longer than {DESCRIPTION_LIMIT} characters")]
     Description,
 
+    #[error("description must be more than 10 words")]
+    DescriptionShort,
+
     #[error("languages is longer than {LANGUAGES_LIMIT} characters")]
     Languages,
 
@@ -290,15 +293,11 @@ impl Storage {
     pub fn create(
         root: &Path,
         name: &str,
-        description: Option<&str>,
+        description: &str,
         languages: &str,
     ) -> Result<(Self, Ulid), Error> {
         check_name(name)?;
-        if let Some(text) = description
-            && text.chars().count() > DESCRIPTION_LIMIT
-        {
-            return Err(Error::Description);
-        }
+        check_description(description)?;
         if languages.chars().count() > LANGUAGES_LIMIT {
             return Err(Error::Languages);
         }
@@ -341,6 +340,44 @@ impl Storage {
             });
         }
         Ok((storage, id))
+    }
+
+    /// Change the description and/or the language tags on the one row this
+    /// database holds. At least one of the two has to be `Some`; the caller
+    /// has already decided that, because an empty patch is a client mistake
+    /// rather than a storage one.
+    pub fn update(&self, description: Option<&str>, languages: Option<&str>) -> Result<(), Error> {
+        if let Some(text) = description {
+            check_description(text)?;
+        }
+        if let Some(text) = languages
+            && text.chars().count() > LANGUAGES_LIMIT
+        {
+            return Err(Error::Languages);
+        }
+
+        let written = match (description, languages) {
+            (Some(description), Some(languages)) => self.connection.execute(
+                "UPDATE memory SET description = ?1, languages = ?2",
+                rusqlite::params![description, languages],
+            ),
+            (Some(description), None) => self.connection.execute(
+                "UPDATE memory SET description = ?1",
+                rusqlite::params![description],
+            ),
+            (None, Some(languages)) => self.connection.execute(
+                "UPDATE memory SET languages = ?1",
+                rusqlite::params![languages],
+            ),
+            (None, None) => return Ok(()),
+        };
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
+        }
+        Ok(())
     }
 
     /// Open an existing memory. Will not create one: a wrong `--home` or a
@@ -1369,6 +1406,23 @@ fn identifier(bytes: &[u8]) -> Ulid {
 /// A name is `a-z`, `0-9` and `_`. It is a directory name, it is what every
 /// command takes to find the memory, and it goes into paths and log lines, so
 /// anything that would need quoting or escaping is refused at the door.
+/// A description is what a calling model reads to decide whether this memory
+/// is the one to search, so a phrase shorter than a sentence is not enough
+/// and a wall of text is not either.
+fn check_description(text: &str) -> Result<(), Error> {
+    if text.chars().count() > DESCRIPTION_LIMIT {
+        return Err(Error::Description);
+    }
+    let mut words = 0;
+    for _ in text.split_whitespace() {
+        words += 1;
+    }
+    if words <= 10 {
+        return Err(Error::DescriptionShort);
+    }
+    Ok(())
+}
+
 fn check_name(name: &str) -> Result<(), Error> {
     if name.is_empty() {
         return Err(Error::Empty);

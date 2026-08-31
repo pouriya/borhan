@@ -108,8 +108,8 @@ Two things the Makefile does that are not obvious:
 | `rusqlite` | 0.40.2 | Metadata / keyword store, `bundled` SQLite |
 | `tokio` | 1.53.1 | Async runtime (`lancedb` is async throughout) |
 | `clap` | 4.6.6 | Command line, derive API |
-| `tanzim` | 0.28.0 | Reads `remote.toml` / `server.toml`, with located errors |
-| `toml_edit` | 0.22.27 | Writes `remote.toml` in `init remote` |
+| `tanzim` | 0.28.0 | Reads `server.toml`, with located errors |
+| `toml_edit` | 0.22.27 | Writes `server.toml` in `init server` |
 | `getrandom` | 0.4.3 | The 80 random bits of a ULID, straight from the OS |
 | `chrono` | 0.4.45 | Renders `created_at` as ISO-8601 in `memory list`; no other date handling |
 | `futures` | 0.3.31 | `TryStreamExt::try_next`, to read LanceDB's result stream |
@@ -643,9 +643,11 @@ and nothing sits outside it:
 
 ```
 ~/.borhan/
-  storage/      SQLite database + LanceDB tables. Written by `init storage`.
-  remote.toml   Written by `init remote`. Present => client of a running server.
-  server.toml   Read by `serve`. Absent => defaults (127.0.0.1:1995, no token).
+  storage/      One directory per memory. Written by `init storage`.
+  server.toml   Listen address and token. Written by `init server`.
+                `serve` binds it; the CLI probes it and uses HTTP when that
+                process answers, otherwise opens storage itself.
+                Absent for `serve` => 127.0.0.1:1995 and no token.
 ```
 
 **Nothing is created implicitly.** `init` is the only thing that writes the
@@ -660,38 +662,15 @@ store and hides every existing memory.
 Commands that touch no storage (`embedding load`, `embedding do` — model-only
 work) run fine without `init`.
 
-### Local vs client mode
+### Local vs HTTP
 
-The *presence* of `remote.toml` is the switch. With it, this instance owns no
-storage and talks to the `borhan serve` at its `server`; without it, everything
-happens locally against `storage/`. `serve` reads `server.toml` only — a server
-machine has no `remote.toml`.
+`server.toml` is the only configuration file. `init server --listen HOST:PORT [--token T]` writes it (`create_new`, mode `0600`). `serve` reads it to bind; if the file is missing it binds `127.0.0.1:1995` with no token. Every memory command probes that listen address (`GET /api/v1/health`, about 1s). If the file is missing, `listen` is unset, or the server does not answer, the command opens storage itself.
 
-Both files are read with [`tanzim`](https://docs.rs/tanzim) into `Remote` /
-`Server`, via the one `read_configuration` helper. The helper formats tanzim's
-error with `{:#}` — that is the form carrying source, line, column and the caret;
-wrapping it as a `#[source]` throws all of it away.
+A token in `server.toml` is required on every HTTP request as `Authorization: Bearer`. The same file is what the CLI sends.
 
-`remote.toml` is the one file borhan *writes*: `init remote` serializes the same
-`Remote` struct back out with `toml_edit`, so reader and writer cannot drift. It
-is created with `create_new` and mode `0600` — it holds a token, and refusing to
-clobber an existing one is what keeps `init remote` from silently repointing a
-configured client.
+Every HTTP response sets `Server: borhan/<version>` and `X-Borhan-Version` to the crate version (`Cargo.toml`). The CLI compares that header to its own version. A mismatch prints prettified JSON and does not try to format it. A match with `--json` decodes, re-encodes and pretty-prints the body. A match without `--json` prints the response headers, then the usual text.
 
-**Two things are stubs, on purpose:**
-
-- **`init remote` does not reach the server yet.** It is supposed to hit
-  `http://{server}/api/v1/auth` with the token and require a `201` before
-  writing anything; nothing in the tree makes client-side HTTP requests, so the
-  `TODO` in `main.rs` marks where that check goes.
-- **The `token` fields are parsed but never used.** Nothing is sent and nothing
-  is enforced: the only route is a placeholder. Wire them up with the real API,
-  not before.
-
-No command routes to the server yet, so in client mode `init storage` and every
-`memory` subcommand refuse rather than doing the wrong thing locally. The client
-check sits once at the top of the `Command::Memory` arm, which is where routing
-has to grow first — the `TODO` there marks it.
+Both `serve` and the CLI read the file with [`tanzim`](https://docs.rs/tanzim) into `Server`, via `read_configuration`. The helper formats tanzim's error with `{:#}` — that is the form carrying source, line, column and the caret; wrapping it as a `#[source]` throws all of it away. `init server` serializes the same `Server` struct back out with `toml_edit`.
 
 ## CLI
 
@@ -700,59 +679,41 @@ subcommand. **A subcommand is required** — there is no implicit server.
 
 ```
 borhan init                             # == borhan init storage
-borhan init storage [--model M]         # create ~/.borhan, ~/.borhan/storage,
-                                        # borhan.db and embedding_<M>.lance
-borhan init remote --server H:P \
-                  [--token T]           # write ~/.borhan/remote.toml (0600)
-borhan serve                            # axum hello-world, address from server.toml
+borhan init storage                     # create ~/.borhan and ~/.borhan/storage
+borhan init server --listen H:P \
+                  [--token T]           # write ~/.borhan/server.toml (0600)
+borhan serve                            # HTTP API, address from server.toml
 borhan memory create <NAME> \
-                  [--description T]     # store a memory, print its ULID
-                                        # NAME: [a-z0-9_], unique, stored as memory_NAME
+                  --description T       # store a memory, print its ULID
+                  [--languages L]       # description is required, more than 10 words
+                  [--json]
 borhan memory                           # == borhan memory list
-borhan memory list                      # ULID, created, name, counts, A/U share, description
-                                        # names print without the memory_ prefix
+borhan memory list [--json]             # ULID, created, name, counts, languages, description
+borhan memory update <NAME> \
+                  [--description T] [--languages L] [--json]
 borhan memory add <NAME> <TEXT> \
-                  [--type message|paragraph|sentence] \
-                  [--session S] [--message M] [--paragraph ULID] \
-                  [--role user|assistant] [--role-name N] \
-                  [--model M]           # writes the rows AND their vectors, prints the top ULID
+                  --session S [--message M]
+                  [--role user|assistant|tool] [--author N] [--ts MS]
+                  [--json]              # split into units, index, print the message ULID
 borhan memory get <NAME> <ULID>... \
-                  [--json]              # rows back, in the order asked, text reassembled
-borhan memory get <NAME> --session S \
-                  [--message M] [--paragraph ULID] \
-                  [--from N] [--count K] \
-                  [--json]              # walk: the children of what you name
-borhan memory search <NAME> <TEXT> \
-                  [--type K] [--limit N] [--max-distance D] \
-                  [--model M]           # score, type, ULID, session, message,
-                                        # paragraph, sentence, words, text
-                                        # nearest first, one blank line apart
-borhan embedding load <DIR>             # load a model dir, report name + dims
-borhan embedding do [--model M] <TEXT>  # embed TEXT; M is "default" or a dir
+                  [--json]              # units back, in the order asked
+borhan memory search <NAME> <GROUPS>... \
+                  [--limit N] [--json]  # concept groups, coverage, cursor
+borhan memory cursor <NAME> <ULID> \
+                  [--before N] [--after N] [--json]
+borhan memory lexicon <NAME> <WORDS>... [--json]
+borhan memory rescan <NAME> [--json]
 ```
 
-**`embedding` is for models only** — loading one, embedding a string, seeing the
-numbers. Nothing under it touches storage; anything that reads or writes what is
-stored is a `memory` subcommand.
+`--json` prints the same wrapped object the HTTP API returns, pretty-printed.
+Text mode does not print stats on stdout.
 
-`init storage --model` loads the model to get its name and its width, because
-both go into the LanceDB table it makes. Re-running with a second model adds a
-table beside the first rather than replacing it.
+`memory add` reads the text as Markdown, splits it into units, writes them to
+SQLite and the tantivy index, prints the message ULID on stdout and the unit
+count on stderr.
 
-`memory add` reads the text as Markdown, breaks it into paragraphs and
-sentences, and writes every piece to both stores. Stdout gets the top row's ULID
-and nothing else, so it pipes into the `--paragraph` of whatever goes in next;
-the `N paragraphs, M sentences` summary goes to stderr. `--type` says which
-layer to attach at, and the splitting happens below it — so `--type paragraph`
-hangs new paragraphs off an existing message, and `--type sentence` stores
-exactly what it is given.
-
-`memory get` takes as many ULIDs as you give it and prints them back **in the
-order asked**, so `memory search … | awk '{print $3}' | xargs borhan memory get
-NAME` keeps the ranking. Plain output is one header line and the text per row,
-blank-line separated; `--json` is an array of objects — always an array, even
-for one id, so nothing reading it has to branch on how many were asked for. An
-id that resolves to nothing is named on stderr, one line each.
+`memory get` takes unit ULIDs and prints them back in the order asked. An id
+that resolves to nothing is named on stderr, one line each.
 
 The same command **walks** when given `--session`, `--message` or `--paragraph`
 instead of ULIDs, which is how you read *around* a hit rather than only at it:

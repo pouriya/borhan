@@ -16,9 +16,14 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "net",
 ] }
 
-# HTTP server. default-features = false drops form/json/query/matched-path/
-# tracing extractors that the hello-world router does not use.
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+# HTTP server. default-features = false drops form/matched-path/tracing
+# extractors; json and query are the bodies and cursor window this API uses.
+axum = { version = "0.8.9", default-features = false, features = [
+    "http1",
+    "tokio",
+    "json",
+    "query",
+] }
 
 # Configuration files. default-features = false drops the env/JSON/YAML loaders
 # and parsers and the whole validate-schema tree; borhan reads exactly one TOML
@@ -33,7 +38,7 @@ tanzim = { version = "0.28.0", default-features = false, features = [
 # crate in the tree — only a direct dependency.
 serde = { version = "1.0.195", features = ["derive"] }
 
-# Writing `remote.toml` in `init remote`. tanzim only reads. This is the crate
+# Writing `server.toml` in `init server`. tanzim only reads. This is the crate
 # tanzim's TOML parser already sits on, so nothing new lands in the tree beyond
 # its `serde` feature; `parse` stays off because borhan never parses with it.
 toml_edit = { version = "0.22.27", default-features = false, features = [
@@ -121,6 +126,11 @@ clap = { version = "4.6.6", default-features = false, features = [
     "usage",
     "error-context",
 ] }
+
+# CLI talking to a running `serve`. Blocking on purpose: a command is one
+# request then exit, and the rustls/native-tls stacks stay off because the
+# probe and the fallback are `http://` on loopback.
+ureq = { version = "2.12.1", default-features = false, features = ["json"] }
 
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [

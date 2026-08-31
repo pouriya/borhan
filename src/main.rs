@@ -1,3 +1,4 @@
+mod api;
 mod index;
 mod normalize;
 mod search;
@@ -8,10 +9,13 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 
 use crate::index::Index;
@@ -37,15 +41,16 @@ const DEFAULT_HOME_DIRECTORY: &str = ".borhan";
 //       storage/            One directory per memory. Created by `init`.
 //         <name>/borhan.db  The messages. Never derived, never rebuilt.
 //         <name>/index/     The tantivy index. Entirely derived; `rescan` fodder.
-//       remote.toml         Present => this instance is a client of a server.
-//       server.toml         Read by `serve`. Absent => every default applies.
+//       server.toml         Listen address and token. Written by `init server`.
+//                           `serve` binds it; the CLI probes it and talks HTTP
+//                           when that process answers, otherwise opens storage.
 //
 // None of it is created implicitly: `init` is the only thing that writes the
 // layout, so a missing directory always means "this machine was never set up",
 // never "it was set up somewhere you did not look".
 const STORAGE_DIRECTORY: &str = "storage";
-const REMOTE_CONFIGURATION: &str = "remote.toml";
 const SERVER_CONFIGURATION: &str = "server.toml";
+const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Where `serve` listens when `server.toml` does not say otherwise.
 const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:1995";
@@ -148,13 +153,13 @@ pub enum InitCommand {
     /// Create the local storage. The default when `init` is given no subcommand.
     Storage,
 
-    /// Point this instance at a running server by writing `remote.toml`.
-    Remote {
-        /// `HOST:PORT` of the running `borhan serve`.
+    /// Write `server.toml` so `serve` and the CLI share a listen address and token.
+    Server {
+        /// `HOST:PORT` to bind, and the address the CLI probes.
         #[arg(long)]
-        server: String,
+        listen: String,
 
-        /// Token that server expects.
+        /// Token clients must present as `Authorization: Bearer`. Optional.
         #[arg(long)]
         token: Option<String>,
     },
@@ -168,16 +173,20 @@ pub enum MemoryCommand {
         /// It is the memory's directory name.
         name: String,
 
-        /// Longer text, up to 2000 characters. Shown to the calling model, so
-        /// it should say what is in here and what is not.
+        /// Longer text, more than 10 words and up to 2000 characters. Shown to
+        /// the calling model, so it should say what is in here and what is not.
         #[arg(long)]
-        description: Option<String>,
+        description: String,
 
         /// Comma-separated language tags, like `fa,en`. Reported by `memory
         /// list` so a caller composing a query knows which languages a concept
         /// group is worth expanding into.
         #[arg(long, default_value = "fa,en")]
         languages: String,
+
+        /// Emit JSON instead of the ULID.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List the memories, oldest first. The default when `memory` is given no
@@ -193,7 +202,30 @@ pub enum MemoryCommand {
     /// memory tagged `fa` can still hold English. The description says what is
     /// in the memory and what is not, which is what to read before deciding
     /// this is the one to search.
-    List,
+    List {
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Change a memory's description and/or language tags.
+    Update {
+        /// The memory to change.
+        name: String,
+
+        /// Replacement description. Same rules as `memory create`: more than
+        /// 10 words, at most 2000 characters.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Replacement language tags, like `fa,en`.
+        #[arg(long)]
+        languages: Option<String>,
+
+        /// Emit JSON instead of the ULID.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Add a message to a memory, split into units and indexed.
     ///
@@ -230,6 +262,10 @@ pub enum MemoryCommand {
         /// because a transcript is usually replayed, not watched.
         #[arg(long)]
         ts: Option<i64>,
+
+        /// Emit JSON instead of the ULID.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print units back by id, in the order asked.
@@ -338,8 +374,8 @@ pub enum MemoryCommand {
         #[arg(long = "role")]
         roles: Vec<String>,
 
-        /// Emit one JSON object holding `hits`, `unknown` and `hints` instead
-        /// of the table. All of it goes to standard output.
+        /// Emit one JSON object holding `hit_list`, `unknown_list`, `hint_list`
+        /// and `stats` instead of the table. All of it goes to standard output.
         #[arg(long)]
         json: bool,
     },
@@ -405,6 +441,10 @@ pub enum MemoryCommand {
         /// holds. They are looked up exactly as written, so pass the word you
         /// were about to search with, not a stem of it.
         words: Vec<String>,
+
+        /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Split every stored message again and rebuild the index from scratch.
@@ -415,31 +455,25 @@ pub enum MemoryCommand {
     Rescan {
         /// The memory to rebuild.
         name: String,
+
+        /// Emit JSON instead of the counts.
+        #[arg(long)]
+        json: bool,
     },
 }
 
-/// `<home>/remote.toml`. Present means this instance is a client.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Remote {
-    /// `HOST:PORT` of the running server.
-    pub server: String,
-
-    /// Presented to the server when it is configured with a token. Parsed but
-    /// not sent yet: no command routes to the server so far.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-}
-
-/// `<home>/server.toml`, read by `serve` only. Absent means every default.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `<home>/server.toml`. `serve` binds `listen`; the CLI probes the same
+/// address and uses HTTP when that process answers.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
-    /// Address to bind. [`DEFAULT_LISTEN_ADDRESS`] when unset.
+    /// Address to bind, and the address the CLI probes. [`DEFAULT_LISTEN_ADDRESS`]
+    /// when unset for `serve`; the CLI treats a missing value as "use storage".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
 
-    /// Token clients must present. Parsed but not enforced yet: the only route
-    /// is a placeholder, and there is nothing worth protecting behind it.
+    /// Token clients must present as `Authorization: Bearer`. Unset means open.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }
 
@@ -653,6 +687,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(level)
         .json()
         .flatten_event(true)
+        .with_span_events(FmtSpan::CLOSE)
         .log_internal_errors(true)
         .with_level(true)
         .with_file(show_location)
@@ -664,41 +699,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let storage = settings.home.join(STORAGE_DIRECTORY);
-    let remote_configuration = settings.home.join(REMOTE_CONFIGURATION);
-
-    // Presence is the switch, so the existence check comes first and tanzim only
-    // runs when there is a file to read.
-    let mut remote = None;
-    if remote_configuration.is_file() {
-        let configuration: Remote = read_configuration(&remote_configuration)?;
-        tracing::debug!(
-            msg = "Running as a client",
-            configuration = ?remote_configuration,
-            server = configuration.server,
-            token = configuration.token.is_some()
-        );
-        remote = Some(configuration);
-    } else {
-        tracing::debug!(msg = "Running against local storage", directory = ?storage);
-    }
 
     match settings.command {
         Command::Init { command } => match command.unwrap_or(InitCommand::Storage) {
             InitCommand::Storage => {
-                if let Some(remote) = remote {
-                    anyhow::bail!(
-                        "{remote_configuration:?} makes this instance a client of {}, and a \
-                         client owns no storage — there is nothing here to initialize. \
-                         Initialize the machine running `borhan serve` instead, or remove \
-                         {remote_configuration:?} to keep memories in {storage:?} locally.",
-                        remote.server
-                    );
-                }
-
-                // The whole of making a storage, now that a memory is a
-                // directory rather than a table: there is nothing to shape
-                // ahead of time, so this is a mkdir and the announcement that
-                // it happened.
                 let existing = storage.is_dir();
                 fs::create_dir_all(&storage)
                     .with_context(|| format!("Could not create {storage:?}"))?;
@@ -711,36 +715,29 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
 
-            InitCommand::Remote { server, token } => {
-                if let Some(remote) = remote {
+            InitCommand::Server { listen, token } => {
+                let server_configuration = settings.home.join(SERVER_CONFIGURATION);
+                if server_configuration.is_file() {
                     anyhow::bail!(
-                        "{remote_configuration:?} already points this instance at {}. Remove it \
-                         before pointing it at another server.",
-                        remote.server
+                        "{server_configuration:?} already exists. Remove it before writing \
+                         another listen address."
                     );
                 }
-                // TODO: reach the server before writing anything — hit
-                // `http://{server}/api/v1/auth` with the token and require a 201
-                // back, so a wrong address or a rejected token fails here rather
-                // than at the first command that needs the server. Nothing in
-                // the tree makes client-side HTTP requests yet, so writing the
-                // file is all this does for now.
-                let remote = Remote { server, token };
-                let configuration = match toml_edit::ser::to_string_pretty(&remote) {
+                let server = Server {
+                    listen: Some(listen.clone()),
+                    token,
+                };
+                let configuration = match toml_edit::ser::to_string_pretty(&server) {
                     Ok(configuration) => configuration,
-                    // Two strings; there is no shape here that TOML cannot hold.
                     Err(error) => {
                         return Err(anyhow::Error::new(error)
-                            .context("Could not render the remote configuration"));
+                            .context("Could not render the server configuration"));
                     }
                 };
 
                 fs::create_dir_all(&settings.home).with_context(|| {
                     format!("Could not create home directory {:?}", settings.home)
                 })?;
-                // `create_new` refuses to clobber an existing file, and the unix
-                // mode keeps the token out of a world-readable file from the
-                // moment it exists rather than a chmod later.
                 let mut options = fs::OpenOptions::new();
                 options.write(true).create_new(true);
                 #[cfg(unix)]
@@ -749,21 +746,21 @@ async fn main() -> anyhow::Result<()> {
                     options.mode(0o600);
                 }
                 let mut file = options
-                    .open(&remote_configuration)
-                    .with_context(|| format!("Could not create {remote_configuration:?}"))?;
+                    .open(&server_configuration)
+                    .with_context(|| format!("Could not create {server_configuration:?}"))?;
                 file.write_all(configuration.as_bytes())
-                    .with_context(|| format!("Could not write {remote_configuration:?}"))?;
+                    .with_context(|| format!("Could not write {server_configuration:?}"))?;
 
                 tracing::info!(
-                    msg = "Initialized remote",
-                    configuration = ?remote_configuration,
-                    server = remote.server,
-                    token = remote.token.is_some()
+                    msg = "Initialized server configuration",
+                    configuration = ?server_configuration,
+                    listen = listen,
+                    token = server.token.is_some()
                 );
                 println!(
-                    "Initialized {} pointing at {}",
-                    remote_configuration.display(),
-                    remote.server
+                    "Initialized {} listening at {}",
+                    server_configuration.display(),
+                    listen
                 );
                 Ok(())
             }
@@ -784,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let router =
-                axum::Router::new().route("/", axum::routing::get(|| async { "Hello, world!" }));
+                crate::api::router(crate::api::App::new(storage.clone(), server.token.clone()));
             let listener = tokio::net::TcpListener::bind(&address)
                 .await
                 .with_context(|| format!("Could not listen on {address}"))?;
@@ -792,8 +789,6 @@ async fn main() -> anyhow::Result<()> {
                 msg = "Started HTTP server",
                 address = address,
                 storage = ?storage,
-                // Nothing enforces it yet; logged so a misread server.toml is
-                // visible before it matters.
                 token = server.token.is_some()
             );
             axum::serve(listener, router)
@@ -803,100 +798,109 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Memory { command } => {
-            if let Some(remote) = remote {
-                // TODO: send this to the server instead of refusing — talk to
-                // it over the HTTP API and print what it answers with. Every
-                // memory command lands here, so this is the one place client
-                // mode has to grow.
-                anyhow::bail!(
-                    "{remote_configuration:?} makes this instance a client of {}, and routing \
-                     commands to a server is not implemented yet. Remove \
-                     {remote_configuration:?} to work against {storage:?} locally.",
-                    remote.server
-                );
-            }
-
-            match command.unwrap_or(MemoryCommand::List) {
+            let origin = probe_server(&settings.home)?;
+            let command = command.unwrap_or(MemoryCommand::List { json: false });
+            match command {
                 MemoryCommand::Create {
                     name,
                     description,
                     languages,
+                    json,
                 } => {
-                    check_storage(&settings.home, &storage, "memory create ...")?;
-
-                    tracing::debug!(
-                        msg = "Creating memory",
-                        name = name,
-                        description = description.is_some()
-                    );
-                    let (store, id) =
-                        Storage::create(&storage, &name, description.as_deref(), &languages)?;
-                    // The index is made now rather than on the first `add`, so
-                    // that a memory is either wholly there or wholly not.
-                    let built = Index::attach(&store.directory.join(index::DIRECTORY))?;
-                    store.set_meta(index::VERSION_KEY, &normalize::VERSION.to_string())?;
-                    store.set_meta(index::BUILT_KEY, &Ulid::now().to_string())?;
-                    drop(built);
-
-                    tracing::info!(msg = "Created memory", ulid = %id, name = name);
-                    println!("{id}");
+                    if let Some((origin, token)) = &origin {
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            "/api/v1/memory",
+                            Some(serde_json::json!({
+                                "name": name,
+                                "description": description,
+                                "languages": languages,
+                            })),
+                        )?;
+                        print_http(&response, json, |body| {
+                            println!("{}", body["id"].as_str().unwrap_or(""));
+                            Ok(())
+                        })?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory create ...")?;
+                        let (id, stats) =
+                            crate::api::create(&storage, &name, &description, &languages)?;
+                        if json {
+                            print_pretty(&crate::api::id_json(&id, &stats))?;
+                        } else {
+                            println!("{id}");
+                        }
+                    }
                     Ok(())
                 }
 
-                MemoryCommand::List => {
-                    check_storage(&settings.home, &storage, "memory list")?;
-
-                    let memories = Storage::list(&storage)?;
-                    tracing::info!(msg = "Listed memories", count = memories.len());
-                    if memories.is_empty() {
-                        eprintln!("No memories yet — `borhan memory create <name>`.");
-                        return Ok(());
+                MemoryCommand::List { json } => {
+                    if let Some((origin, token)) = &origin {
+                        let response =
+                            request(origin, token.as_deref(), "GET", "/api/v1/memory_list", None)?;
+                        print_http(&response, json, print_memory_list_json)?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory list")?;
+                        let (memories, stats) = crate::api::list(&storage)?;
+                        if json {
+                            print_pretty(&crate::api::list_json(&memories, &stats))?;
+                        } else {
+                            print_memory_list(&memories);
+                        }
                     }
+                    Ok(())
+                }
 
-                    let mut widths = (0, 0, 0);
-                    let mut rows = Vec::new();
-                    for memory in &memories {
-                        let created = chrono::DateTime::from_timestamp_millis(memory.created_at);
-                        let created = match created {
-                            Some(created) => {
-                                created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                            }
-                            None => "-".to_string(),
-                        };
-                        let counts = format!(
-                            "{} sessions, {} messages, {} units",
-                            memory.sessions, memory.messages, memory.units
-                        );
-                        let summary = match &memory.description {
-                            Some(description) => {
-                                let line = description.lines().next().unwrap_or("");
-                                if line.chars().count() > SUMMARY_LIMIT {
-                                    let cut: String =
-                                        line.chars().take(SUMMARY_LIMIT).collect::<String>();
-                                    format!("{cut}…")
-                                } else {
-                                    line.to_string()
-                                }
-                            }
-                            None => String::new(),
-                        };
-                        widths.0 = widths.0.max(memory.name.len());
-                        widths.1 = widths.1.max(counts.len());
-                        widths.2 = widths.2.max(memory.languages.len());
-                        rows.push((
-                            memory.id.to_string(),
-                            created,
-                            memory.name.clone(),
-                            counts,
-                            memory.languages.clone(),
-                            summary,
-                        ));
+                MemoryCommand::Update {
+                    name,
+                    description,
+                    languages,
+                    json,
+                } => {
+                    if description.is_none() && languages.is_none() {
+                        anyhow::bail!("Pass --description and/or --languages");
                     }
-                    for (id, created, name, counts, languages, summary) in rows {
-                        println!(
-                            "{id}  {created}  {name:<0$}  {counts:<1$}  {languages:<2$}  {summary}",
-                            widths.0, widths.1, widths.2
-                        );
+                    if let Some((origin, token)) = &origin {
+                        let mut payload = serde_json::Map::new();
+                        if let Some(description) = &description {
+                            payload.insert(
+                                "description".to_string(),
+                                serde_json::Value::String(description.clone()),
+                            );
+                        }
+                        if let Some(languages) = &languages {
+                            payload.insert(
+                                "languages".to_string(),
+                                serde_json::Value::String(languages.clone()),
+                            );
+                        }
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "PATCH",
+                            &format!("/api/v1/memory/{name}"),
+                            Some(serde_json::Value::Object(payload)),
+                        )?;
+                        print_http(&response, json, |body| {
+                            println!("{}", body["id"].as_str().unwrap_or(""));
+                            Ok(())
+                        })?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory update ...")?;
+                        let store = Storage::open(&storage, &name)?;
+                        let (id, stats) = crate::api::update(
+                            &store,
+                            &name,
+                            description.as_deref(),
+                            languages.as_deref(),
+                        )?;
+                        if json {
+                            print_pretty(&crate::api::id_json(&id, &stats))?;
+                        } else {
+                            println!("{id}");
+                        }
                     }
                     Ok(())
                 }
@@ -909,111 +913,125 @@ async fn main() -> anyhow::Result<()> {
                     role,
                     author,
                     ts,
+                    json,
                 } => {
-                    check_storage(&settings.home, &storage, "memory add ...")?;
-
-                    let Some(role) = Role::parse(&role) else {
-                        anyhow::bail!("Role {role:?} is not one of user, assistant or tool");
-                    };
-                    let mut store = Storage::open(&storage, &name)?;
-                    let built = Index::open(&store)?;
-
-                    let ts = match ts {
-                        Some(ts) => ts,
-                        None => Ulid::now(),
-                    };
-                    let author = match &author {
-                        Some(author) => author.as_str(),
-                        None => role.as_str(),
-                    };
-                    tracing::debug!(
-                        msg = "Adding message",
-                        memory = name,
-                        session = session,
-                        bytes = text.len()
-                    );
-
-                    // Layer one first and on its own. If indexing fails after
-                    // this, the message is still stored and `rescan` recovers
-                    // it; the other order loses it.
-                    let written = store.add(&Entry {
-                        session: &session,
-                        message: message.as_deref(),
-                        author,
-                        role,
-                        ts,
-                        body: &text,
-                    })?;
-
-                    let mut writer = built.writer()?;
-                    built.add(&writer, &written, role.code(), ts, &text)?;
-                    built.commit(&mut writer)?;
-
-                    tracing::info!(
-                        msg = "Added message",
-                        memory = name,
-                        ulid = %written.message,
-                        seq = written.seq,
-                        units = written.units.len()
-                    );
-                    eprintln!("{} units", written.units.len());
-                    println!("{}", written.message);
+                    if let Some((origin, token)) = &origin {
+                        let mut payload = serde_json::json!({
+                            "session": session,
+                            "role": role,
+                            "body": text,
+                        });
+                        if let Some(message) = &message {
+                            payload["message"] = serde_json::Value::String(message.clone());
+                        }
+                        if let Some(author) = &author {
+                            payload["author"] = serde_json::Value::String(author.clone());
+                        }
+                        if let Some(ts) = ts {
+                            payload["ts"] = serde_json::json!(ts);
+                        }
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/message_list"),
+                            Some(payload),
+                        )?;
+                        print_http(&response, json, |body| {
+                            if let Some(units) = body["units"].as_u64() {
+                                eprintln!("{units} units");
+                            }
+                            println!("{}", body["id"].as_str().unwrap_or(""));
+                            Ok(())
+                        })?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory add ...")?;
+                        let Some(role) = Role::parse(&role) else {
+                            anyhow::bail!("Role {role:?} is not one of user, assistant or tool");
+                        };
+                        let store = Storage::open(&storage, &name)?;
+                        let built = Index::open(&store)?;
+                        let ts = match ts {
+                            Some(ts) => ts,
+                            None => Ulid::now(),
+                        };
+                        let author = match &author {
+                            Some(author) => author.as_str(),
+                            None => role.as_str(),
+                        };
+                        let writer = built.writer()?;
+                        let store = Mutex::new(store);
+                        let writer = Mutex::new(writer);
+                        let entry = Entry {
+                            session: &session,
+                            message: message.as_deref(),
+                            author,
+                            role,
+                            ts,
+                            body: &text,
+                        };
+                        let (written, stats) =
+                            crate::api::add(&store, &built, &writer, &entry, &name)?;
+                        if json {
+                            print_pretty(&serde_json::json!({
+                                "id": written.message.to_string(),
+                                "units": written.units.len(),
+                                "stats": stats,
+                            }))?;
+                        } else {
+                            eprintln!("{} units", written.units.len());
+                            println!("{}", written.message);
+                        }
+                    }
                     Ok(())
                 }
 
                 MemoryCommand::Get { name, ids, json } => {
-                    check_storage(&settings.home, &storage, "memory get ...")?;
                     if ids.is_empty() {
                         anyhow::bail!("Pass at least one unit ULID to read back");
                     }
-
-                    let store = Storage::open(&storage, &name)?;
-                    let mut units = Vec::new();
-                    for id in &ids {
-                        match Ulid::parse(id) {
-                            Ok(id) => units.push(id),
-                            Err(error) => {
-                                return Err(anyhow::Error::new(error)
-                                    .context(format!("{id:?} is not a ULID")));
+                    if let Some((origin, token)) = &origin {
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/unit_list"),
+                            Some(serde_json::json!({ "id_list": ids })),
+                        )?;
+                        print_http(&response, json, print_units_json)?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory get ...")?;
+                        let store = Storage::open(&storage, &name)?;
+                        let mut units = Vec::new();
+                        for id in &ids {
+                            match Ulid::parse(id) {
+                                Ok(id) => units.push(id),
+                                Err(error) => {
+                                    return Err(anyhow::Error::new(error)
+                                        .context(format!("{id:?} is not a ULID")));
+                                }
                             }
                         }
-                    }
-                    let located = store.locate(&units)?;
-                    for id in &units {
-                        if !located.iter().any(|row| row.unit == *id) {
-                            eprintln!("No unit {id}");
+                        let (located, stats) = crate::api::get(&store, &units)?;
+                        for id in &units {
+                            if !located.iter().any(|row| row.unit == *id) {
+                                eprintln!("No unit {id}");
+                            }
                         }
-                    }
-
-                    if json {
-                        let mut array = Vec::new();
-                        for row in &located {
-                            array.push(serde_json::json!({
-                                "unit": row.unit.to_string(),
-                                "message": row.message.to_string(),
-                                "message_ref": row.message_ref,
-                                "session": row.session.to_string(),
-                                "session_ref": row.session_ref,
-                                "seq": row.seq,
-                                "unit_seq": row.unit_seq,
-                                "author": row.author,
-                                "role": row.role.as_str(),
-                                "ts": row.ts,
-                                "text": row.text(),
-                            }));
-                        }
-                        println!("{}", serde_json::Value::Array(array));
-                    } else {
-                        for row in &located {
-                            println!(
-                                "{}  {}  {}  unit {}",
-                                row.unit,
-                                row.role.as_str(),
-                                row.session_ref,
-                                row.unit_seq
-                            );
-                            println!("{}", row.text());
-                            println!();
+                        if json {
+                            print_pretty(&crate::api::get_json(&located, &stats))?;
+                        } else {
+                            for row in &located {
+                                println!(
+                                    "{}  {}  {}  unit {}",
+                                    row.unit,
+                                    row.role.as_str(),
+                                    row.session_ref,
+                                    row.unit_seq
+                                );
+                                println!("{}", row.text());
+                                println!();
+                            }
                         }
                     }
                     Ok(())
@@ -1030,194 +1048,85 @@ async fn main() -> anyhow::Result<()> {
                     roles,
                     json,
                 } => {
-                    check_storage(&settings.home, &storage, "memory search ...")?;
-
                     let mut parsed = Vec::new();
                     for group in &groups {
                         parsed.push(parse_group(group)?);
                     }
-                    let mut filter = Filter {
-                        after,
-                        before,
-                        ..Filter::default()
-                    };
-                    if let Some(session) = &session {
-                        match Ulid::parse(session) {
-                            Ok(session) => filter.session = Some(session),
-                            Err(error) => {
-                                return Err(anyhow::Error::new(error).context(format!(
-                                    "--session takes a session ULID, and {session:?} is not one"
-                                )));
-                            }
-                        }
-                    }
-                    for role in &roles {
-                        let Some(role) = Role::parse(role) else {
-                            anyhow::bail!("Role {role:?} is not one of user, assistant or tool");
-                        };
-                        filter.roles.push(role);
-                    }
-
-                    let store = Storage::open(&storage, &name)?;
-                    let built = Index::open(&store)?;
-                    tracing::debug!(
-                        msg = "Searching",
-                        memory = name,
-                        groups = parsed.len(),
-                        limit = limit
-                    );
-                    let outcome =
-                        search::search(&store, &built, &parsed, &filter, limit, max_per_message)?;
-
-                    // Logged before it is printed, so that the cursor call that
-                    // follows a search has something to attach itself to.
-                    let mut returned = Vec::new();
-                    for hit in &outcome.hits {
-                        returned.push(serde_json::json!({
-                            "unit": hit.unit.to_string(),
-                            "score": hit.score,
-                            "coverage": [hit.coverage.0, hit.coverage.1],
-                        }));
-                    }
-                    let asked = serde_json::to_string(&serde_json::Value::Array(
-                        parsed
-                            .iter()
-                            .map(|group| {
-                                serde_json::json!({
-                                    "label": group.label,
-                                    "words": group.words,
-                                    "required": group.required,
-                                })
-                            })
-                            .collect(),
-                    ))?;
-                    let logged = serde_json::to_string(&serde_json::Value::Array(returned))?;
-                    store.log_search(&asked, &logged)?;
-
-                    tracing::info!(
-                        msg = "Searched",
-                        memory = name,
-                        hits = outcome.hits.len(),
-                        unknown = outcome.unknown.len()
-                    );
-
-                    if json {
-                        let mut array = Vec::new();
-                        for hit in &outcome.hits {
-                            array.push(serde_json::json!({
-                                "cursor": hit.cursor,
-                                "unit": hit.unit.to_string(),
-                                "score": hit.score,
-                                "raw": hit.raw,
-                                "coverage": [hit.coverage.0, hit.coverage.1],
-                                "matched": hit.matched,
-                                "session": hit.session,
-                                "message": hit.message,
-                                "author": hit.author,
-                                "role": hit.role.as_str(),
-                                "ts": hit.ts,
-                                "words": hit.words,
-                                "snippet": hit.snippet,
+                    if let Some((origin, token)) = &origin {
+                        let mut group_list = Vec::new();
+                        for group in &parsed {
+                            group_list.push(serde_json::json!({
+                                "label": group.label,
+                                "word_list": group.words,
+                                "required": group.required,
                             }));
                         }
-                        let unknown: Vec<serde_json::Value> = outcome
-                            .unknown
-                            .iter()
-                            .map(|unknown| {
-                                serde_json::json!({
-                                    "group": unknown.group,
-                                    "word": unknown.word,
-                                })
-                            })
-                            .collect();
-                        let hints: Vec<serde_json::Value> = outcome
-                            .hints
-                            .iter()
-                            .map(|(term, df)| serde_json::json!({"term": term, "units": df}))
-                            .collect();
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "hits": array,
-                                "unknown": unknown,
-                                "hints": hints,
-                            })
-                        );
-                        return Ok(());
-                    }
-
-                    for unknown in &outcome.unknown {
-                        eprintln!(
-                            "unknown: {:?} (group {:?}) matched nothing",
-                            unknown.word, unknown.group
-                        );
-                    }
-                    if outcome.hits.is_empty() {
-                        eprintln!("No hits.");
-                    }
-
-                    // Column widths are measured from the result set rather
-                    // than fixed, because a session and a message are whatever
-                    // the feeder decided to call them, and a header that does
-                    // not sit over the column it names is worse than no header.
-                    //
-                    // The header goes to stderr, where everything else this
-                    // command says *about* its answer already goes — the
-                    // unknown words, `No hits.`, the vocabulary line. Standard
-                    // output stays hits and nothing else, so `head -n 1 | awk
-                    // '{print $3}'` still means "the cursor of the top hit".
-                    const HEADER: [&str; 6] =
-                        ["score", "cover", "cursor", "session", "message", "size"];
-                    let rows: Vec<[String; 6]> = outcome
-                        .hits
-                        .iter()
-                        .map(|hit| {
-                            [
-                                format!("{:.3}", hit.score),
-                                format!("{}/{}", hit.coverage.0, hit.coverage.1),
-                                hit.cursor.to_string(),
-                                hit.session.to_string(),
-                                hit.message.as_deref().unwrap_or("-").to_string(),
-                                format!("{} words", hit.words),
-                            ]
-                        })
-                        .collect();
-                    let mut widths = HEADER.map(|title| title.len());
-                    for row in &rows {
-                        for (width, cell) in widths.iter_mut().zip(row) {
-                            *width = (*width).max(cell.chars().count());
+                        let mut payload = serde_json::json!({
+                            "group_list": group_list,
+                            "limit": limit,
+                            "max_per_message": max_per_message,
+                        });
+                        if let Some(session) = &session {
+                            payload["session"] = serde_json::Value::String(session.clone());
                         }
-                    }
-
-                    let lay = |cells: &[String; 6], last: &str| {
-                        let mut line = String::new();
-                        for (cell, width) in cells.iter().zip(widths) {
-                            line.push_str(&format!("{cell:<width$}  "));
+                        if let Some(after) = after {
+                            payload["after"] = serde_json::json!(after);
                         }
-                        line.push_str(last);
-                        line
-                    };
-
-                    if !rows.is_empty() {
-                        let titles = HEADER.map(|title| title.to_string());
-                        eprintln!("{}", lay(&titles, "matched"));
-                    }
-                    for (row, hit) in rows.iter().zip(&outcome.hits) {
-                        println!("{}", lay(row, &format!("[{}]", hit.matched.join(","))));
-                        // Quoted so that the sentence is one selectable run:
-                        // a double-click takes a word and a triple-click takes
-                        // the line, but the quotes are what make the boundary
-                        // of the text visible when it ends in whitespace or
-                        // starts with a dash.
-                        println!("\"{}\"", preview(&hit.snippet));
-                        println!();
-                    }
-                    if !outcome.hints.is_empty() {
-                        let mut hints = Vec::new();
-                        for (term, units) in &outcome.hints {
-                            hints.push(format!("{term} ({units})"));
+                        if let Some(before) = before {
+                            payload["before"] = serde_json::json!(before);
                         }
-                        eprintln!("also in these results: {}", hints.join(", "));
+                        if !roles.is_empty() {
+                            payload["role_list"] = serde_json::json!(roles);
+                        }
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/search"),
+                            Some(payload),
+                        )?;
+                        print_http(&response, json, print_search_json)?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory search ...")?;
+                        let mut filter = Filter {
+                            after,
+                            before,
+                            ..Filter::default()
+                        };
+                        if let Some(session) = &session {
+                            match Ulid::parse(session) {
+                                Ok(session) => filter.session = Some(session),
+                                Err(error) => {
+                                    return Err(anyhow::Error::new(error).context(format!(
+                                        "--session takes a session ULID, and {session:?} is not one"
+                                    )));
+                                }
+                            }
+                        }
+                        for role in &roles {
+                            let Some(role) = Role::parse(role) else {
+                                anyhow::bail!(
+                                    "Role {role:?} is not one of user, assistant or tool"
+                                );
+                            };
+                            filter.roles.push(role);
+                        }
+                        let store = Storage::open(&storage, &name)?;
+                        let built = Index::open(&store)?;
+                        let (outcome, stats) = crate::api::search(
+                            &store,
+                            &built,
+                            &name,
+                            &parsed,
+                            &filter,
+                            limit,
+                            max_per_message,
+                        )?;
+                        if json {
+                            print_pretty(&crate::api::search_json(&outcome, &stats))?;
+                        } else {
+                            print_search(&outcome);
+                        }
                     }
                     Ok(())
                 }
@@ -1229,134 +1138,543 @@ async fn main() -> anyhow::Result<()> {
                     after,
                     json,
                 } => {
-                    check_storage(&settings.home, &storage, "memory cursor ...")?;
-
-                    let unit = match Ulid::parse(&cursor) {
-                        Ok(unit) => unit,
-                        Err(error) => {
-                            return Err(anyhow::Error::new(error)
-                                .context(format!("{cursor:?} is not a cursor from a search hit")));
-                        }
-                    };
-                    let store = Storage::open(&storage, &name)?;
-                    let messages = store.around(unit, before, after)?;
-                    // The label this produces is the whole reason the log
-                    // exists: the caller reaching for a hit is the caller
-                    // telling us that hit was the right one.
-                    store.log_expansion(unit)?;
-
-                    tracing::info!(
-                        msg = "Expanded a cursor",
-                        memory = name,
-                        unit = %unit,
-                        messages = messages.len()
-                    );
-
-                    if json {
-                        let mut array = Vec::new();
-                        for message in &messages {
-                            array.push(serde_json::json!({
-                                "message": message.id.to_string(),
-                                "message_ref": message.reference,
-                                "seq": message.seq,
-                                "author": message.author,
-                                "role": message.role.as_str(),
-                                "ts": message.ts,
-                                "anchor": message.anchor,
-                                "body": message.body,
-                            }));
-                        }
-                        println!("{}", serde_json::Value::Array(array));
+                    if let Some((origin, token)) = &origin {
+                        let path = format!(
+                            "/api/v1/memory/{name}/cursor/{cursor}?before={before}&after={after}"
+                        );
+                        let response = request(origin, token.as_deref(), "GET", &path, None)?;
+                        print_http(&response, json, print_cursor_json)?;
                     } else {
-                        for message in &messages {
-                            let mark = if message.anchor { "→" } else { " " };
-                            println!(
-                                "{mark} {}  {}  {}  seq {}",
-                                message.id,
-                                message.author,
-                                message.role.as_str(),
-                                message.seq
-                            );
-                            println!("{}", message.body);
-                            println!();
+                        check_storage(&settings.home, &storage, "memory cursor ...")?;
+                        let unit = match Ulid::parse(&cursor) {
+                            Ok(unit) => unit,
+                            Err(error) => {
+                                return Err(anyhow::Error::new(error).context(format!(
+                                    "{cursor:?} is not a cursor from a search hit"
+                                )));
+                            }
+                        };
+                        let store = Storage::open(&storage, &name)?;
+                        let (messages, stats) =
+                            crate::api::cursor(&store, &name, unit, before, after)?;
+                        if json {
+                            print_pretty(&crate::api::cursor_json(&messages, &stats))?;
+                        } else {
+                            for message in &messages {
+                                let mark = if message.anchor { "→" } else { " " };
+                                println!(
+                                    "{mark} {}  {}  {}  seq {}",
+                                    message.id,
+                                    message.author,
+                                    message.role.as_str(),
+                                    message.seq
+                                );
+                                println!("{}", message.body);
+                                println!();
+                            }
                         }
                     }
                     Ok(())
                 }
 
-                MemoryCommand::Lexicon { name, words } => {
-                    check_storage(&settings.home, &storage, "memory lexicon ...")?;
+                MemoryCommand::Lexicon { name, words, json } => {
                     if words.is_empty() {
                         anyhow::bail!("Pass at least one word to look up");
                     }
-
-                    let store = Storage::open(&storage, &name)?;
-                    let built = Index::open(&store)?;
-                    let searcher = built.reader.searcher();
-
-                    for word in &words {
-                        let segmented = normalize::segment(word);
-                        let script = match segmented.first() {
-                            Some(word) => word.script,
-                            None => normalize::Script::Other,
-                        };
-                        let surface = normalize::surface(word);
-                        let lemma = normalize::lemma(word, script);
-
-                        let counts = [
-                            (built.fields.surface, surface.as_str()),
-                            (built.fields.lemma, lemma.as_str()),
-                            (built.fields.context, lemma.as_str()),
-                        ];
-                        let mut frequencies = [0u64; 3];
-                        for (at, (field, text)) in counts.iter().enumerate() {
-                            if text.is_empty() {
-                                continue;
+                    if let Some((origin, token)) = &origin {
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/lexicon"),
+                            Some(serde_json::json!({ "word_list": words })),
+                        )?;
+                        print_http(&response, json, print_lexicon_json)?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory lexicon ...")?;
+                        let store = Storage::open(&storage, &name)?;
+                        let built = Index::open(&store)?;
+                        let (rows, stats) = crate::api::lexicon(&built, &name, &words)?;
+                        if json {
+                            print_pretty(&crate::api::lexicon_json(&rows, &stats))?;
+                        } else {
+                            for row in &rows {
+                                println!(
+                                    "{}  surface={} ({})  lemma={} ({})  context=({})",
+                                    row.word,
+                                    row.surface,
+                                    row.surface_units,
+                                    row.lemma,
+                                    row.lemma_units,
+                                    row.context_units
+                                );
                             }
-                            let term = tantivy::Term::from_field_text(*field, text);
-                            frequencies[at] = searcher.doc_freq(&term)?;
                         }
-                        println!(
-                            "{word}  surface={surface} ({})  lemma={lemma} ({})  context=({})",
-                            frequencies[0], frequencies[1], frequencies[2]
-                        );
                     }
                     Ok(())
                 }
 
-                MemoryCommand::Rescan { name } => {
-                    check_storage(&settings.home, &storage, "memory rescan ...")?;
-
-                    let mut store = Storage::open(&storage, &name)?;
-                    // Deliberately not `Index::open`: this is the command whose
-                    // entire job is to make a stale index current, so refusing
-                    // to open a stale one here would leave no way out.
-                    let built = Index::attach(&store.directory.join(index::DIRECTORY))?;
-                    let mut writer = built.writer()?;
-                    built.clear(&mut writer)?;
-                    built.commit(&mut writer)?;
-
-                    let written = store.resplit()?;
-                    let mut units = 0;
-                    for (message, written) in &written {
-                        let (body, role, ts) = store.message(*message)?;
-                        built.add(&writer, written, role, ts, &body)?;
-                        units += written.units.len();
+                MemoryCommand::Rescan { name, json } => {
+                    if let Some((origin, token)) = &origin {
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/rescan"),
+                            None,
+                        )?;
+                        print_http(&response, json, |body| {
+                            eprintln!(
+                                "{} messages, {} units",
+                                body["messages"].as_u64().unwrap_or(0),
+                                body["units"].as_u64().unwrap_or(0)
+                            );
+                            Ok(())
+                        })?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory rescan ...")?;
+                        let store = Storage::open(&storage, &name)?;
+                        let built = Index::attach(&store.directory.join(crate::index::DIRECTORY))?;
+                        let writer = built.writer()?;
+                        let store = Mutex::new(store);
+                        let writer = Mutex::new(writer);
+                        let (messages, units, stats) =
+                            crate::api::rescan(&store, &built, &writer, &name)?;
+                        if json {
+                            print_pretty(&serde_json::json!({
+                                "messages": messages,
+                                "units": units,
+                                "stats": stats,
+                            }))?;
+                        } else {
+                            eprintln!("{messages} messages, {units} units");
+                        }
                     }
-                    built.commit(&mut writer)?;
-                    store.set_meta(index::VERSION_KEY, &normalize::VERSION.to_string())?;
-                    store.set_meta(index::BUILT_KEY, &Ulid::now().to_string())?;
-
-                    tracing::info!(
-                        msg = "Rescanned memory",
-                        memory = name,
-                        messages = written.len(),
-                        units = units
-                    );
-                    eprintln!("{} messages, {units} units", written.len());
                     Ok(())
                 }
             }
         }
     }
+}
+
+fn probe_server(home: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
+    let path = home.join(SERVER_CONFIGURATION);
+    if !path.is_file() {
+        tracing::debug!(msg = "Running against local storage");
+        return Ok(None);
+    }
+    let server: Server = read_configuration(&path)?;
+    let Some(listen) = server.listen else {
+        tracing::debug!(msg = "server.toml has no listen, using local storage");
+        return Ok(None);
+    };
+    let origin = format!("http://{listen}");
+    let url = format!("{origin}/api/v1/health");
+    let mut req = ureq::get(&url);
+    req = req.timeout(Duration::from_secs(1));
+    if let Some(token) = &server.token {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    match req.call() {
+        Ok(response) if response.status() == 200 => {
+            tracing::debug!(msg = "Using HTTP server", origin = origin.as_str());
+            Ok(Some((origin, server.token)))
+        }
+        Ok(response) => {
+            tracing::debug!(
+                msg = "Server health was not 200, using local storage",
+                status = response.status()
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::debug!(msg = "Server did not respond, using local storage", error = %error);
+            Ok(None)
+        }
+    }
+}
+
+struct ClientResponse {
+    version: Option<String>,
+    server: Option<String>,
+    trace: Option<String>,
+    body: serde_json::Value,
+}
+
+fn versions_match(remote: Option<&str>) -> bool {
+    match remote {
+        Some(version) => version == CRATE_VERSION,
+        None => false,
+    }
+}
+
+fn print_pretty(body: &serde_json::Value) -> anyhow::Result<()> {
+    let text = match serde_json::to_string_pretty(body) {
+        Ok(text) => text,
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("Could not encode JSON"));
+        }
+    };
+    println!("{text}");
+    Ok(())
+}
+
+fn print_http_headers(response: &ClientResponse) {
+    if let Some(server) = &response.server {
+        eprintln!("Server: {server}");
+    }
+    if let Some(version) = &response.version {
+        eprintln!("X-Borhan-Version: {version}");
+    }
+    if let Some(trace) = &response.trace {
+        eprintln!("X-Trace-Id: {trace}");
+    }
+}
+
+fn print_http(
+    response: &ClientResponse,
+    json: bool,
+    print_text: impl FnOnce(&serde_json::Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if json || !versions_match(response.version.as_deref()) {
+        return print_pretty(&response.body);
+    }
+    print_http_headers(response);
+    print_text(&response.body)
+}
+
+fn request(
+    origin: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> anyhow::Result<ClientResponse> {
+    let url = format!("{origin}{path}");
+    let mut req = ureq::request(method, &url);
+    req = req.timeout(Duration::from_secs(120));
+    if let Some(token) = token {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let response = match body {
+        Some(body) => req.send_json(body),
+        None => req.call(),
+    };
+    match response {
+        Ok(response) => {
+            let version = response.header("x-borhan-version").map(str::to_string);
+            let server = response.header("server").map(str::to_string);
+            let trace = response.header("x-trace-id").map(str::to_string);
+            if let Some(trace) = &trace {
+                tracing::debug!(msg = "Server trace", trace = trace.as_str());
+            }
+            let body = match response.into_json::<serde_json::Value>() {
+                Ok(value) => value,
+                Err(error) => return Err(anyhow::Error::new(error).context("Could not read JSON")),
+            };
+            Ok(ClientResponse {
+                version,
+                server,
+                trace,
+                body,
+            })
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let version = response.header("x-borhan-version").map(str::to_string);
+            let body = match response.into_json::<serde_json::Value>() {
+                Ok(value) => value,
+                Err(_) => serde_json::json!({}),
+            };
+            if !versions_match(version.as_deref()) {
+                print_pretty(&body)?;
+                anyhow::bail!("HTTP {code}");
+            }
+            let message = match body.get("error").and_then(|error| error.as_str()) {
+                Some(message) => message.to_string(),
+                None => format!("HTTP {code}"),
+            };
+            anyhow::bail!("{message}")
+        }
+        Err(error) => Err(anyhow::Error::new(error).context(format!("{method} {url}"))),
+    }
+}
+
+fn print_memory_list(memories: &[crate::storage::Memory]) {
+    if memories.is_empty() {
+        eprintln!("No memories yet — `borhan memory create <name>`.");
+        return;
+    }
+    let mut widths = (0, 0, 0);
+    let mut rows = Vec::new();
+    for memory in memories {
+        let created = chrono::DateTime::from_timestamp_millis(memory.created_at);
+        let created = match created {
+            Some(created) => created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            None => "-".to_string(),
+        };
+        let counts = format!(
+            "{} sessions, {} messages, {} units",
+            memory.sessions, memory.messages, memory.units
+        );
+        let summary = match &memory.description {
+            Some(description) => {
+                let line = description.lines().next().unwrap_or("");
+                if line.chars().count() > SUMMARY_LIMIT {
+                    let cut: String = line.chars().take(SUMMARY_LIMIT).collect::<String>();
+                    format!("{cut}…")
+                } else {
+                    line.to_string()
+                }
+            }
+            None => String::new(),
+        };
+        widths.0 = widths.0.max(memory.name.len());
+        widths.1 = widths.1.max(counts.len());
+        widths.2 = widths.2.max(memory.languages.len());
+        rows.push((
+            memory.id.to_string(),
+            created,
+            memory.name.clone(),
+            counts,
+            memory.languages.clone(),
+            summary,
+        ));
+    }
+    for (id, created, name, counts, languages, summary) in rows {
+        println!(
+            "{id}  {created}  {name:<0$}  {counts:<1$}  {languages:<2$}  {summary}",
+            widths.0, widths.1, widths.2
+        );
+    }
+}
+
+fn print_memory_list_json(body: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(list) = body.get("memory_list").and_then(|value| value.as_array()) else {
+        anyhow::bail!("server response has no memory_list");
+    };
+    if list.is_empty() {
+        eprintln!("No memories yet — `borhan memory create <name>`.");
+        return Ok(());
+    }
+    let mut memories = Vec::new();
+    for memory in list {
+        let id = match Ulid::parse(memory["id"].as_str().unwrap_or("")) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        memories.push(crate::storage::Memory {
+            id,
+            name: memory["name"].as_str().unwrap_or("").to_string(),
+            description: memory["description"].as_str().map(str::to_string),
+            languages: memory["languages"].as_str().unwrap_or("").to_string(),
+            created_at: memory["created_at"].as_i64().unwrap_or(0),
+            sessions: memory["sessions"].as_u64().unwrap_or(0),
+            messages: memory["messages"].as_u64().unwrap_or(0),
+            units: memory["units"].as_u64().unwrap_or(0),
+        });
+    }
+    print_memory_list(&memories);
+    Ok(())
+}
+
+fn print_units_json(body: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(list) = body.get("unit_list").and_then(|value| value.as_array()) else {
+        anyhow::bail!("server response has no unit_list");
+    };
+    for row in list {
+        println!(
+            "{}  {}  {}  unit {}",
+            row["unit"].as_str().unwrap_or(""),
+            row["role"].as_str().unwrap_or(""),
+            row["session_ref"].as_str().unwrap_or(""),
+            row["unit_seq"].as_i64().unwrap_or(0)
+        );
+        println!("{}", row["text"].as_str().unwrap_or(""));
+        println!();
+    }
+    Ok(())
+}
+
+fn print_search(outcome: &crate::search::Outcome) {
+    for unknown in &outcome.unknown {
+        eprintln!(
+            "unknown: {:?} (group {:?}) matched nothing",
+            unknown.word, unknown.group
+        );
+    }
+    if outcome.hits.is_empty() {
+        eprintln!("No hits.");
+    }
+    const HEADER: [&str; 6] = ["score", "cover", "cursor", "session", "message", "size"];
+    let mut rows: Vec<[String; 6]> = Vec::new();
+    for hit in &outcome.hits {
+        rows.push([
+            format!("{:.3}", hit.score),
+            format!("{}/{}", hit.coverage.0, hit.coverage.1),
+            hit.cursor.to_string(),
+            hit.session.to_string(),
+            hit.message.as_deref().unwrap_or("-").to_string(),
+            format!("{} words", hit.words),
+        ]);
+    }
+    let mut widths = HEADER.map(|title| title.len());
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let lay = |cells: &[String; 6], last: &str| {
+        let mut line = String::new();
+        for (cell, width) in cells.iter().zip(widths) {
+            line.push_str(&format!("{cell:<width$}  "));
+        }
+        line.push_str(last);
+        line
+    };
+    if !rows.is_empty() {
+        let titles = HEADER.map(|title| title.to_string());
+        eprintln!("{}", lay(&titles, "matched"));
+    }
+    for (row, hit) in rows.iter().zip(&outcome.hits) {
+        println!("{}", lay(row, &format!("[{}]", hit.matched.join(","))));
+        println!("\"{}\"", preview(&hit.snippet));
+        println!();
+    }
+    if !outcome.hints.is_empty() {
+        let mut hints = Vec::new();
+        for (term, units) in &outcome.hints {
+            hints.push(format!("{term} ({units})"));
+        }
+        eprintln!("also in these results: {}", hints.join(", "));
+    }
+}
+
+fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(unknown) = body.get("unknown_list").and_then(|value| value.as_array()) {
+        for item in unknown {
+            eprintln!(
+                "unknown: {:?} (group {:?}) matched nothing",
+                item["word"].as_str().unwrap_or(""),
+                item["group"].as_str().unwrap_or("")
+            );
+        }
+    }
+    let Some(hits) = body.get("hit_list").and_then(|value| value.as_array()) else {
+        anyhow::bail!("server response has no hit_list");
+    };
+    if hits.is_empty() {
+        eprintln!("No hits.");
+        return Ok(());
+    }
+    const HEADER: [&str; 6] = ["score", "cover", "cursor", "session", "message", "size"];
+    let mut rows: Vec<[String; 6]> = Vec::new();
+    let mut matched_list = Vec::new();
+    let mut snippets = Vec::new();
+    for hit in hits {
+        let coverage = hit["coverage"].as_array();
+        let cover = match coverage {
+            Some(coverage) if coverage.len() == 2 => {
+                format!(
+                    "{}/{}",
+                    coverage[0].as_u64().unwrap_or(0),
+                    coverage[1].as_u64().unwrap_or(0)
+                )
+            }
+            _ => "-/-".to_string(),
+        };
+        rows.push([
+            format!("{:.3}", hit["score"].as_f64().unwrap_or(0.0)),
+            cover,
+            hit["cursor"].as_str().unwrap_or("").to_string(),
+            hit["session"].as_str().unwrap_or("").to_string(),
+            hit["message"].as_str().unwrap_or("-").to_string(),
+            format!("{} words", hit["words"].as_u64().unwrap_or(0)),
+        ]);
+        let mut matched = Vec::new();
+        if let Some(list) = hit["matched_list"].as_array() {
+            for label in list {
+                if let Some(label) = label.as_str() {
+                    matched.push(label.to_string());
+                }
+            }
+        }
+        matched_list.push(matched);
+        snippets.push(hit["snippet"].as_str().unwrap_or("").to_string());
+    }
+    let mut widths = HEADER.map(|title| title.len());
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let lay = |cells: &[String; 6], last: &str| {
+        let mut line = String::new();
+        for (cell, width) in cells.iter().zip(widths) {
+            line.push_str(&format!("{cell:<width$}  "));
+        }
+        line.push_str(last);
+        line
+    };
+    let titles = HEADER.map(|title| title.to_string());
+    eprintln!("{}", lay(&titles, "matched"));
+    for (at, row) in rows.iter().enumerate() {
+        println!("{}", lay(row, &format!("[{}]", matched_list[at].join(","))));
+        println!("\"{}\"", preview(&snippets[at]));
+        println!();
+    }
+    if let Some(hints) = body.get("hint_list").and_then(|value| value.as_array())
+        && !hints.is_empty()
+    {
+        let mut parts = Vec::new();
+        for hint in hints {
+            parts.push(format!(
+                "{} ({})",
+                hint["term"].as_str().unwrap_or(""),
+                hint["units"].as_u64().unwrap_or(0)
+            ));
+        }
+        eprintln!("also in these results: {}", parts.join(", "));
+    }
+    Ok(())
+}
+
+fn print_cursor_json(body: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(list) = body.get("message_list").and_then(|value| value.as_array()) else {
+        anyhow::bail!("server response has no message_list");
+    };
+    for message in list {
+        let mark = if message["anchor"].as_bool().unwrap_or(false) {
+            "→"
+        } else {
+            " "
+        };
+        println!(
+            "{mark} {}  {}  {}  seq {}",
+            message["message"].as_str().unwrap_or(""),
+            message["author"].as_str().unwrap_or(""),
+            message["role"].as_str().unwrap_or(""),
+            message["seq"].as_i64().unwrap_or(0)
+        );
+        println!("{}", message["body"].as_str().unwrap_or(""));
+        println!();
+    }
+    Ok(())
+}
+
+fn print_lexicon_json(body: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(list) = body.get("word_list").and_then(|value| value.as_array()) else {
+        anyhow::bail!("server response has no word_list");
+    };
+    for row in list {
+        println!(
+            "{}  surface={} ({})  lemma={} ({})  context=({})",
+            row["word"].as_str().unwrap_or(""),
+            row["surface"].as_str().unwrap_or(""),
+            row["surface_units"].as_u64().unwrap_or(0),
+            row["lemma"].as_str().unwrap_or(""),
+            row["lemma_units"].as_u64().unwrap_or(0),
+            row["context_units"].as_u64().unwrap_or(0)
+        );
+    }
+    Ok(())
 }
