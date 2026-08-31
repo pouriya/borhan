@@ -1,5 +1,6 @@
 /target
 /build
+/oldbuild
 
 # Vendored embedding model (~31 MB) — fetch with `make model`
 /models
@@ -10,7 +11,7 @@ src/embedding/potion-retrieval-32M
 # few hundred MB of derived vectors.
 /seed
 /home
-
+/oldhome
 # Local store
 /data
 *.db
