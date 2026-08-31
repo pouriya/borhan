@@ -1,23 +1,28 @@
 //! Shared memory operations, and the HTTP API that serves them.
 //!
 //! CLI and `serve` both call the functions in this file. The CLI prints; the
-//! router serializes the same values as JSON. A ULID is minted at the start of
-//! every operation, carried on the tracing span as `trace`, returned in
-//! `stats.trace`, and — on HTTP — copied to `X-Trace-Id`.
+//! router serializes the same values as JSON. A ULID is minted by the caller —
+//! the HTTP middleware for `serve`, the command for the CLI — carried on every
+//! span as `trace`, returned in `stats.trace`, and copied to `X-Trace-Id`.
+//! HTTP wraps the operation in an `Http` span and logs method, path, route,
+//! status, and request/response body lengths.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::extract::{Path as UrlPath, Query, Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header::AUTHORIZATION};
+use axum::extract::{MatchedPath, Path as UrlPath, Query, Request, State};
+use axum::http::{
+    HeaderName, HeaderValue, StatusCode, header::AUTHORIZATION, header::CONTENT_LENGTH,
+};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get as get_route, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use tantivy::IndexWriter;
+use tracing::Instrument;
 
 use crate::index::Index;
 use crate::search::{Filter, Group, Outcome};
@@ -154,18 +159,32 @@ pub struct Lexeme {
     pub context_units: u64,
 }
 
-pub fn list(root: &Path) -> Result<(Vec<Memory>, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("List", trace = %trace);
+pub fn list(root: &Path, trace: &Ulid) -> Result<(Vec<Memory>, Stats), Error> {
+    let span = tracing::info_span!(
+        "List",
+        op = "list",
+        trace = %trace,
+        count = tracing::field::Empty,
+        fetch_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
     tracing::debug!(msg = "Listing memories");
     let fetch = Instant::now();
     let memories = Storage::list(root)?;
     let fetch_ms = ms(fetch);
-    tracing::info!(msg = "Listed memories", count = memories.len());
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.fetch_ms = Some(fetch_ms);
+    span.record("count", memories.len() as u64);
+    span.record("fetch_ms", fetch_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Listed memories",
+        count = memories.len(),
+        fetch_ms = fetch_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((memories, stats))
 }
 
@@ -174,12 +193,24 @@ pub fn create(
     name: &str,
     description: &str,
     languages: &str,
+    trace: &Ulid,
 ) -> Result<(Ulid, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Create", trace = %trace, memory = name);
+    let span = tracing::info_span!(
+        "Create",
+        op = "create",
+        trace = %trace,
+        memory = name,
+        write_ms = tracing::field::Empty,
+        index_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
-    tracing::debug!(msg = "Creating memory", name = name);
+    tracing::debug!(
+        msg = "Creating memory",
+        memory = name,
+        description_bytes = description.len()
+    );
     let write = Instant::now();
     let (store, id) = Storage::create(root, name, description, languages)?;
     let write_ms = ms(write);
@@ -189,10 +220,20 @@ pub fn create(
     store.set_meta(index::BUILT_KEY, &Ulid::now().to_string())?;
     drop(built);
     let index_ms = ms(index);
-    tracing::info!(msg = "Created memory", ulid = %id, name = name);
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.write_ms = Some(write_ms);
     stats.index_ms = Some(index_ms);
+    span.record("write_ms", write_ms);
+    span.record("index_ms", index_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Created memory",
+        memory = name,
+        ulid = %id,
+        write_ms = write_ms,
+        index_ms = index_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((id, stats))
 }
 
@@ -201,22 +242,41 @@ pub fn update(
     name: &str,
     description: Option<&str>,
     languages: Option<&str>,
+    trace: &Ulid,
 ) -> Result<(Ulid, Stats), Error> {
+    let span = tracing::info_span!(
+        "Update",
+        op = "update",
+        trace = %trace,
+        memory = name,
+        write_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     if description.is_none() && languages.is_none() {
         return Err(Error::NothingToUpdate);
     }
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Update", trace = %trace, memory = name);
-    let _entered = span.enter();
     let started = Instant::now();
-    tracing::debug!(msg = "Updating memory", name = name);
+    tracing::debug!(
+        msg = "Updating memory",
+        memory = name,
+        description = description.is_some(),
+        languages = languages.is_some()
+    );
     let write = Instant::now();
     store.update(description, languages)?;
     let write_ms = ms(write);
     let memory = store.describe()?;
-    tracing::info!(msg = "Updated memory", name = name);
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.write_ms = Some(write_ms);
+    span.record("write_ms", write_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Updated memory",
+        memory = name,
+        write_ms = write_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((memory.id, stats))
 }
 
@@ -226,9 +286,22 @@ pub fn add(
     writer: &Mutex<IndexWriter>,
     entry: &Entry<'_>,
     name: &str,
+    trace: &Ulid,
 ) -> Result<(Written, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Add", trace = %trace, memory = name);
+    let span = tracing::info_span!(
+        "Add",
+        op = "add",
+        trace = %trace,
+        memory = name,
+        bytes = entry.body.len() as u64,
+        units = tracing::field::Empty,
+        store_lock_ms = tracing::field::Empty,
+        writer_lock_ms = tracing::field::Empty,
+        write_ms = tracing::field::Empty,
+        index_ms = tracing::field::Empty,
+        commit_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
     tracing::debug!(
@@ -253,34 +326,71 @@ pub fn add(
     let commit = Instant::now();
     index.commit(&mut writer)?;
     let commit_ms = ms(commit);
-    tracing::info!(
-        msg = "Added message",
-        memory = name,
-        ulid = %written.message,
-        seq = written.seq,
-        units = written.units.len()
-    );
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.store_lock_ms = Some(store_lock_ms);
     stats.writer_lock_ms = Some(writer_lock_ms);
     stats.write_ms = Some(write_ms);
     stats.index_ms = Some(index_ms);
     stats.commit_ms = Some(commit_ms);
+    span.record("units", written.units.len() as u64);
+    span.record("store_lock_ms", store_lock_ms);
+    span.record("writer_lock_ms", writer_lock_ms);
+    span.record("write_ms", write_ms);
+    span.record("index_ms", index_ms);
+    span.record("commit_ms", commit_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Added message",
+        memory = name,
+        ulid = %written.message,
+        seq = written.seq,
+        units = written.units.len(),
+        bytes = entry.body.len(),
+        store_lock_ms = store_lock_ms,
+        writer_lock_ms = writer_lock_ms,
+        write_ms = write_ms,
+        index_ms = index_ms,
+        commit_ms = commit_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((written, stats))
 }
 
-pub fn get(store: &Storage, ids: &[Ulid]) -> Result<(Vec<Located>, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Get", trace = %trace);
+pub fn get(
+    store: &Storage,
+    ids: &[Ulid],
+    name: &str,
+    trace: &Ulid,
+) -> Result<(Vec<Located>, Stats), Error> {
+    let span = tracing::info_span!(
+        "Get",
+        op = "get",
+        trace = %trace,
+        memory = name,
+        ids = ids.len() as u64,
+        count = tracing::field::Empty,
+        fetch_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
-    tracing::debug!(msg = "Reading units", count = ids.len());
+    tracing::debug!(msg = "Reading units", memory = name, ids = ids.len());
     let fetch = Instant::now();
     let located = store.locate(ids)?;
     let fetch_ms = ms(fetch);
-    tracing::info!(msg = "Read units", count = located.len());
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.fetch_ms = Some(fetch_ms);
+    span.record("count", located.len() as u64);
+    span.record("fetch_ms", fetch_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Read units",
+        memory = name,
+        ids = ids.len(),
+        count = located.len(),
+        fetch_ms = fetch_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((located, stats))
 }
 
@@ -290,11 +400,23 @@ pub fn search(
     name: &str,
     groups: &[Group],
     filter: &Filter,
-    limit: usize,
-    per_message: usize,
+    page: (usize, usize),
+    trace: &Ulid,
 ) -> Result<(Outcome, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Search", trace = %trace, memory = name);
+    let (limit, per_message) = page;
+    let span = tracing::info_span!(
+        "Search",
+        op = "search",
+        trace = %trace,
+        memory = name,
+        groups = groups.len() as u64,
+        limit = limit as u64,
+        hits = tracing::field::Empty,
+        unknown = tracing::field::Empty,
+        search_ms = tracing::field::Empty,
+        write_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
     tracing::debug!(
@@ -334,16 +456,25 @@ pub fn search(
     let write = Instant::now();
     store.log_search(&asked, &logged)?;
     let write_ms = ms(write);
-
+    let mut stats = Stats::new(trace, started);
+    stats.search_ms = Some(search_ms);
+    stats.write_ms = Some(write_ms);
+    span.record("hits", outcome.hits.len() as u64);
+    span.record("unknown", outcome.unknown.len() as u64);
+    span.record("search_ms", search_ms);
+    span.record("write_ms", write_ms);
+    span.record("total_ms", stats.total_ms);
     tracing::info!(
         msg = "Searched",
         memory = name,
+        groups = groups.len(),
+        limit = limit,
         hits = outcome.hits.len(),
-        unknown = outcome.unknown.len()
+        unknown = outcome.unknown.len(),
+        search_ms = search_ms,
+        write_ms = write_ms,
+        total_ms = stats.total_ms,
     );
-    let mut stats = Stats::new(&trace, started);
-    stats.search_ms = Some(search_ms);
-    stats.write_ms = Some(write_ms);
     Ok((outcome, stats))
 }
 
@@ -353,39 +484,75 @@ pub fn cursor(
     unit: Ulid,
     before: i64,
     after: i64,
+    trace: &Ulid,
 ) -> Result<(Vec<Message>, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Cursor", trace = %trace, memory = name);
+    let span = tracing::info_span!(
+        "Cursor",
+        op = "cursor",
+        trace = %trace,
+        memory = name,
+        before = before,
+        after = after,
+        messages = tracing::field::Empty,
+        cursor_ms = tracing::field::Empty,
+        write_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
-    tracing::debug!(msg = "Expanding a cursor", memory = name, unit = %unit);
+    tracing::debug!(
+        msg = "Expanding a cursor",
+        memory = name,
+        unit = %unit,
+        before = before,
+        after = after
+    );
     let cursor_started = Instant::now();
     let messages = store.around(unit, before, after)?;
     let cursor_ms = ms(cursor_started);
     let write = Instant::now();
     store.log_expansion(unit)?;
     let write_ms = ms(write);
+    let mut stats = Stats::new(trace, started);
+    stats.cursor_ms = Some(cursor_ms);
+    stats.write_ms = Some(write_ms);
+    span.record("messages", messages.len() as u64);
+    span.record("cursor_ms", cursor_ms);
+    span.record("write_ms", write_ms);
+    span.record("total_ms", stats.total_ms);
     tracing::info!(
         msg = "Expanded a cursor",
         memory = name,
         unit = %unit,
-        messages = messages.len()
+        messages = messages.len(),
+        cursor_ms = cursor_ms,
+        write_ms = write_ms,
+        total_ms = stats.total_ms,
     );
-    let mut stats = Stats::new(&trace, started);
-    stats.cursor_ms = Some(cursor_ms);
-    stats.write_ms = Some(write_ms);
     Ok((messages, stats))
 }
 
-pub fn lexicon(index: &Index, name: &str, words: &[String]) -> Result<(Vec<Lexeme>, Stats), Error> {
+pub fn lexicon(
+    index: &Index,
+    name: &str,
+    words: &[String],
+    trace: &Ulid,
+) -> Result<(Vec<Lexeme>, Stats), Error> {
+    let span = tracing::info_span!(
+        "Lexicon",
+        op = "lexicon",
+        trace = %trace,
+        memory = name,
+        words = words.len() as u64,
+        lexicon_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
+    let _entered = span.enter();
     if words.is_empty() {
         return Err(Error::EmptyWords);
     }
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Lexicon", trace = %trace, memory = name);
-    let _entered = span.enter();
     let started = Instant::now();
-    tracing::debug!(msg = "Looking up words", memory = name, count = words.len());
+    tracing::debug!(msg = "Looking up words", memory = name, words = words.len());
     let lexicon_started = Instant::now();
     let searcher = index.reader.searcher();
     let mut rows = Vec::new();
@@ -420,9 +587,17 @@ pub fn lexicon(index: &Index, name: &str, words: &[String]) -> Result<(Vec<Lexem
         });
     }
     let lexicon_ms = ms(lexicon_started);
-    tracing::info!(msg = "Looked up words", memory = name, count = rows.len());
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.lexicon_ms = Some(lexicon_ms);
+    span.record("lexicon_ms", lexicon_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Looked up words",
+        memory = name,
+        words = rows.len(),
+        lexicon_ms = lexicon_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((rows, stats))
 }
 
@@ -431,9 +606,22 @@ pub fn rescan(
     index: &Index,
     writer: &Mutex<IndexWriter>,
     name: &str,
+    trace: &Ulid,
 ) -> Result<(usize, usize, Stats), Error> {
-    let trace = Ulid::new()?;
-    let span = tracing::info_span!("Rescan", trace = %trace, memory = name);
+    let span = tracing::info_span!(
+        "Rescan",
+        op = "rescan",
+        trace = %trace,
+        memory = name,
+        messages = tracing::field::Empty,
+        units = tracing::field::Empty,
+        store_lock_ms = tracing::field::Empty,
+        writer_lock_ms = tracing::field::Empty,
+        commit_ms = tracing::field::Empty,
+        resplit_ms = tracing::field::Empty,
+        index_ms = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
     let _entered = span.enter();
     let started = Instant::now();
     tracing::debug!(msg = "Rescanning memory", memory = name);
@@ -473,18 +661,32 @@ pub fn rescan(
         store.set_meta(index::BUILT_KEY, &Ulid::now().to_string())?;
     }
     let index_ms = ms(index_started);
-    tracing::info!(
-        msg = "Rescanned memory",
-        memory = name,
-        messages = written.len(),
-        units = units
-    );
-    let mut stats = Stats::new(&trace, started);
+    let mut stats = Stats::new(trace, started);
     stats.store_lock_ms = Some(store_lock_ms);
     stats.writer_lock_ms = Some(writer_lock_ms);
     stats.commit_ms = Some(commit_ms);
     stats.resplit_ms = Some(resplit_ms);
     stats.index_ms = Some(index_ms);
+    span.record("messages", written.len() as u64);
+    span.record("units", units as u64);
+    span.record("store_lock_ms", store_lock_ms);
+    span.record("writer_lock_ms", writer_lock_ms);
+    span.record("commit_ms", commit_ms);
+    span.record("resplit_ms", resplit_ms);
+    span.record("index_ms", index_ms);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(
+        msg = "Rescanned memory",
+        memory = name,
+        messages = written.len(),
+        units = units,
+        store_lock_ms = store_lock_ms,
+        writer_lock_ms = writer_lock_ms,
+        commit_ms = commit_ms,
+        resplit_ms = resplit_ms,
+        index_ms = index_ms,
+        total_ms = stats.total_ms,
+    );
     Ok((written.len(), units, stats))
 }
 
@@ -606,7 +808,126 @@ pub fn router(app: App) -> Router {
         .route("/api/v1/memory/{name}/rescan", post(rescan_memory))
         .layer(middleware::from_fn_with_state(app.clone(), token_gate))
         .layer(middleware::from_fn(identify))
+        .layer(middleware::from_fn(http_layer))
         .with_state(app)
+}
+
+#[derive(Clone, Copy)]
+struct RequestTrace(Ulid);
+
+fn content_length(headers: &axum::http::HeaderMap) -> u64 {
+    let Some(value) = headers.get(CONTENT_LENGTH) else {
+        return 0;
+    };
+    let Ok(text) = value.to_str() else {
+        return 0;
+    };
+    text.parse().unwrap_or_default()
+}
+
+fn spawn_op<F, T>(f: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(f))
+}
+
+async fn http_layer(mut request: Request, next: Next) -> Response {
+    let trace = match Ulid::new() {
+        Ok(trace) => trace,
+        Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, error, ""),
+    };
+    let method = request.method().as_str().to_string();
+    let path = request.uri().path().to_string();
+    let query = match request.uri().query() {
+        Some(query) => query.to_string(),
+        None => String::new(),
+    };
+    let route = match request.extensions().get::<MatchedPath>() {
+        Some(matched) => matched.as_str().to_string(),
+        None => path.clone(),
+    };
+    let request_bytes = content_length(request.headers());
+    request.extensions_mut().insert(RequestTrace(trace));
+    let started = Instant::now();
+    let span = tracing::info_span!(
+        "Http",
+        op = "http",
+        trace = %trace,
+        http_method = method.as_str(),
+        http_path = path.as_str(),
+        http_route = route.as_str(),
+        http_query = query.as_str(),
+        http_request_bytes = request_bytes,
+        http_status = tracing::field::Empty,
+        http_response_bytes = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
+    async move {
+        tracing::debug!(
+            msg = "Received HTTP request",
+            http_method = method.as_str(),
+            http_path = path.as_str(),
+            http_route = route.as_str(),
+            http_query = query.as_str(),
+            http_request_bytes = request_bytes,
+        );
+        let mut response = next.run(request).await;
+        let status = response.status().as_u16();
+        let response_bytes = content_length(response.headers());
+        let total_ms = ms(started);
+        tracing::Span::current().record("http_status", status);
+        tracing::Span::current().record("http_response_bytes", response_bytes);
+        tracing::Span::current().record("total_ms", total_ms);
+        if let Ok(value) = HeaderValue::from_str(&trace.to_string()) {
+            response.headers_mut().insert(TRACE_HEADER, value);
+        }
+        if status >= 500 {
+            tracing::error!(
+                msg = "HTTP request",
+                trace = %trace,
+                http_method = method.as_str(),
+                http_path = path.as_str(),
+                http_route = route.as_str(),
+                http_query = query.as_str(),
+                http_status = status,
+                http_request_bytes = request_bytes,
+                http_response_bytes = response_bytes,
+                total_ms = total_ms,
+            );
+        } else if status >= 400 {
+            tracing::warn!(
+                msg = "HTTP request",
+                trace = %trace,
+                http_method = method.as_str(),
+                http_path = path.as_str(),
+                http_route = route.as_str(),
+                http_query = query.as_str(),
+                http_status = status,
+                http_request_bytes = request_bytes,
+                http_response_bytes = response_bytes,
+                total_ms = total_ms,
+            );
+        } else {
+            tracing::info!(
+                msg = "HTTP request",
+                trace = %trace,
+                http_method = method.as_str(),
+                http_path = path.as_str(),
+                http_route = route.as_str(),
+                http_query = query.as_str(),
+                http_status = status,
+                http_request_bytes = request_bytes,
+                http_response_bytes = response_bytes,
+                total_ms = total_ms,
+            );
+        }
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 async fn identify(request: Request, next: Next) -> Response {
@@ -633,14 +954,10 @@ fn traced(status: StatusCode, trace: &str, body: serde_json::Value) -> Response 
     response
 }
 
-fn fail(status: StatusCode, error: impl std::fmt::Display) -> Response {
-    let trace = match Ulid::new() {
-        Ok(id) => id.to_string(),
-        Err(_) => String::new(),
-    };
+fn fail(status: StatusCode, error: impl std::fmt::Display, trace: &str) -> Response {
     traced(
         status,
-        &trace,
+        trace,
         serde_json::json!({
             "error": error.to_string(),
             "stats": { "trace": trace, "total_ms": 0 },
@@ -673,8 +990,8 @@ fn status_of(error: &Error) -> StatusCode {
     }
 }
 
-fn reject(error: Error) -> Response {
-    fail(status_of(&error), error)
+fn reject(error: Error, trace: &Ulid) -> Response {
+    fail(status_of(&error), error, &trace.to_string())
 }
 
 fn open(app: &App, name: &str) -> Result<(Arc<OpenMemory>, Option<u64>), Error> {
@@ -685,10 +1002,12 @@ fn open(app: &App, name: &str) -> Result<(Arc<OpenMemory>, Option<u64>), Error> 
         }
     }
     let started = Instant::now();
+    tracing::debug!(msg = "Opening memory", memory = name);
     let store = Storage::open(&app.root, name)?;
     let index = Index::open(&store)?;
     let writer = index.writer()?;
     let open_ms = ms(started);
+    tracing::info!(msg = "Opened memory", memory = name, open_ms = open_ms);
     let memory = Arc::new(OpenMemory {
         store: Mutex::new(store),
         index,
@@ -710,10 +1029,12 @@ fn open_attached(app: &App, name: &str) -> Result<(Arc<OpenMemory>, Option<u64>)
         }
     }
     let started = Instant::now();
+    tracing::debug!(msg = "Opening memory for rescan", memory = name);
     let store = Storage::open(&app.root, name)?;
     let index = Index::attach(&store.directory.join(index::DIRECTORY))?;
     let writer = index.writer()?;
     let open_ms = ms(started);
+    tracing::info!(msg = "Opened memory", memory = name, open_ms = open_ms);
     let memory = Arc::new(OpenMemory {
         store: Mutex::new(store),
         index,
@@ -737,22 +1058,24 @@ async fn token_gate(State(app): State<Arc<App>>, request: Request, next: Next) -
             None => None,
         };
         if presented != Some(wanted.as_str()) {
-            return fail(StatusCode::UNAUTHORIZED, "missing or wrong token");
+            let trace = match request.extensions().get::<RequestTrace>() {
+                Some(RequestTrace(trace)) => trace.to_string(),
+                None => String::new(),
+            };
+            return fail(StatusCode::UNAUTHORIZED, "missing or wrong token", &trace);
         }
     }
     next.run(request).await
 }
 
-async fn health() -> Response {
-    let started = Instant::now();
-    let trace = match Ulid::new() {
-        Ok(id) => id,
-        Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, error),
-    };
-    let span = tracing::info_span!("Health", trace = %trace);
+async fn health(Extension(RequestTrace(trace)): Extension<RequestTrace>) -> Response {
+    let span = tracing::info_span!("Health", op = "health", trace = %trace, total_ms = tracing::field::Empty);
     let _entered = span.enter();
-    let stats = Stats::new(&trace, started);
+    let started = Instant::now();
     tracing::debug!(msg = "Health check");
+    let stats = Stats::new(&trace, started);
+    span.record("total_ms", stats.total_ms);
+    tracing::info!(msg = "Health check", total_ms = stats.total_ms);
     traced(
         StatusCode::OK,
         &stats.trace,
@@ -760,15 +1083,18 @@ async fn health() -> Response {
     )
 }
 
-async fn memory_list(State(app): State<Arc<App>>) -> Response {
+async fn memory_list(
+    State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
+) -> Response {
     let root = app.root.clone();
-    let result = tokio::task::spawn_blocking(move || list(&root)).await;
+    let result = spawn_op(move || list(&root, &trace)).await;
     match result {
         Ok(Ok((memories, stats))) => {
             traced(StatusCode::OK, &stats.trace, list_json(&memories, &stats))
         }
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -779,13 +1105,17 @@ struct CreateBody {
     languages: Option<String>,
 }
 
-async fn create_memory(State(app): State<Arc<App>>, Json(body): Json<CreateBody>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+async fn create_memory(
+    State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
+    Json(body): Json<CreateBody>,
+) -> Response {
+    let result = spawn_op(move || {
         let languages = match &body.languages {
             Some(text) if !text.is_empty() => text.as_str(),
             _ => "fa,en",
         };
-        let (id, mut stats) = create(&app.root, &body.name, &body.description, languages)?;
+        let (id, mut stats) = create(&app.root, &body.name, &body.description, languages, &trace)?;
         match open(&app, &body.name) {
             Ok((_, open_ms)) => stats.open_ms = open_ms,
             Err(error) => return Err(error),
@@ -795,8 +1125,8 @@ async fn create_memory(State(app): State<Arc<App>>, Json(body): Json<CreateBody>
     .await;
     match result {
         Ok(Ok((id, stats))) => traced(StatusCode::OK, &stats.trace, id_json(&id, &stats)),
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -808,10 +1138,11 @@ struct UpdateBody {
 
 async fn update_memory(
     State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
     UrlPath(name): UrlPath<String>,
     Json(body): Json<UpdateBody>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_op(move || {
         let (opened, open_ms) = open(&app, &name)?;
         let wait = Instant::now();
         let store = opened.store.lock().unwrap();
@@ -821,6 +1152,7 @@ async fn update_memory(
             &name,
             body.description.as_deref(),
             body.languages.as_deref(),
+            &trace,
         )?;
         stats.open_ms = open_ms;
         stats.store_lock_ms = Some(store_lock_ms);
@@ -829,8 +1161,8 @@ async fn update_memory(
     .await;
     match result {
         Ok(Ok((id, stats))) => traced(StatusCode::OK, &stats.trace, id_json(&id, &stats)),
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -846,10 +1178,11 @@ struct AddBody {
 
 async fn add_message(
     State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
     UrlPath(name): UrlPath<String>,
     Json(body): Json<AddBody>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_op(move || {
         let role_text = match &body.role {
             Some(role) => role.as_str(),
             None => "user",
@@ -876,8 +1209,14 @@ async fn add_message(
             ts,
             body: &body.body,
         };
-        let (written, mut stats) =
-            add(&opened.store, &opened.index, &opened.writer, &entry, &name)?;
+        let (written, mut stats) = add(
+            &opened.store,
+            &opened.index,
+            &opened.writer,
+            &entry,
+            &name,
+            &trace,
+        )?;
         stats.open_ms = open_ms;
         Ok((written, stats))
     })
@@ -892,8 +1231,8 @@ async fn add_message(
                 "stats": stats,
             }),
         ),
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -904,10 +1243,11 @@ struct GetBody {
 
 async fn get_units(
     State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
     UrlPath(name): UrlPath<String>,
     Json(body): Json<GetBody>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_op(move || {
         if body.id_list.is_empty() {
             return Err(Error::EmptyIds);
         }
@@ -927,7 +1267,7 @@ async fn get_units(
         let wait = Instant::now();
         let store = opened.store.lock().unwrap();
         let store_lock_ms = ms(wait);
-        let (located, mut stats) = get(&store, &ids)?;
+        let (located, mut stats) = get(&store, &ids, &name, &trace)?;
         stats.open_ms = open_ms;
         stats.store_lock_ms = Some(store_lock_ms);
         Ok((located, stats))
@@ -937,8 +1277,8 @@ async fn get_units(
         Ok(Ok((located, stats))) => {
             traced(StatusCode::OK, &stats.trace, get_json(&located, &stats))
         }
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -963,10 +1303,11 @@ struct GroupBody {
 
 async fn search_memory(
     State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
     UrlPath(name): UrlPath<String>,
     Json(body): Json<SearchBody>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_op(move || {
         let mut groups = Vec::new();
         for group in body.group_list {
             groups.push(Group {
@@ -1011,8 +1352,8 @@ async fn search_memory(
             &name,
             &groups,
             &filter,
-            limit,
-            per_message,
+            (limit, per_message),
+            &trace,
         )?;
         stats.open_ms = open_ms;
         stats.store_lock_ms = Some(store_lock_ms);
@@ -1023,8 +1364,8 @@ async fn search_memory(
         Ok(Ok((outcome, stats))) => {
             traced(StatusCode::OK, &stats.trace, search_json(&outcome, &stats))
         }
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -1036,10 +1377,11 @@ struct CursorQuery {
 
 async fn cursor_memory(
     State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
     UrlPath((name, id)): UrlPath<(String, String)>,
     Query(query): Query<CursorQuery>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_op(move || {
         let unit = match Ulid::parse(&id) {
             Ok(unit) => unit,
             Err(source) => {
@@ -1052,7 +1394,7 @@ async fn cursor_memory(
         let wait = Instant::now();
         let store = opened.store.lock().unwrap();
         let store_lock_ms = ms(wait);
-        let (messages, mut stats) = cursor(&store, &name, unit, before, after)?;
+        let (messages, mut stats) = cursor(&store, &name, unit, before, after, &trace)?;
         stats.open_ms = open_ms;
         stats.store_lock_ms = Some(store_lock_ms);
         Ok((messages, stats))
@@ -1062,8 +1404,8 @@ async fn cursor_memory(
         Ok(Ok((messages, stats))) => {
             traced(StatusCode::OK, &stats.trace, cursor_json(&messages, &stats))
         }
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
@@ -1074,28 +1416,33 @@ struct LexiconBody {
 
 async fn lexicon_memory(
     State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
     UrlPath(name): UrlPath<String>,
     Json(body): Json<LexiconBody>,
 ) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_op(move || {
         let (opened, open_ms) = open(&app, &name)?;
-        let (rows, mut stats) = lexicon(&opened.index, &name, &body.word_list)?;
+        let (rows, mut stats) = lexicon(&opened.index, &name, &body.word_list, &trace)?;
         stats.open_ms = open_ms;
         Ok((rows, stats))
     })
     .await;
     match result {
         Ok(Ok((rows, stats))) => traced(StatusCode::OK, &stats.trace, lexicon_json(&rows, &stats)),
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 
-async fn rescan_memory(State(app): State<Arc<App>>, UrlPath(name): UrlPath<String>) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
+async fn rescan_memory(
+    State(app): State<Arc<App>>,
+    Extension(RequestTrace(trace)): Extension<RequestTrace>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    let result = spawn_op(move || {
         let (opened, open_ms) = open_attached(&app, &name)?;
         let (messages, units, mut stats) =
-            rescan(&opened.store, &opened.index, &opened.writer, &name)?;
+            rescan(&opened.store, &opened.index, &opened.writer, &name, &trace)?;
         stats.open_ms = open_ms;
         Ok((messages, units, stats))
     })
@@ -1110,8 +1457,8 @@ async fn rescan_memory(State(app): State<Arc<App>>, UrlPath(name): UrlPath<Strin
                 "stats": stats,
             }),
         ),
-        Ok(Err(error)) => reject(error),
-        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        Ok(Err(error)) => reject(error, &trace),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error, &trace.to_string()),
     }
 }
 

@@ -16,13 +16,16 @@ tokio = { version = "1.53.1", default-features = false, features = [
     "net",
 ] }
 
-# HTTP server. default-features = false drops form/matched-path/tracing
-# extractors; json and query are the bodies and cursor window this API uses.
+# HTTP server. default-features = false drops form/tracing extractors; json
+# and query are the bodies and cursor window this API uses. matched-path is
+# the route template on the HTTP access log (`/api/v1/memory/{name}/search`),
+# so dashboards can group by route without exploding on memory names.
 axum = { version = "0.8.9", default-features = false, features = [
     "http1",
     "tokio",
     "json",
     "query",
+    "matched-path",
 ] }
 
 # Configuration files. default-features = false drops the env/JSON/YAML loaders

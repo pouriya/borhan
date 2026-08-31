@@ -687,7 +687,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(level)
         .json()
         .flatten_event(true)
-        .with_span_events(FmtSpan::CLOSE)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .log_internal_errors(true)
         .with_level(true)
         .with_file(show_location)
@@ -825,8 +825,9 @@ async fn main() -> anyhow::Result<()> {
                         })?;
                     } else {
                         check_storage(&settings.home, &storage, "memory create ...")?;
+                        let trace = Ulid::new()?;
                         let (id, stats) =
-                            crate::api::create(&storage, &name, &description, &languages)?;
+                            crate::api::create(&storage, &name, &description, &languages, &trace)?;
                         if json {
                             print_pretty(&crate::api::id_json(&id, &stats))?;
                         } else {
@@ -843,7 +844,8 @@ async fn main() -> anyhow::Result<()> {
                         print_http(&response, json, print_memory_list_json)?;
                     } else {
                         check_storage(&settings.home, &storage, "memory list")?;
-                        let (memories, stats) = crate::api::list(&storage)?;
+                        let trace = Ulid::new()?;
+                        let (memories, stats) = crate::api::list(&storage, &trace)?;
                         if json {
                             print_pretty(&crate::api::list_json(&memories, &stats))?;
                         } else {
@@ -890,11 +892,13 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         check_storage(&settings.home, &storage, "memory update ...")?;
                         let store = Storage::open(&storage, &name)?;
+                        let trace = Ulid::new()?;
                         let (id, stats) = crate::api::update(
                             &store,
                             &name,
                             description.as_deref(),
                             languages.as_deref(),
+                            &trace,
                         )?;
                         if json {
                             print_pretty(&crate::api::id_json(&id, &stats))?;
@@ -970,8 +974,9 @@ async fn main() -> anyhow::Result<()> {
                             ts,
                             body: &text,
                         };
+                        let trace = Ulid::new()?;
                         let (written, stats) =
-                            crate::api::add(&store, &built, &writer, &entry, &name)?;
+                            crate::api::add(&store, &built, &writer, &entry, &name, &trace)?;
                         if json {
                             print_pretty(&serde_json::json!({
                                 "id": written.message.to_string(),
@@ -1012,7 +1017,8 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        let (located, stats) = crate::api::get(&store, &units)?;
+                        let trace = Ulid::new()?;
+                        let (located, stats) = crate::api::get(&store, &units, &name, &trace)?;
                         for id in &units {
                             if !located.iter().any(|row| row.unit == *id) {
                                 eprintln!("No unit {id}");
@@ -1021,17 +1027,7 @@ async fn main() -> anyhow::Result<()> {
                         if json {
                             print_pretty(&crate::api::get_json(&located, &stats))?;
                         } else {
-                            for row in &located {
-                                println!(
-                                    "{}  {}  {}  unit {}",
-                                    row.unit,
-                                    row.role.as_str(),
-                                    row.session_ref,
-                                    row.unit_seq
-                                );
-                                println!("{}", row.text());
-                                println!();
-                            }
+                            print_units(&located);
                         }
                     }
                     Ok(())
@@ -1113,14 +1109,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                         let store = Storage::open(&storage, &name)?;
                         let built = Index::open(&store)?;
+                        let trace = Ulid::new()?;
                         let (outcome, stats) = crate::api::search(
                             &store,
                             &built,
                             &name,
                             &parsed,
                             &filter,
-                            limit,
-                            max_per_message,
+                            (limit, max_per_message),
+                            &trace,
                         )?;
                         if json {
                             print_pretty(&crate::api::search_json(&outcome, &stats))?;
@@ -1155,23 +1152,13 @@ async fn main() -> anyhow::Result<()> {
                             }
                         };
                         let store = Storage::open(&storage, &name)?;
+                        let trace = Ulid::new()?;
                         let (messages, stats) =
-                            crate::api::cursor(&store, &name, unit, before, after)?;
+                            crate::api::cursor(&store, &name, unit, before, after, &trace)?;
                         if json {
                             print_pretty(&crate::api::cursor_json(&messages, &stats))?;
                         } else {
-                            for message in &messages {
-                                let mark = if message.anchor { "→" } else { " " };
-                                println!(
-                                    "{mark} {}  {}  {}  seq {}",
-                                    message.id,
-                                    message.author,
-                                    message.role.as_str(),
-                                    message.seq
-                                );
-                                println!("{}", message.body);
-                                println!();
-                            }
+                            print_cursor(&messages);
                         }
                     }
                     Ok(())
@@ -1194,21 +1181,12 @@ async fn main() -> anyhow::Result<()> {
                         check_storage(&settings.home, &storage, "memory lexicon ...")?;
                         let store = Storage::open(&storage, &name)?;
                         let built = Index::open(&store)?;
-                        let (rows, stats) = crate::api::lexicon(&built, &name, &words)?;
+                        let trace = Ulid::new()?;
+                        let (rows, stats) = crate::api::lexicon(&built, &name, &words, &trace)?;
                         if json {
                             print_pretty(&crate::api::lexicon_json(&rows, &stats))?;
                         } else {
-                            for row in &rows {
-                                println!(
-                                    "{}  surface={} ({})  lemma={} ({})  context=({})",
-                                    row.word,
-                                    row.surface,
-                                    row.surface_units,
-                                    row.lemma,
-                                    row.lemma_units,
-                                    row.context_units
-                                );
-                            }
+                            print_lexicon(&rows);
                         }
                     }
                     Ok(())
@@ -1238,8 +1216,9 @@ async fn main() -> anyhow::Result<()> {
                         let writer = built.writer()?;
                         let store = Mutex::new(store);
                         let writer = Mutex::new(writer);
+                        let trace = Ulid::new()?;
                         let (messages, units, stats) =
-                            crate::api::rescan(&store, &built, &writer, &name)?;
+                            crate::api::rescan(&store, &built, &writer, &name, &trace)?;
                         if json {
                             print_pretty(&serde_json::json!({
                                 "messages": messages,
@@ -1296,8 +1275,6 @@ fn probe_server(home: &Path) -> anyhow::Result<Option<(String, Option<String>)>>
 
 struct ClientResponse {
     version: Option<String>,
-    server: Option<String>,
-    trace: Option<String>,
     body: serde_json::Value,
 }
 
@@ -1319,14 +1296,10 @@ fn print_pretty(body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_http_headers(response: &ClientResponse) {
-    if let Some(server) = &response.server {
-        eprintln!("Server: {server}");
-    }
-    if let Some(version) = &response.version {
-        eprintln!("X-Borhan-Version: {version}");
-    }
-    if let Some(trace) = &response.trace {
+fn print_trace(trace: Option<&str>) {
+    if let Some(trace) = trace
+        && !trace.is_empty()
+    {
         eprintln!("X-Trace-Id: {trace}");
     }
 }
@@ -1339,7 +1312,6 @@ fn print_http(
     if json || !versions_match(response.version.as_deref()) {
         return print_pretty(&response.body);
     }
-    print_http_headers(response);
     print_text(&response.body)
 }
 
@@ -1351,6 +1323,35 @@ fn request(
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<ClientResponse> {
     let url = format!("{origin}{path}");
+    let (http_path, http_query) = match path.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (path, ""),
+    };
+    let request_bytes = match &body {
+        Some(value) => value.to_string().len() as u64,
+        None => 0,
+    };
+    let span = tracing::info_span!(
+        "Client",
+        op = "http_client",
+        http_method = method,
+        http_path = http_path,
+        http_query = http_query,
+        http_request_bytes = request_bytes,
+        http_status = tracing::field::Empty,
+        http_response_bytes = tracing::field::Empty,
+        trace = tracing::field::Empty,
+        total_ms = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let started = std::time::Instant::now();
+    tracing::debug!(
+        msg = "Sending HTTP request",
+        http_method = method,
+        http_path = http_path,
+        http_query = http_query,
+        http_request_bytes = request_bytes,
+    );
     let mut req = ureq::request(method, &url);
     req = req.timeout(Duration::from_secs(120));
     if let Some(token) = token {
@@ -1360,31 +1361,88 @@ fn request(
         Some(body) => req.send_json(body),
         None => req.call(),
     };
+    let total_ms = started.elapsed().as_millis() as u64;
     match response {
         Ok(response) => {
+            let status = response.status();
+            let response_bytes: u64 = match response.header("content-length") {
+                Some(value) => value.parse().unwrap_or_default(),
+                None => 0,
+            };
             let version = response.header("x-borhan-version").map(str::to_string);
-            let server = response.header("server").map(str::to_string);
             let trace = response.header("x-trace-id").map(str::to_string);
+            span.record("http_status", status);
+            span.record("http_response_bytes", response_bytes);
+            span.record("total_ms", total_ms);
             if let Some(trace) = &trace {
+                span.record("trace", tracing::field::display(trace));
                 tracing::debug!(msg = "Server trace", trace = trace.as_str());
             }
+            tracing::info!(
+                msg = "HTTP client request",
+                http_method = method,
+                http_path = http_path,
+                http_query = http_query,
+                http_status = status,
+                http_request_bytes = request_bytes,
+                http_response_bytes = response_bytes,
+                total_ms = total_ms,
+            );
             let body = match response.into_json::<serde_json::Value>() {
                 Ok(value) => value,
                 Err(error) => return Err(anyhow::Error::new(error).context("Could not read JSON")),
             };
-            Ok(ClientResponse {
-                version,
-                server,
-                trace,
-                body,
-            })
+            Ok(ClientResponse { version, body })
         }
         Err(ureq::Error::Status(code, response)) => {
+            let response_bytes: u64 = match response.header("content-length") {
+                Some(value) => value.parse().unwrap_or_default(),
+                None => 0,
+            };
+            span.record("http_status", code);
+            span.record("http_response_bytes", response_bytes);
+            span.record("total_ms", total_ms);
             let version = response.header("x-borhan-version").map(str::to_string);
+            let mut trace = response.header("x-trace-id").map(str::to_string);
             let body = match response.into_json::<serde_json::Value>() {
                 Ok(value) => value,
                 Err(_) => serde_json::json!({}),
             };
+            if trace.is_none()
+                && let Some(value) = body
+                    .get("stats")
+                    .and_then(|stats| stats.get("trace"))
+                    .and_then(|trace| trace.as_str())
+            {
+                trace = Some(value.to_string());
+            }
+            if let Some(trace) = &trace {
+                span.record("trace", tracing::field::display(trace));
+            }
+            if code >= 500 {
+                tracing::error!(
+                    msg = "HTTP client request",
+                    http_method = method,
+                    http_path = http_path,
+                    http_query = http_query,
+                    http_status = code,
+                    http_request_bytes = request_bytes,
+                    http_response_bytes = response_bytes,
+                    total_ms = total_ms,
+                );
+            } else {
+                tracing::warn!(
+                    msg = "HTTP client request",
+                    http_method = method,
+                    http_path = http_path,
+                    http_query = http_query,
+                    http_status = code,
+                    http_request_bytes = request_bytes,
+                    http_response_bytes = response_bytes,
+                    total_ms = total_ms,
+                );
+            }
+            print_trace(trace.as_deref());
             if !versions_match(version.as_deref()) {
                 print_pretty(&body)?;
                 anyhow::bail!("HTTP {code}");
@@ -1395,8 +1453,56 @@ fn request(
             };
             anyhow::bail!("{message}")
         }
-        Err(error) => Err(anyhow::Error::new(error).context(format!("{method} {url}"))),
+        Err(error) => {
+            span.record("total_ms", total_ms);
+            tracing::error!(
+                msg = "HTTP client request failed",
+                http_method = method,
+                http_path = http_path,
+                http_query = http_query,
+                http_request_bytes = request_bytes,
+                total_ms = total_ms,
+                error = %error,
+            );
+            Err(anyhow::Error::new(error).context(format!("{method} {url}")))
+        }
     }
+}
+
+fn column_widths(titles: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
+    let mut widths = Vec::new();
+    for title in titles {
+        widths.push(title.chars().count());
+    }
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    widths
+}
+
+fn columns_line(cells: &[String], widths: &[usize]) -> String {
+    let mut line = String::new();
+    for (at, cell) in cells.iter().enumerate() {
+        if at > 0 {
+            line.push_str("  ");
+        }
+        let width = match widths.get(at) {
+            Some(width) => *width,
+            None => cell.chars().count(),
+        };
+        line.push_str(&format!("{cell:<width$}"));
+    }
+    line
+}
+
+fn print_column_header(titles: &[&str], widths: &[usize]) {
+    let mut cells = Vec::new();
+    for title in titles {
+        cells.push((*title).to_string());
+    }
+    eprintln!("{}", columns_line(&cells, widths));
 }
 
 fn print_memory_list(memories: &[crate::storage::Memory]) {
@@ -1404,7 +1510,14 @@ fn print_memory_list(memories: &[crate::storage::Memory]) {
         eprintln!("No memories yet — `borhan memory create <name>`.");
         return;
     }
-    let mut widths = (0, 0, 0);
+    const TITLES: [&str; 6] = [
+        "id",
+        "created",
+        "name",
+        "counts",
+        "languages",
+        "description",
+    ];
     let mut rows = Vec::new();
     for memory in memories {
         let created = chrono::DateTime::from_timestamp_millis(memory.created_at);
@@ -1428,23 +1541,39 @@ fn print_memory_list(memories: &[crate::storage::Memory]) {
             }
             None => String::new(),
         };
-        widths.0 = widths.0.max(memory.name.len());
-        widths.1 = widths.1.max(counts.len());
-        widths.2 = widths.2.max(memory.languages.len());
-        rows.push((
+        rows.push(vec![
             memory.id.to_string(),
             created,
             memory.name.clone(),
             counts,
             memory.languages.clone(),
             summary,
-        ));
+        ]);
     }
-    for (id, created, name, counts, languages, summary) in rows {
-        println!(
-            "{id}  {created}  {name:<0$}  {counts:<1$}  {languages:<2$}  {summary}",
-            widths.0, widths.1, widths.2
-        );
+    print_table(&TITLES, &rows);
+}
+
+fn print_table(titles: &[&str], rows: &[Vec<String>]) {
+    if rows.is_empty() {
+        return;
+    }
+    let widths = column_widths(titles, rows);
+    print_column_header(titles, &widths);
+    for row in rows {
+        println!("{}", columns_line(row, &widths));
+    }
+}
+
+fn print_block_list(titles: &[&str], rows: &[Vec<String>], bodies: &[String]) {
+    if rows.is_empty() {
+        return;
+    }
+    let widths = column_widths(titles, rows);
+    print_column_header(titles, &widths);
+    for (row, body) in rows.iter().zip(bodies) {
+        println!("{}", columns_line(row, &widths));
+        println!("{body}");
+        println!();
     }
 }
 
@@ -1481,18 +1610,36 @@ fn print_units_json(body: &serde_json::Value) -> anyhow::Result<()> {
     let Some(list) = body.get("unit_list").and_then(|value| value.as_array()) else {
         anyhow::bail!("server response has no unit_list");
     };
+    const TITLES: [&str; 4] = ["unit", "role", "session", "seq"];
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
     for row in list {
-        println!(
-            "{}  {}  {}  unit {}",
-            row["unit"].as_str().unwrap_or(""),
-            row["role"].as_str().unwrap_or(""),
-            row["session_ref"].as_str().unwrap_or(""),
-            row["unit_seq"].as_i64().unwrap_or(0)
-        );
-        println!("{}", row["text"].as_str().unwrap_or(""));
-        println!();
+        rows.push(vec![
+            row["unit"].as_str().unwrap_or("").to_string(),
+            row["role"].as_str().unwrap_or("").to_string(),
+            row["session_ref"].as_str().unwrap_or("").to_string(),
+            row["unit_seq"].as_i64().unwrap_or(0).to_string(),
+        ]);
+        bodies.push(row["text"].as_str().unwrap_or("").to_string());
     }
+    print_block_list(&TITLES, &rows, &bodies);
     Ok(())
+}
+
+fn print_units(located: &[crate::storage::Located]) {
+    const TITLES: [&str; 4] = ["unit", "role", "session", "seq"];
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
+    for row in located {
+        rows.push(vec![
+            row.unit.to_string(),
+            row.role.as_str().to_string(),
+            row.session_ref.clone(),
+            row.unit_seq.to_string(),
+        ]);
+        bodies.push(row.text().to_string());
+    }
+    print_block_list(&TITLES, &rows, &bodies);
 }
 
 fn print_search(outcome: &crate::search::Outcome) {
@@ -1504,42 +1651,26 @@ fn print_search(outcome: &crate::search::Outcome) {
     }
     if outcome.hits.is_empty() {
         eprintln!("No hits.");
+        return;
     }
-    const HEADER: [&str; 6] = ["score", "cover", "cursor", "session", "message", "size"];
-    let mut rows: Vec<[String; 6]> = Vec::new();
+    const TITLES: [&str; 7] = [
+        "score", "cover", "cursor", "session", "message", "size", "matched",
+    ];
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
     for hit in &outcome.hits {
-        rows.push([
+        rows.push(vec![
             format!("{:.3}", hit.score),
             format!("{}/{}", hit.coverage.0, hit.coverage.1),
             hit.cursor.to_string(),
             hit.session.to_string(),
             hit.message.as_deref().unwrap_or("-").to_string(),
             format!("{} words", hit.words),
+            format!("[{}]", hit.matched.join(",")),
         ]);
+        bodies.push(format!("\"{}\"", preview(&hit.snippet)));
     }
-    let mut widths = HEADER.map(|title| title.len());
-    for row in &rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    let lay = |cells: &[String; 6], last: &str| {
-        let mut line = String::new();
-        for (cell, width) in cells.iter().zip(widths) {
-            line.push_str(&format!("{cell:<width$}  "));
-        }
-        line.push_str(last);
-        line
-    };
-    if !rows.is_empty() {
-        let titles = HEADER.map(|title| title.to_string());
-        eprintln!("{}", lay(&titles, "matched"));
-    }
-    for (row, hit) in rows.iter().zip(&outcome.hits) {
-        println!("{}", lay(row, &format!("[{}]", hit.matched.join(","))));
-        println!("\"{}\"", preview(&hit.snippet));
-        println!();
-    }
+    print_block_list(&TITLES, &rows, &bodies);
     if !outcome.hints.is_empty() {
         let mut hints = Vec::new();
         for (term, units) in &outcome.hints {
@@ -1566,10 +1697,11 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
         eprintln!("No hits.");
         return Ok(());
     }
-    const HEADER: [&str; 6] = ["score", "cover", "cursor", "session", "message", "size"];
-    let mut rows: Vec<[String; 6]> = Vec::new();
-    let mut matched_list = Vec::new();
-    let mut snippets = Vec::new();
+    const TITLES: [&str; 7] = [
+        "score", "cover", "cursor", "session", "message", "size", "matched",
+    ];
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
     for hit in hits {
         let coverage = hit["coverage"].as_array();
         let cover = match coverage {
@@ -1582,14 +1714,6 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
             }
             _ => "-/-".to_string(),
         };
-        rows.push([
-            format!("{:.3}", hit["score"].as_f64().unwrap_or(0.0)),
-            cover,
-            hit["cursor"].as_str().unwrap_or("").to_string(),
-            hit["session"].as_str().unwrap_or("").to_string(),
-            hit["message"].as_str().unwrap_or("-").to_string(),
-            format!("{} words", hit["words"].as_u64().unwrap_or(0)),
-        ]);
         let mut matched = Vec::new();
         if let Some(list) = hit["matched_list"].as_array() {
             for label in list {
@@ -1598,30 +1722,21 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
                 }
             }
         }
-        matched_list.push(matched);
-        snippets.push(hit["snippet"].as_str().unwrap_or("").to_string());
+        rows.push(vec![
+            format!("{:.3}", hit["score"].as_f64().unwrap_or(0.0)),
+            cover,
+            hit["cursor"].as_str().unwrap_or("").to_string(),
+            hit["session"].as_str().unwrap_or("").to_string(),
+            hit["message"].as_str().unwrap_or("-").to_string(),
+            format!("{} words", hit["words"].as_u64().unwrap_or(0)),
+            format!("[{}]", matched.join(",")),
+        ]);
+        bodies.push(format!(
+            "\"{}\"",
+            preview(hit["snippet"].as_str().unwrap_or(""))
+        ));
     }
-    let mut widths = HEADER.map(|title| title.len());
-    for row in &rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    let lay = |cells: &[String; 6], last: &str| {
-        let mut line = String::new();
-        for (cell, width) in cells.iter().zip(widths) {
-            line.push_str(&format!("{cell:<width$}  "));
-        }
-        line.push_str(last);
-        line
-    };
-    let titles = HEADER.map(|title| title.to_string());
-    eprintln!("{}", lay(&titles, "matched"));
-    for (at, row) in rows.iter().enumerate() {
-        println!("{}", lay(row, &format!("[{}]", matched_list[at].join(","))));
-        println!("\"{}\"", preview(&snippets[at]));
-        println!();
-    }
+    print_block_list(&TITLES, &rows, &bodies);
     if let Some(hints) = body.get("hint_list").and_then(|value| value.as_array())
         && !hints.is_empty()
     {
@@ -1638,43 +1753,90 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_cursor(messages: &[crate::storage::Message]) {
+    const TITLES: [&str; 5] = ["hit", "message", "author", "role", "seq"];
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
+    for message in messages {
+        let hit = if message.anchor {
+            "→".to_string()
+        } else {
+            String::new()
+        };
+        rows.push(vec![
+            hit,
+            message.id.to_string(),
+            message.author.clone(),
+            message.role.as_str().to_string(),
+            message.seq.to_string(),
+        ]);
+        bodies.push(message.body.clone());
+    }
+    print_block_list(&TITLES, &rows, &bodies);
+}
+
 fn print_cursor_json(body: &serde_json::Value) -> anyhow::Result<()> {
     let Some(list) = body.get("message_list").and_then(|value| value.as_array()) else {
         anyhow::bail!("server response has no message_list");
     };
+    const TITLES: [&str; 5] = ["hit", "message", "author", "role", "seq"];
+    let mut rows = Vec::new();
+    let mut bodies = Vec::new();
     for message in list {
-        let mark = if message["anchor"].as_bool().unwrap_or(false) {
-            "→"
+        let hit = if message["anchor"].as_bool().unwrap_or(false) {
+            "→".to_string()
         } else {
-            " "
+            String::new()
         };
-        println!(
-            "{mark} {}  {}  {}  seq {}",
-            message["message"].as_str().unwrap_or(""),
-            message["author"].as_str().unwrap_or(""),
-            message["role"].as_str().unwrap_or(""),
-            message["seq"].as_i64().unwrap_or(0)
-        );
-        println!("{}", message["body"].as_str().unwrap_or(""));
-        println!();
+        rows.push(vec![
+            hit,
+            message["message"].as_str().unwrap_or("").to_string(),
+            message["author"].as_str().unwrap_or("").to_string(),
+            message["role"].as_str().unwrap_or("").to_string(),
+            message["seq"].as_i64().unwrap_or(0).to_string(),
+        ]);
+        bodies.push(message["body"].as_str().unwrap_or("").to_string());
     }
+    print_block_list(&TITLES, &rows, &bodies);
     Ok(())
+}
+
+fn print_lexicon(rows: &[crate::api::Lexeme]) {
+    const TITLES: [&str; 4] = ["word", "surface", "lemma", "context"];
+    let mut table = Vec::new();
+    for row in rows {
+        table.push(vec![
+            row.word.clone(),
+            format!("{} ({})", row.surface, row.surface_units),
+            format!("{} ({})", row.lemma, row.lemma_units),
+            row.context_units.to_string(),
+        ]);
+    }
+    print_table(&TITLES, &table);
 }
 
 fn print_lexicon_json(body: &serde_json::Value) -> anyhow::Result<()> {
     let Some(list) = body.get("word_list").and_then(|value| value.as_array()) else {
         anyhow::bail!("server response has no word_list");
     };
+    const TITLES: [&str; 4] = ["word", "surface", "lemma", "context"];
+    let mut table = Vec::new();
     for row in list {
-        println!(
-            "{}  surface={} ({})  lemma={} ({})  context=({})",
-            row["word"].as_str().unwrap_or(""),
-            row["surface"].as_str().unwrap_or(""),
-            row["surface_units"].as_u64().unwrap_or(0),
-            row["lemma"].as_str().unwrap_or(""),
-            row["lemma_units"].as_u64().unwrap_or(0),
-            row["context_units"].as_u64().unwrap_or(0)
-        );
+        table.push(vec![
+            row["word"].as_str().unwrap_or("").to_string(),
+            format!(
+                "{} ({})",
+                row["surface"].as_str().unwrap_or(""),
+                row["surface_units"].as_u64().unwrap_or(0)
+            ),
+            format!(
+                "{} ({})",
+                row["lemma"].as_str().unwrap_or(""),
+                row["lemma_units"].as_u64().unwrap_or(0)
+            ),
+            row["context_units"].as_u64().unwrap_or(0).to_string(),
+        ]);
     }
+    print_table(&TITLES, &table);
     Ok(())
 }

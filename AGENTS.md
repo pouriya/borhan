@@ -668,7 +668,7 @@ work) run fine without `init`.
 
 A token in `server.toml` is required on every HTTP request as `Authorization: Bearer`. The same file is what the CLI sends.
 
-Every HTTP response sets `Server: borhan/<version>` and `X-Borhan-Version` to the crate version (`Cargo.toml`). The CLI compares that header to its own version. A mismatch prints prettified JSON and does not try to format it. A match with `--json` decodes, re-encodes and pretty-prints the body. A match without `--json` prints the response headers, then the usual text.
+Every HTTP response sets `Server: borhan/<version>` and `X-Borhan-Version` to the crate version (`Cargo.toml`). The CLI compares that header to its own version. A mismatch prints prettified JSON and does not try to format it. A match with `--json` decodes, re-encodes and pretty-prints the body. A match without `--json` prints the usual text. `X-Trace-Id` is shown only when the server answers 4xx or 5xx.
 
 Both `serve` and the CLI read the file with [`tanzim`](https://docs.rs/tanzim) into `Server`, via `read_configuration`. The helper formats tanzim's error with `{:#}` — that is the form carrying source, line, column and the caret; wrapping it as a `#[source]` throws all of it away. `init server` serializes the same `Server` struct back out with `toml_edit`.
 
@@ -882,6 +882,28 @@ output. Verbosity comes from `CommandLine::logging_level()`:
 | `error` | Failure the binary recovers from — a failure it does *not* recover from is returned from `main` as `Err(String)`, not logged |
 | `debug` | Before attempting something important — include the inputs/params that affect the outcome |
 | `trace` | After completing a low-level operation — include rich detail about what was produced |
+
+### HTTP and operations
+
+Every memory operation opens a named span (`List`, `Search`, `Cursor`, …) with
+`op` (lowercase, for grouping), `trace` (the ULID), `memory` when there is one,
+and the numeric timings that ran (`total_ms`, `search_ms`, `fetch_ms`, …). The
+same numbers are on the matching `info` event. CLI and HTTP share this span.
+
+HTTP adds a parent `Http` span (`op = "http"`) and one access-log event
+`msg = "HTTP request"` with:
+
+- `http_method`, `http_path` (the raw URI), `http_route` (the matched template,
+  low cardinality), `http_query`
+- `http_status` (numeric)
+- `http_request_bytes`, `http_response_bytes` (`Content-Length`, else 0)
+- `total_ms`, `trace`
+
+2xx is `info`, 4xx is `warn`, 5xx is `error`. The CLI talking to `serve` emits
+the same fields as `msg = "HTTP client request"` on a `Client` span, and records
+the server's `trace` so the two processes join.
+
+Span `NEW` and `CLOSE` events are enabled so busy/idle time is in the JSON too.
 
 ### Format rules
 
