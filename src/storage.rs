@@ -78,10 +78,36 @@ const POSTFIX_LIMIT: usize = 16;
 /// rust-lang/rfcs, a third of every top ten was a row under this line.
 ///
 /// What is lost is the ability to find a heading or a stray line of code by
-/// searching for it alone. The paragraph holding it is still embedded, still
-/// found, and reads back with that line in it, which is the better answer
-/// anyway.
+/// searching for it alone. It is still not lost from the index: [`WINDOW`] puts
+/// it inside the vector of the sentence beside it, so a search for it lands on
+/// the prose it labels — which is the better answer anyway.
 const MINIMUM_WORDS: usize = 5;
+
+/// How much of each neighbouring sentence goes into a sentence's vector.
+///
+/// A sentence on its own is a poor thing to embed. "It doubles the dose" says
+/// nothing about what *it* is, and the model has no way to know: potion is a
+/// lookup table over tokens, so a vector holds only the words it was given. The
+/// sentence before it named the drug and the one after it says what happens
+/// then, and both are what somebody searching would actually type.
+///
+/// So a sentence is embedded together with the back of the sentence before it
+/// and the front of the one after — half of each, which is this. The half
+/// nearest the sentence, because that is the half that is about it.
+///
+/// This buys context for no vectors at all: the same rows are embedded, each
+/// from more text. Measured over 3,737 GitHub-docs sections and 287 sections of
+/// the WHO emergency-care workbook, 20 queries each, recall@1 with document
+/// aggregation went 35% -> 55% and 20% -> 30%; the paraphrased half of the
+/// queries, the ones a person rather than a manual would write, went 40% -> 60%
+/// at recall@10. A quarter did less and the whole neighbour did no better and
+/// cost recall@10, the vector by then having drifted off the sentence and onto
+/// the passage.
+///
+/// It does not lift the floor: below [`MINIMUM_WORDS`] a row is still not
+/// embedded. A three-word row borrowing thirty words from around it would be a
+/// vector for text that is not in the row a hit returns.
+const WINDOW: f64 = 0.5;
 
 /// Put in front of a model's name to make the LanceDB table its vectors live
 /// in. One table per model is the whole migration story: a new model is a new
@@ -380,12 +406,19 @@ pub struct Counts {
     pub user: u64,
 }
 
-/// Which layer of a transcript an embedding covers.
+/// Which layer of a transcript a row covers.
 ///
 /// The `type` column of a memory's table has a fourth value, `session`, which
 /// is not here on purpose: a session is a container, there is no text that *is*
 /// one, and embedding the whole of a day's conversation would return it for
 /// every query.
+///
+/// Two of the three left are embedded. `Paragraph` is not, any more: it is a
+/// row, a cursor and the thing a sentence hangs off, but it gets no vector.
+/// What it used to do for a search, [`WINDOW`] does inside the sentence's own
+/// vector, and for less — a paragraph is one sentence about two thirds of the
+/// time, which made a third of those vectors byte-identical copies of the
+/// sentence under them, competing with it for the same places in the results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Message,
@@ -481,20 +514,23 @@ pub struct Entry {
 
 /// One row [`Storage::add`] wrote, and the text a vector for it is made of.
 ///
-/// The text is returned rather than read back out of the table because only a
-/// sentence row keeps its content: a message's is the whole of what came in and
-/// a paragraph's is its sentences joined, and both are wanted for embedding
-/// even though neither is stored.
+/// The text is returned rather than read back out of the table because it is
+/// not in the table: a message's is the whole of what came in, which is kept
+/// only as its sentences, and a sentence's is that sentence *with its
+/// neighbours around it* (see [`WINDOW`]), which is a string that exists
+/// nowhere else. What a hit reads back is still the row itself — this is what
+/// the vector was built from, not what anyone is shown.
 #[derive(Debug, Clone)]
 pub struct Row {
     pub id: Ulid,
     pub kind: Kind,
     pub text: String,
 
-    /// Whether a vector should be made of `text`, which is false for a row
-    /// under [`MINIMUM_WORDS`]. The row is written either way — reassembling
-    /// the paragraph above it needs it, and so does walking the cursor — it
-    /// just does not become something a search can land on directly.
+    /// Whether a vector should be made of `text`. False for a row under
+    /// [`MINIMUM_WORDS`], and false for every paragraph — see [`Kind`]. The row
+    /// is written either way — reassembling the message above it needs it, and
+    /// so does walking the cursor — it just does not become something a search
+    /// can land on directly.
     pub embed: bool,
 }
 
@@ -765,8 +801,11 @@ impl Storage {
         //     sentence   x           x           x             x            x
         //
         // so a row *is* a cursor. LanceDB stores this table's `id` against each
-        // embedding — sentences, paragraphs and messages get one, whole sessions
-        // do not — which makes the way in a primary key lookup at any level.
+        // embedding — sentences and messages get one, paragraphs and whole
+        // sessions do not — which makes the way in a primary key lookup at any
+        // level. Every layer is a row here whether or not it is a vector there:
+        // a paragraph earns its row by being what sentences hang off and what
+        // reading order is counted in, not by being findable.
         // From that row: the sentences of a paragraph share its `paragraph_id`,
         // the paragraphs of a message share its `message_id`, and the next or
         // previous one is `position` ± 1.
@@ -790,8 +829,8 @@ impl Storage {
         // room for a UUID and its hyphens, which is 36, and for whatever a
         // feeder that does not use UUIDs hands over instead.
         //
-        // Only sentences hold `content`, since a sentence is the unit that gets
-        // embedded; a paragraph or a message is read back by collecting them.
+        // Only sentences hold `content`, since a sentence is the unit that is
+        // kept; a paragraph or a message is read back by collecting them.
         //
         // `postfix` is what the author wrote *after* that content and before
         // whatever came next: a space, a newline, a blank line, as many blank
@@ -1274,6 +1313,11 @@ impl Storage {
             written.push(Row {
                 id,
                 kind: Kind::Sentence,
+                // No [`WINDOW`] here: a sentence added on its own has no
+                // neighbours to take. The one before it is in the table and the
+                // one after it has not been written yet, so a window would be
+                // half a window, and giving it one would mean re-embedding the
+                // row before it on every append.
                 text: entry.content.clone(),
                 embed: entry.content.split_whitespace().count() >= MINIMUM_WORDS,
             });
@@ -1327,16 +1371,34 @@ impl Storage {
                 position = 0;
             }
 
+            // Every sentence about to be written, in reading order, so each
+            // one's vector can take in the ones beside it. Flat on purpose: the
+            // window runs across paragraph boundaries, because a block break is
+            // the writer's formatting and not a break in what is being said —
+            // the first sentence of a paragraph is very often what the last
+            // sentence of the one before it was leading up to.
+            //
+            // The window reaches only as far as this one call, so a sentence at
+            // either end of it has a shorter one. That is the seam of an append,
+            // and closing it would mean re-embedding a row already written.
+            let sentences: Vec<&str> = paragraphs
+                .iter()
+                .flatten()
+                .map(|(sentence, _)| sentence.as_str())
+                .collect();
+            // Which of them the next one written is. Not `position`, which
+            // restarts inside every paragraph.
+            let mut ordinal = 0;
+
             for paragraph in &paragraphs {
                 let id = match Ulid::new() {
                     Ok(id) => id,
                     Err(source) => return Err(Error::Identifier { source }),
                 };
-                // Content and postfix, straight through: the paragraph's vector
-                // is built from the same string [`Storage::get`] hands back, so
-                // what a search matched on is what a reader is shown. The last
-                // postfix is the gap to the next paragraph and belongs between
-                // them, not at the end of this one.
+                // Content and postfix, straight through, which is the same
+                // string [`Storage::get`] hands back. The last postfix is the
+                // gap to the next paragraph and belongs between them, not at
+                // the end of this one.
                 let mut text = String::new();
                 for (sentence, postfix) in paragraph {
                     text.push_str(sentence);
@@ -1370,12 +1432,14 @@ impl Storage {
                         source,
                     });
                 }
-                let words = text.split_whitespace().count();
                 written.push(Row {
                     id,
                     kind: Kind::Paragraph,
                     text,
-                    embed: words >= MINIMUM_WORDS,
+                    // No vector, whatever its length — see [`Kind`]. The text
+                    // is still handed back, because it is the paragraph and a
+                    // caller may want it; nothing here embeds it.
+                    embed: false,
                 });
                 position += 1;
 
@@ -1411,9 +1475,14 @@ impl Storage {
                     written.push(Row {
                         id: sentence_id,
                         kind: Kind::Sentence,
-                        text: sentence.clone(),
+                        text: window(&sentences, ordinal),
+                        // Measured on the sentence, not on the window: the
+                        // window is context for finding this row, and it should
+                        // not be able to talk a row into the index that has
+                        // nothing in it to find.
                         embed: sentence.split_whitespace().count() >= MINIMUM_WORDS,
                     });
+                    ordinal += 1;
                 }
             }
         }
@@ -2358,6 +2427,43 @@ struct Block {
     end: usize,
 }
 
+/// The text one sentence's vector is built from: the back [`WINDOW`] of the
+/// sentence before it, the sentence itself, and the front [`WINDOW`] of the one
+/// after.
+///
+/// `sentences` is one whole `add` in reading order and `at` is which of them
+/// this is, so the ends of it get a one-sided window and a lone sentence gets
+/// itself. Neighbours go in whatever their own length — the [`MINIMUM_WORDS`]
+/// gate decides which rows are embedded, not which words may be borrowed. A
+/// heading, too short to be a vector of its own, is exactly the kind of
+/// neighbour worth having.
+///
+/// Halves are counted in words and rounded down, so a one-word neighbour
+/// contributes nothing rather than all of itself.
+fn window(sentences: &[&str], at: usize) -> String {
+    let mut text = String::new();
+    if at > 0 {
+        let words: Vec<&str> = sentences[at - 1].split_whitespace().collect();
+        let take = (words.len() as f64 * WINDOW) as usize;
+        if take > 0 {
+            // The *back* half of the one before: what leads into this sentence,
+            // not how its own paragraph opened.
+            text.push_str(&words[words.len() - take..].join(" "));
+            text.push(' ');
+        }
+    }
+    text.push_str(sentences[at]);
+    if let Some(next) = sentences.get(at + 1) {
+        let words: Vec<&str> = next.split_whitespace().collect();
+        let take = (words.len() as f64 * WINDOW) as usize;
+        if take > 0 {
+            text.push(' ');
+            text.push_str(&words[..take].join(" "));
+        }
+    }
+    text
+}
+
 /// Break a Markdown text into paragraphs, each already broken into sentences,
 /// each sentence carrying the text that followed it.
 ///
@@ -2381,8 +2487,7 @@ struct Block {
 /// paragraph, a newline between the lines of code, a blank line between blocks,
 /// as many blank lines as were actually written. Concatenating content and
 /// postfix through a paragraph or a whole message gives the text back with its
-/// shape, which is what [`Storage::get`] prints and what a paragraph's vector is
-/// built from. What that cannot give back is the markup this deliberately drops
+/// shape, which is what [`Storage::get`] prints. What that cannot give back is the markup this deliberately drops
 /// and the line wrapping inside a paragraph, which CommonMark itself treats as
 /// insignificant. Nor the very first prefix, which is markup too — the `- ` of
 /// the first list item, the `#` of a heading.

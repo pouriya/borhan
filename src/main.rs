@@ -268,9 +268,10 @@ pub enum MemoryCommand {
         /// What to search for.
         text: String,
 
-        /// Only look at one layer: message, paragraph or sentence. Without it a
-        /// sentence, its paragraph and its message all compete for the same
-        /// places in the results.
+        /// Only look at one layer: message or sentence. Without it a sentence
+        /// and its message compete for the same places in the results.
+        /// Paragraphs are not embedded and so are never found by a search,
+        /// whatever this says; anything stored before that changed still is.
         #[arg(long = "type")]
         kind: Option<String>,
 
@@ -1094,8 +1095,8 @@ async fn main() -> anyhow::Result<()> {
                         Some(kind) => match storage::Kind::parse(&kind) {
                             Some(kind) => Some(kind),
                             None => anyhow::bail!(
-                                "Unknown type {kind:?}: a vector covers a message, a paragraph \
-                                 or a sentence. Whole sessions are not embedded."
+                                "Unknown type {kind:?}: a vector covers a message or a \
+                                 sentence. Paragraphs and whole sessions are not embedded."
                             ),
                         },
                         None => None,
