@@ -180,12 +180,32 @@ pub struct Hit {
     pub raw: f32,
     /// Groups matched over groups asked for. Unlike the score this is a fact
     /// the caller can reason about correctly, and it is what the tool
-    /// description tells a model to read.
+    /// description tells a model to read. It counts [`Hit::nearby`] too, since
+    /// that is what the score counted.
     pub coverage: (u8, u8),
-    /// The labels of the groups that hit.
+    /// The labels of the groups whose words are written in this unit.
     pub matched: Vec<String>,
-    pub session: String,
-    pub message: Option<String>,
+    /// The labels of the groups that hit only through the context field —
+    /// present somewhere else in the same message, absent from this unit.
+    ///
+    /// Kept apart from [`Hit::matched`] rather than merged into it because the
+    /// two are different claims and only one of them can be quoted. A caller
+    /// that reads `matched` and finds a group there is entitled to expect the
+    /// word in the snippet; one that finds it in `nearby` has been told where
+    /// to look next, which is the cursor.
+    pub nearby: Vec<String>,
+    /// The session's ULID, spelled the way `cursor` spells it and the way the
+    /// `session` filter of the next search wants it. `session_ref` beside it is
+    /// the feeder's own name for the same thing — a thread id, a filename —
+    /// which is what a person reads and what nothing accepts as input.
+    ///
+    /// Both are here, under the same names `cursor` uses, because a hit is the
+    /// input to the next call and a caller that has to work out which of two
+    /// spellings a field holds will eventually work it out wrong.
+    pub session: Ulid,
+    pub session_ref: String,
+    pub message: Ulid,
+    pub message_ref: Option<String>,
     pub author: String,
     pub role: Role,
     pub ts: i64,
@@ -209,6 +229,10 @@ struct Plan {
     field: Field,
     weight: f32,
     bm25: Bm25Weight,
+    /// Kept past scoring so a hit can say whether the word is in the unit or
+    /// only near it. The weight alone cannot answer that: it is a float that
+    /// has already been folded into a sum.
+    source: Source,
     /// False for the context field, which records no positions.
     positions: bool,
 }
@@ -279,6 +303,7 @@ pub fn search(
                     field,
                     weight: source.weight(),
                     bm25,
+                    source,
                     positions,
                 });
             }
@@ -410,9 +435,15 @@ pub fn search(
         *count += 1;
 
         let mut matched = Vec::new();
+        let mut nearby = Vec::new();
         for (at, group) in ranking.groups.iter().enumerate() {
-            if candidate.mask & (1 << at) != 0 {
+            if candidate.mask & (1 << at) == 0 {
+                continue;
+            }
+            if candidate.direct & (1 << at) != 0 {
                 matched.push(group.label.clone());
+            } else {
+                nearby.push(group.label.clone());
             }
         }
 
@@ -428,8 +459,11 @@ pub fn search(
             raw: candidate.raw,
             coverage: (candidate.hits, ranking.groups.len() as u8),
             matched,
-            session: row.session_ref.clone(),
-            message: row.message_ref.clone(),
+            nearby,
+            session: row.session,
+            session_ref: row.session_ref.clone(),
+            message: row.message,
+            message_ref: row.message_ref.clone(),
             author: row.author.clone(),
             role: row.role,
             ts: row.ts,
@@ -551,6 +585,15 @@ struct Candidate {
     /// One bit per group, so coverage is a `count_ones` and the matched labels
     /// are readable afterwards.
     mask: u32,
+    /// The subset of `mask` whose words are actually written in the unit.
+    ///
+    /// The difference between the two is what a caller cannot otherwise see: a
+    /// group can be satisfied entirely by the context field, which holds terms
+    /// propagated from the neighbouring units of the same message, and a unit
+    /// reached that way does not contain the word. Reporting it under the same
+    /// heading as a real match is how a reader ends up quoting an acuity level
+    /// off a line that never mentioned one.
+    direct: u32,
 }
 
 /// The collector that does the actual scoring.
@@ -587,6 +630,7 @@ impl Collector for Ranking {
                     fieldnorms: reader.get_fieldnorms_reader(plan.field)?,
                     bm25: plan.bm25.clone(),
                     weight: plan.weight,
+                    source: plan.source,
                     positions: plan.positions,
                 });
             }
@@ -627,6 +671,7 @@ struct Cursor {
     fieldnorms: FieldNormReader,
     bm25: Bm25Weight,
     weight: f32,
+    source: Source,
     positions: bool,
 }
 
@@ -649,6 +694,7 @@ impl SegmentCollector for Scoring {
         let mut sum = 0.0;
         let mut hits = 0u8;
         let mut mask = 0u32;
+        let mut direct = 0u32;
         let mut spans: Vec<Vec<u32>> = Vec::new();
 
         for (at, group) in self.groups.iter_mut().enumerate() {
@@ -656,6 +702,7 @@ impl SegmentCollector for Scoring {
             // sum of them. A paragraph containing `error`, `fault` *and* `خطا`
             // describes one concept three ways and must not score triple.
             let mut best = 0.0f32;
+            let mut written = false;
             let mut positions: Vec<u32> = Vec::new();
             for cursor in group.iter_mut() {
                 // Documents arrive in increasing order within a segment, so
@@ -674,6 +721,12 @@ impl SegmentCollector for Scoring {
                 if score > best {
                     best = score;
                 }
+                // Independent of which cursor scored highest: one exact or
+                // variant posting on this document is enough to say the word
+                // is here, even when a context posting happened to outscore it.
+                if cursor.source != Source::Context {
+                    written = true;
+                }
                 if cursor.positions {
                     self.buffer.clear();
                     cursor.postings.positions(&mut self.buffer);
@@ -686,6 +739,9 @@ impl SegmentCollector for Scoring {
             sum += best;
             hits += 1;
             mask |= 1 << at;
+            if written {
+                direct |= 1 << at;
+            }
             if !positions.is_empty() {
                 positions.sort_unstable();
                 spans.push(positions);
@@ -704,6 +760,7 @@ impl SegmentCollector for Scoring {
             raw: sum,
             hits,
             mask,
+            direct,
         });
 
         // Kept bounded rather than sorted on every push: a common term can

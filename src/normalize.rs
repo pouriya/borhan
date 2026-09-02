@@ -37,7 +37,7 @@ pub const LEMMA: &str = "lemma";
 /// refused rather than served: an index built by older rules answers queries
 /// normalized by newer ones with silence, and silence is indistinguishable
 /// from "nothing was ever stored about that".
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Characters a stem must keep for a suffix to be stripped off it.
 ///
@@ -185,7 +185,19 @@ pub fn surface(word: &str) -> String {
             '\u{064A}' | '\u{0649}' => folded.push('\u{06CC}'),
             // Hamza carriers to their bare letters. `ۀ` is the one the design
             // document calls out: heh with hamza above, which is heh.
-            '\u{0622}' | '\u{0623}' | '\u{0625}' => folded.push('\u{0627}'),
+            //
+            // Alef with madda, `آ`, is deliberately not in this list, and it is the
+            // one letter here a Persian writer does type deliberately: it has
+            // its own key, it is never omitted, and folding it away collapses
+            // `آسم` (asthma) onto `اسم` (name), `آمار` (statistics) onto
+            // `امار` (a commander) and `آب` (water) onto `اب`. The Arabic
+            // carriers below are different: `أ` and `إ` are not on a Persian
+            // keyboard and Persian spells both of them bare, so folding them is
+            // recovering one spelling rather than destroying two words. The
+            // madda fold still happens — on the lemma field, where an
+            // over-eager fold is the point and the surface field is still
+            // beside it holding the difference.
+            '\u{0623}' | '\u{0625}' => folded.push('\u{0627}'),
             '\u{0624}' => folded.push('\u{0648}'),
             '\u{0626}' => folded.push('\u{06CC}'),
             '\u{06C0}' | '\u{0629}' => folded.push('\u{0647}'),
@@ -253,6 +265,17 @@ pub fn lemma(word: &str, script: Script) -> String {
         let stemmer = ENGLISH.get_or_init(|| Stemmer::create(Algorithm::English));
         return stemmer.stem(&folded).into_owned();
     }
+
+    // Alef with madda to bare alef. [`surface`] leaves this alone so that
+    // `آسم` and `اسم` stay two words there; here, on the field whose whole
+    // job is recall, they become one — which is what rescues a corpus whose
+    // producer dropped the madda, as the extracted triage deck did on every
+    // one of its pages, from being unsearchable by anybody typing the word
+    // correctly. The exact spelling still outscores it when the corpus has it.
+    let folded = match folded.contains('\u{0622}') {
+        true => folded.replace('\u{0622}', "\u{0627}"),
+        false => folded,
+    };
 
     // `می‌رود` → `رود`, but only across a ZWNJ. Stripping `می` from a glued
     // token would take it off `میلاد` and `میدان` too, and there is nothing

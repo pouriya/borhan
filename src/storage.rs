@@ -104,6 +104,13 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[error("could not remove {path}")]
+    Remove {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("could not open the database at {path}")]
     Open {
         path: PathBuf,
@@ -135,8 +142,11 @@ pub enum Error {
     #[error("message {reference:?} is already stored in session {session:?}")]
     Duplicate { session: String, reference: String },
 
-    #[error("no unit {id} in this memory")]
-    Unknown { id: String },
+    #[error("no session {reference:?} in this memory")]
+    UnknownSession { reference: String },
+
+    #[error("no message {reference:?} in session {session:?}")]
+    UnknownMessage { session: String, reference: String },
 
     #[error("could not make a ULID")]
     Identifier {
@@ -220,6 +230,24 @@ pub struct Entry<'a> {
     pub body: &'a str,
 }
 
+/// A message being rewritten, and the counterpart of [`Entry`] for
+/// [`Storage::replace`].
+///
+/// It carries no `role` and no `author`, which is the whole difference: a
+/// replacement corrects what a message *says*, never who said it. A description
+/// that has gone stale was still written by whoever wrote it.
+#[derive(Debug, Clone)]
+pub struct Revision<'a> {
+    /// The session holding the message. Must exist; this never creates one.
+    pub session: &'a str,
+    /// The feeder's identifier for the message to rewrite. Required, unlike on
+    /// [`Entry`], because a message with no reference cannot be named again.
+    pub message: &'a str,
+    /// Unix milliseconds, replacing the stored time rather than preserved.
+    pub ts: i64,
+    pub body: &'a str,
+}
+
 /// A unit — a paragraph — as stored: an id and a byte range into the message.
 #[derive(Debug, Clone)]
 pub struct Unit {
@@ -263,19 +291,47 @@ impl Located {
     }
 }
 
-/// A whole message, as the cursor tool returns it.
+/// One session, as the outline reports it.
 #[derive(Debug, Clone)]
-pub struct Message {
+pub struct SessionRow {
+    pub id: Ulid,
+    /// The feeder's own name for it — a thread id, a project, a filename. This
+    /// is what a caller has and what every other operation takes.
+    pub reference: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub messages: u64,
+    pub units: u64,
+}
+
+/// One message of one session, as the outline reports it.
+///
+/// No body, deliberately. The outline exists to stay readable when a session is
+/// a hundred messages long, and it answers *what is on file* — the text itself
+/// is what `cursor` is for, and asking for both at once would make the cheap
+/// question cost the expensive one.
+#[derive(Debug, Clone)]
+pub struct MessageRow {
     pub id: Ulid,
     pub reference: Option<String>,
     pub seq: i64,
     pub author: String,
     pub role: Role,
     pub ts: i64,
+    pub characters: u64,
+    pub units: u64,
+}
+
+/// A stored message with everything the index needs to hold it again.
+///
+/// Returned by [`Storage::replace`], which has to hand back the *whole* session
+/// and not just the message that changed; see that method for why.
+#[derive(Debug, Clone)]
+pub struct Indexed {
+    pub written: Written,
+    pub role: Role,
+    pub ts: i64,
     pub body: String,
-    /// True for the message the cursor pointed at, so the caller can see where
-    /// in the window it landed.
-    pub anchor: bool,
 }
 
 /// One memory's SQLite database.
@@ -395,6 +451,36 @@ impl Storage {
         Self::attach(directory)
     }
 
+    /// Remove a memory: its database, its index and its directory.
+    ///
+    /// There is no undo and nothing is moved aside first, because a memory is
+    /// the only copy of the messages in it — the index is derived and can be
+    /// rebuilt by `rescan`, the messages cannot be rebuilt by anything. The
+    /// caller is expected to have said so explicitly; `memory delete` requires
+    /// `--yes` and the HTTP route requires the `delete` permission.
+    ///
+    /// Opened first, and the counts read before anything is unlinked, for two
+    /// reasons: it turns a misspelled name into [`Error::Missing`] naming what
+    /// was looked for rather than a recursive delete of whatever that path
+    /// happened to be, and it lets the one line this logs say how much was
+    /// destroyed, which is the only record that will exist afterwards.
+    pub fn delete(root: &Path, name: &str) -> Result<Memory, Error> {
+        let storage = Self::open(root, name)?;
+        let described = storage.describe()?;
+        let directory = storage.directory.clone();
+        // The connection closes here. On Unix the unlink would succeed with it
+        // still open and leave a live handle to an unlinked file, which is a
+        // deleted memory that a request already in flight can still read from.
+        drop(storage);
+        if let Err(source) = fs::remove_dir_all(&directory) {
+            return Err(Error::Remove {
+                path: directory,
+                source,
+            });
+        }
+        Ok(described)
+    }
+
     /// Every memory under `root`, oldest first, with its counts.
     ///
     /// There is no registry to read: a memory is a directory, so the listing is
@@ -461,10 +547,10 @@ impl Storage {
         // `unit` and `sentence` hold offsets and no text. The offsets are byte
         // offsets into `message.body`, which is the only copy of the text.
         //
-        // The two log tables cost nothing today and are the entire training set
-        // for a reranker later: a search that returns twenty hits followed by a
-        // cursor call on the seventh is a relevance label generated for free
-        // during normal operation, and it cannot be recovered afterwards.
+        // Nothing here records what was searched for or what was read back. A
+        // read leaves nothing behind but a line on stderr; the connection is
+        // read-write because writing is a separate operation on the same file,
+        // not because reading writes.
         let schema = "
             CREATE TABLE IF NOT EXISTS memory (
                 id          BLOB(16)    NOT NULL PRIMARY KEY,
@@ -520,20 +606,6 @@ impl Storage {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS search_log (
-                id            BLOB(16) NOT NULL PRIMARY KEY,
-                ts            INTEGER  NOT NULL,
-                groups_json   TEXT     NOT NULL,
-                returned_json TEXT     NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS expansion_log (
-                search_id BLOB(16) NOT NULL,
-                unit_id   BLOB(16) NOT NULL,
-                ts        INTEGER  NOT NULL,
-                PRIMARY KEY (search_id, unit_id)
-            ) WITHOUT ROWID;
         ";
         if let Err(source) = connection.execute_batch(schema) {
             return Err(Error::Schema {
@@ -750,6 +822,350 @@ impl Storage {
         })
     }
 
+    /// Every session in this memory, oldest first.
+    ///
+    /// `ORDER BY id` and not by `started_at`: the id is a ULID whose byte order
+    /// is time order, and it is the one column a feeder cannot get wrong.
+    pub fn sessions(&self) -> Result<Vec<SessionRow>, Error> {
+        let mut statement = match self.connection.prepare(
+            "SELECT s.id, s.external_ref, s.started_at, s.ended_at,
+                    (SELECT count(*) FROM message m WHERE m.session_id = s.id),
+                    (SELECT count(*) FROM unit u JOIN message m ON m.id = u.message_id
+                      WHERE m.session_id = s.id)
+             FROM session s
+             ORDER BY s.id",
+        ) {
+            Ok(statement) => statement,
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+        let found = statement.query_map([], |row| {
+            Ok(SessionRow {
+                id: identifier(&row.get::<_, Vec<u8>>(0)?),
+                reference: row.get(1)?,
+                started_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                messages: row.get::<_, i64>(4)? as u64,
+                units: row.get::<_, i64>(5)? as u64,
+            })
+        });
+        let rows = match found {
+            Ok(rows) => rows,
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+        let mut sessions = Vec::new();
+        for row in rows {
+            match row {
+                Ok(row) => sessions.push(row),
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Every message of one session, in the order they were added.
+    ///
+    /// A session with no messages cannot exist — the row is made by the first
+    /// `add` — so an empty result means the reference is wrong, and saying so
+    /// is worth more than returning nothing and letting the caller conclude the
+    /// session is empty.
+    pub fn messages(&self, session: &str) -> Result<Vec<MessageRow>, Error> {
+        let mut statement = match self.connection.prepare(
+            "SELECT m.id, m.external_ref, m.seq, m.author, m.role, m.ts,
+                    length(m.body),
+                    (SELECT count(*) FROM unit u WHERE u.message_id = m.id)
+             FROM message m JOIN session s ON s.id = m.session_id
+             WHERE s.external_ref = ?1
+             ORDER BY m.seq",
+        ) {
+            Ok(statement) => statement,
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+        let found = statement.query_map(rusqlite::params![session], |row| {
+            Ok(MessageRow {
+                id: identifier(&row.get::<_, Vec<u8>>(0)?),
+                reference: row.get(1)?,
+                seq: row.get(2)?,
+                author: row.get(3)?,
+                role: Role::from_code(row.get::<_, i64>(4)? as u64),
+                ts: row.get(5)?,
+                characters: row.get::<_, i64>(6)? as u64,
+                units: row.get::<_, i64>(7)? as u64,
+            })
+        });
+        let rows = match found {
+            Ok(rows) => rows,
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+        let mut messages = Vec::new();
+        for row in rows {
+            match row {
+                Ok(row) => messages.push(row),
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        if messages.is_empty() {
+            return Err(Error::UnknownSession {
+                reference: session.to_string(),
+            });
+        }
+        Ok(messages)
+    }
+
+    /// Rewrite one message's body in place, keeping its `seq`.
+    ///
+    /// This is how a description that has gone out of date is corrected. In
+    /// place, rather than by removing the message and adding a new one, because
+    /// `seq` is gapless within a session and that is exactly what makes the
+    /// cursor a range scan — a hole in it would silently shorten every window
+    /// that spans the gap. Keeping the ordinal also says the true thing: the
+    /// message still belongs where it was, and only its text was wrong.
+    ///
+    /// The `ts` is replaced too, and not carried over. The body is new text; a
+    /// correction that kept the old time would be ranked by recency as though
+    /// it were as old as the thing it corrected.
+    ///
+    /// Returns the session's ULID, the rewritten message's ULID, and *every*
+    /// message in the session, because of how the index has to be repaired. Tantivy can delete by an indexed term, and the
+    /// only term on a unit that identifies where it came from is the session —
+    /// units carry no message field. So the caller drops the whole session from
+    /// the index and writes it back. That is work proportional to the session
+    /// rather than to the message, which is the price of not adding a field to
+    /// a schema every existing index on disk was built with.
+    pub fn replace(
+        &mut self,
+        revision: &Revision<'_>,
+    ) -> Result<(Ulid, Ulid, Vec<Indexed>), Error> {
+        let transaction = match self.connection.transaction() {
+            Ok(transaction) => transaction,
+            Err(source) => {
+                return Err(Error::Write {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+
+        let found = transaction.query_row(
+            "SELECT id FROM session WHERE external_ref = ?1",
+            rusqlite::params![revision.session],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        let session_id = match found {
+            Ok(bytes) => identifier(&bytes),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Error::UnknownSession {
+                    reference: revision.session.to_string(),
+                });
+            }
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+
+        let found = transaction.query_row(
+            "SELECT id FROM message WHERE session_id = ?1 AND external_ref = ?2",
+            rusqlite::params![session_id.bytes().as_slice(), revision.message],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        let message_id = match found {
+            Ok(bytes) => identifier(&bytes),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(Error::UnknownMessage {
+                    session: revision.session.to_string(),
+                    reference: revision.message.to_string(),
+                });
+            }
+            Err(source) => {
+                return Err(Error::Query {
+                    path: self.database.clone(),
+                    source,
+                });
+            }
+        };
+
+        let written = transaction.execute(
+            "UPDATE message SET body = ?1, ts = ?2 WHERE id = ?3",
+            rusqlite::params![revision.body, revision.ts, message_id.bytes().as_slice()],
+        );
+        if let Err(source) = written {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
+        }
+
+        // The old split, gone before the new one is written. `sentence` first:
+        // it is keyed by unit, so deleting units first would orphan it.
+        let cleared = transaction.execute(
+            "DELETE FROM sentence WHERE unit_id IN
+             (SELECT id FROM unit WHERE message_id = ?1)",
+            rusqlite::params![message_id.bytes().as_slice()],
+        );
+        if let Err(source) = cleared {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
+        }
+        let cleared = transaction.execute(
+            "DELETE FROM unit WHERE message_id = ?1",
+            rusqlite::params![message_id.bytes().as_slice()],
+        );
+        if let Err(source) = cleared {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
+        }
+        write_units(&transaction, &self.database, message_id, revision.body)?;
+
+        // Everything in the session, the rewritten message included, read back
+        // the way the index wants it. Read after the write so the replaced
+        // message comes out with its new body and new units like any other.
+        let mut session_messages = Vec::new();
+        {
+            let mut statement = match transaction.prepare(
+                "SELECT id, seq, role, ts, body FROM message
+                 WHERE session_id = ?1 ORDER BY seq",
+            ) {
+                Ok(statement) => statement,
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            };
+            let found =
+                statement.query_map(rusqlite::params![session_id.bytes().as_slice()], |row| {
+                    Ok((
+                        identifier(&row.get::<_, Vec<u8>>(0)?),
+                        row.get::<_, i64>(1)?,
+                        Role::from_code(row.get::<_, i64>(2)? as u64),
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                });
+            let rows = match found {
+                Ok(rows) => rows,
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            };
+            for row in rows {
+                match row {
+                    Ok(row) => session_messages.push(row),
+                    Err(source) => {
+                        return Err(Error::Query {
+                            path: self.database.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut indexed = Vec::new();
+        for (id, seq, role, ts, body) in session_messages {
+            let mut statement = match transaction.prepare(
+                "SELECT id, byte_start, byte_end FROM unit
+                 WHERE message_id = ?1 ORDER BY seq",
+            ) {
+                Ok(statement) => statement,
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            };
+            let found = statement.query_map(rusqlite::params![id.bytes().as_slice()], |row| {
+                Ok(Unit {
+                    id: identifier(&row.get::<_, Vec<u8>>(0)?),
+                    start: row.get::<_, i64>(1)? as usize,
+                    end: row.get::<_, i64>(2)? as usize,
+                })
+            });
+            let rows = match found {
+                Ok(rows) => rows,
+                Err(source) => {
+                    return Err(Error::Query {
+                        path: self.database.clone(),
+                        source,
+                    });
+                }
+            };
+            let mut units = Vec::new();
+            for row in rows {
+                match row {
+                    Ok(row) => units.push(row),
+                    Err(source) => {
+                        return Err(Error::Query {
+                            path: self.database.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+            indexed.push(Indexed {
+                written: Written {
+                    session: session_id,
+                    message: id,
+                    seq,
+                    units,
+                },
+                role,
+                ts,
+                body,
+            });
+        }
+
+        if let Err(source) = transaction.commit() {
+            return Err(Error::Write {
+                path: self.database.clone(),
+                source,
+            });
+        }
+
+        Ok((session_id, message_id, indexed))
+    }
+
     /// Drop every unit and sentence and split every stored message again, in
     /// `(session, seq)` order, returning what the caller has to reindex.
     ///
@@ -961,13 +1377,33 @@ impl Storage {
         Ok(sentences)
     }
 
-    /// The messages around a unit: the cursor tool's whole implementation.
+    /// The units around a unit: the whole of what reading a hit back means.
     ///
-    /// A range scan on `(session_id, seq)`, which is exact and index-only
-    /// because the ordinals are gapless. No scoring and no snippets — the
-    /// caller has already decided this region is worth reading, and cutting it
-    /// down again would be answering a question it did not ask.
-    pub fn around(&self, unit: Ulid, before: i64, after: i64) -> Result<Vec<Message>, Error> {
+    /// One range scan on `(session_id, seq)`, which is exact and index-only
+    /// because the ordinals are gapless: a unit `before` units back can never
+    /// sit further than `before` messages back, however the split fell, so the
+    /// message range is a bounded superset and the trim happens in memory.
+    ///
+    /// `whole` keeps every unit of those messages, which is how a caller asks
+    /// for the messages themselves. Without it the window is counted in units,
+    /// because a unit is a thirtieth of a message in these corpora and the
+    /// caller who followed a hit here usually wanted the paragraph, not the
+    /// page. No scoring and no snippets either way — the caller has already
+    /// decided this region is worth reading.
+    ///
+    /// A unit this memory does not hold comes back as an empty window rather
+    /// than an error, because a batch of cursors carried over from an older
+    /// result set should read the ones that still resolve; naming the ones that
+    /// did not is the caller's job.
+    pub fn around(
+        &self,
+        unit: Ulid,
+        before: i64,
+        after: i64,
+        whole: bool,
+    ) -> Result<Vec<Located>, Error> {
+        let before = before.max(0);
+        let after = after.max(0);
         let anchor = self.connection.query_row(
             "SELECT m.session_id, m.seq FROM unit u JOIN message m ON m.id = u.message_id
              WHERE u.id = ?1",
@@ -976,11 +1412,7 @@ impl Storage {
         );
         let (session, seq) = match anchor {
             Ok(anchor) => anchor,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Err(Error::Unknown {
-                    id: unit.to_string(),
-                });
-            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
             Err(source) => {
                 return Err(Error::Query {
                     path: self.database.clone(),
@@ -990,9 +1422,14 @@ impl Storage {
         };
 
         let mut statement = match self.connection.prepare(
-            "SELECT id, external_ref, seq, author, role, ts, body FROM message
-             WHERE session_id = ?1 AND seq >= ?2 AND seq <= ?3
-             ORDER BY seq",
+            "SELECT u.id, u.seq, u.byte_start, u.byte_end,
+                    m.id, m.external_ref, m.seq, m.author, m.role, m.ts, m.body,
+                    s.id, s.external_ref
+             FROM unit u
+             JOIN message m ON m.id = u.message_id
+             JOIN session s ON s.id = m.session_id
+             WHERE m.session_id = ?1 AND m.seq >= ?2 AND m.seq <= ?3
+             ORDER BY m.seq, u.seq",
         ) {
             Ok(statement) => statement,
             Err(source) => {
@@ -1005,16 +1442,20 @@ impl Storage {
         let rows = statement.query_map(
             rusqlite::params![session, seq - before, seq + after],
             |row| {
-                let at: i64 = row.get(2)?;
-                Ok(Message {
-                    id: identifier(&row.get::<_, Vec<u8>>(0)?),
-                    reference: row.get(1)?,
-                    seq: at,
-                    author: row.get(3)?,
-                    role: Role::from_code(row.get::<_, i64>(4)? as u64),
-                    ts: row.get(5)?,
-                    body: row.get(6)?,
-                    anchor: at == seq,
+                Ok(Located {
+                    unit: identifier(&row.get::<_, Vec<u8>>(0)?),
+                    unit_seq: row.get(1)?,
+                    start: row.get::<_, i64>(2)? as usize,
+                    end: row.get::<_, i64>(3)? as usize,
+                    message: identifier(&row.get::<_, Vec<u8>>(4)?),
+                    message_ref: row.get(5)?,
+                    seq: row.get(6)?,
+                    author: row.get(7)?,
+                    role: Role::from_code(row.get::<_, i64>(8)? as u64),
+                    ts: row.get(9)?,
+                    body: row.get(10)?,
+                    session: identifier(&row.get::<_, Vec<u8>>(11)?),
+                    session_ref: row.get(12)?,
                 })
             },
         );
@@ -1027,10 +1468,10 @@ impl Storage {
                 });
             }
         };
-        let mut messages = Vec::new();
+        let mut window = Vec::new();
         for row in rows {
             match row {
-                Ok(row) => messages.push(row),
+                Ok(row) => window.push(row),
                 Err(source) => {
                     return Err(Error::Query {
                         path: self.database.clone(),
@@ -1039,70 +1480,15 @@ impl Storage {
                 }
             }
         }
-        Ok(messages)
-    }
-
-    /// Record a query and what it returned.
-    ///
-    /// Free to write and impossible to recover later: when the agent searches,
-    /// gets twenty results and then reaches for the cursor on the seventh, that
-    /// pair of rows is a relevance judgement produced by normal use.
-    pub fn log_search(&self, groups: &str, returned: &str) -> Result<Ulid, Error> {
-        let id = match Ulid::new() {
-            Ok(id) => id,
-            Err(source) => return Err(Error::Identifier { source }),
-        };
-        let written = self.connection.execute(
-            "INSERT INTO search_log (id, ts, groups_json, returned_json) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                id.bytes().as_slice(),
-                id.milliseconds() as i64,
-                groups,
-                returned
-            ],
-        );
-        if let Err(source) = written {
-            return Err(Error::Write {
-                path: self.database.clone(),
-                source,
-            });
+        if whole {
+            return Ok(window);
         }
-        Ok(id)
-    }
-
-    /// Record that a unit returned by some earlier search was expanded.
-    ///
-    /// The search it belongs to is the most recent one that returned this unit,
-    /// found here rather than passed in, because the caller of the cursor tool
-    /// holds an opaque string and should not have to also carry a search id
-    /// around to make the log work.
-    pub fn log_expansion(&self, unit: Ulid) -> Result<(), Error> {
-        let found = self.connection.query_row(
-            "SELECT id FROM search_log WHERE returned_json LIKE ?1 ORDER BY id DESC LIMIT 1",
-            rusqlite::params![format!("%{}%", unit)],
-            |row| row.get::<_, Vec<u8>>(0),
-        );
-        let search = match found {
-            Ok(search) => search,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
-            Err(source) => {
-                return Err(Error::Query {
-                    path: self.database.clone(),
-                    source,
-                });
-            }
+        let Some(at) = window.iter().position(|row| row.unit == unit) else {
+            return Ok(Vec::new());
         };
-        let written = self.connection.execute(
-            "INSERT OR IGNORE INTO expansion_log (search_id, unit_id, ts) VALUES (?1, ?2, ?3)",
-            rusqlite::params![search, unit.bytes().as_slice(), Ulid::now()],
-        );
-        if let Err(source) = written {
-            return Err(Error::Write {
-                path: self.database.clone(),
-                source,
-            });
-        }
-        Ok(())
+        let start = at.saturating_sub(before as usize);
+        let end = window.len().min(at + after as usize + 1);
+        Ok(window[start..end].to_vec())
     }
 
     /// Read one `index_meta` value.

@@ -1,4 +1,4 @@
-TARGET ?= $(shell rustc -vV | awk '$$1 == "host:"{print $$2}')
+TARGET ?= $(shell rustc -vV 2>/dev/null | awk '$$1 == "host:"{print $$2}')
 BUILD_DIR=$(CURDIR)/build
 CARGO_TARGET_DIR ?= $(CURDIR)/target
 VERSION=$(shell cat Cargo.toml | awk 'BEGIN{FS="[ \"]"}$$1 == "version"{print $$4;exit}')
@@ -29,6 +29,20 @@ SEED_LIMIT ?= 200
 # a scan of somebody else's documents out of the developer's own store.
 SEED_HOME=$(CURDIR)/home
 
+# Where `make systemd-install` puts things, and what it writes into the served
+# user's server.toml. SERVER_PORT is the one knob worth overriding:
+#
+#     sudo make systemd-install SERVER_PORT=8080
+#
+SERVICE_FILE=borhan.service
+SYSTEMD_DIR ?= /etc/systemd/system
+INSTALL_DIR ?= /usr/local/bin
+SERVER_PORT ?= 7777
+SERVER_LISTEN ?= 127.0.0.1:${SERVER_PORT}
+
+# Same name main.rs appends to a user's home when --home is absent.
+BORHAN_HOME_DIRECTORY=.borhan
+
 
 all: dev clippy test check-style
 
@@ -47,6 +61,79 @@ dev: ${BUILD_DIR}
 
 start-dev: dev
 	${DEV_CMD} --home ${SEED_HOME} --debug serve
+
+
+# Install `borhan serve` as a systemd unit, from ${SERVICE_FILE} in the repo
+# root. Run it with sudo: the unit lands in ${SYSTEMD_DIR} and the binary in
+# ${INSTALL_DIR}, and both of those are root's.
+#
+# The service does not run as root. It runs as the user who typed sudo and
+# serves that user's own ~/${BORHAN_HOME_DIRECTORY}, which is the point of the
+# whole target: the CLI probes the listen address in `<home>/server.toml` and
+# talks HTTP when something answers there, so a `borhan memory search` typed in
+# that user's shell goes through this unit only if the unit and the shell agree
+# on one home directory. Hence the templating -- ${SERVICE_FILE} carries
+# @USER@, @GROUP@ and @HOME@, and the sed below fills them from the passwd
+# entry of $${SUDO_USER}.
+#
+# The build is the one step that runs back as that user, through a login shell.
+# Two reasons, both about what sudo does to an environment: cargo lives in
+# ~/.cargo/bin, which is not on sudo's secure_path, and a `cargo build` run as
+# root leaves a root-owned target/ that the next ordinary `make dev` cannot
+# write.
+# The path `release` writes, printed in whatever environment is asking. Used by
+# `systemd-install`, which cannot work it out on its own: ${CMD} is named after
+# ${TARGET}, ${TARGET} comes from `rustc -vV`, and rustc lives in ~/.cargo/bin,
+# which is not on sudo's PATH. So the root-side make asks the user's login
+# shell -- the same one that just ran the build -- what the file is called.
+print-cmd:
+	@ echo ${CMD}
+
+
+systemd-install:
+	@ test -d ${SYSTEMD_DIR} || { \
+		echo "No ${SYSTEMD_DIR}: nothing here runs systemd, so there is no unit to install."; \
+		exit 1; }
+	@ command -v systemctl >/dev/null 2>&1 || { \
+		echo "No systemctl on PATH: nothing here runs systemd."; exit 1; }
+	@ test "`id -u`" = "0" || { \
+		echo "systemd-install writes ${SYSTEMD_DIR} and ${INSTALL_DIR}."; \
+		echo "Run: sudo $(MAKE) systemd-install"; exit 1; }
+	@ test -n "$${SUDO_USER}" || { \
+		echo "Run this with sudo from your own login rather than as root: the unit runs"; \
+		echo "as $${SUDO_USER} and serves that user's ~/${BORHAN_HOME_DIRECTORY}, and there is no such user here."; \
+		exit 1; }
+	@ set -e; \
+	user="$${SUDO_USER}"; \
+	group=`id -gn "$$user"`; \
+	home=`getent passwd "$$user" | cut -d: -f6`; \
+	test -n "$$home" || { echo "No home directory in the passwd entry of $$user."; exit 1; }; \
+	borhan_home="$$home/${BORHAN_HOME_DIRECTORY}"; \
+	echo "==> building as $$user"; \
+	sudo -u "$$user" -H sh -lc "cd ${CURDIR} && exec $(MAKE) --no-print-directory release"; \
+	cmd=`sudo -u "$$user" -H sh -lc "cd ${CURDIR} && exec $(MAKE) --no-print-directory print-cmd"`; \
+	test -x "$$cmd" || { echo "make release left no binary at \"$$cmd\"."; exit 1; }; \
+	echo "==> installing $$cmd at ${INSTALL_DIR}/borhan"; \
+	systemctl stop ${SERVICE_FILE} >/dev/null 2>&1 || true; \
+	install -d -m 0755 ${INSTALL_DIR}; \
+	install -m 0755 "$$cmd" ${INSTALL_DIR}/borhan; \
+	sudo -u "$$user" mkdir -p "$$borhan_home"; \
+	if [ -f "$$borhan_home/server.toml" ]; then \
+		echo "==> keeping $$borhan_home/server.toml, which already says where to listen"; \
+	else \
+		echo "==> writing $$borhan_home/server.toml listening at ${SERVER_LISTEN}"; \
+		sudo -u "$$user" ${INSTALL_DIR}/borhan --home "$$borhan_home" \
+			init server --listen ${SERVER_LISTEN}; \
+	fi; \
+	echo "==> writing ${SYSTEMD_DIR}/${SERVICE_FILE} for $$user, home $$borhan_home"; \
+	sed -e "s|@USER@|$$user|g" -e "s|@GROUP@|$$group|g" -e "s|@HOME@|$$borhan_home|g" \
+		${CURDIR}/${SERVICE_FILE} > ${SYSTEMD_DIR}/${SERVICE_FILE}; \
+	chmod 0644 ${SYSTEMD_DIR}/${SERVICE_FILE}; \
+	echo "==> systemctl daemon-reload"; \
+	systemctl daemon-reload; \
+	echo "==> systemctl enable --now ${SERVICE_FILE}"; \
+	systemctl enable --now ${SERVICE_FILE}; \
+	systemctl --no-pager --full status ${SERVICE_FILE} || true
 
 
 clippy:
@@ -176,4 +263,4 @@ ${BUILD_DIR}:
 	@ mkdir -p ${BUILD_DIR}
 
 
-.PHONY: all release dev start-dev clippy check-style fmt lint test docs open-docs clean dist-clean purge seed seed-fetch seed-scan seed-test seed-clean
+.PHONY: all release dev start-dev print-cmd systemd-install clippy check-style fmt lint test docs open-docs clean dist-clean purge seed seed-fetch seed-scan seed-test seed-clean

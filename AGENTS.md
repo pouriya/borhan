@@ -1,15 +1,18 @@
 # borhan
 
-Memory store: **embed → store → search**. A binary, not a library.
+Memory store: **store → split → index → search → read back**. A binary, not a
+library. A SQLite source of truth under a tantivy index; nothing is embedded and
+nothing is downloaded at runtime.
 
 ## ⚠️ Read this before writing any code
 
-**DO NOT CREATE NEW FILES UNLESS EXPLICITLY TOLD TO.** The whole program lives in
-`src/main.rs`. Splitting it into `settings.rs`, `utils.rs`, `store.rs`, `lib.rs`,
-a `mod` tree, or anything else is **not** an improvement to make on your own
-initiative — it is a change to the project's shape, and that is the author's
-decision. Add to `main.rs` and let it grow. If you genuinely think a split is
-needed, say so and wait for an answer; do not split and then explain.
+**DO NOT CREATE NEW FILES UNLESS EXPLICITLY TOLD TO.** The module list under
+Layout is the whole program and it is closed. Adding `settings.rs`, `utils.rs`,
+`types.rs`, `lib.rs` or any further split is **not** an improvement to make on
+your own initiative — it is a change to the project's shape, and that is the
+author's decision. Add to the module the code belongs to and let it grow. If you
+genuinely think a split is needed, say so and wait for an answer; do not split
+and then explain.
 
 **INLINE EVERYTHING UNLESS YOU KNOW IT WILL BE REUSED.** Not "might be reused
 later", not "is cleaner as its own function" — *known*, concrete, present reuse.
@@ -23,7 +26,7 @@ single chain used once, collapse them back together.
 **USE `make`. DO NOT CALL `cargo` DIRECTLY.** Every check this project cares
 about is a make target, and the bare `cargo` equivalents silently skip some of
 them — `cargo build` does not pin `--target`, `cargo clippy` without
-`-D warnings` does not fail, and nothing else runs `check-arrow` at all.
+`-D warnings` does not fail.
 **Before reporting any task finished, `make all` must pass.** Quote its result;
 do not claim it passed without running it.
 
@@ -31,33 +34,27 @@ do not claim it passed without running it.
 
 | Target | What it does |
 |--------|--------------|
-| `make all` | **The gate**: `dev` + `clippy` + `test` + `check-style` + `check-arrow` |
-| `make model` | Downloads a fixture model into `models/` (once; no-op if present) |
+| `make all` | **The gate**: `dev` + `clippy` + `test` + `check-style` |
 | `make dev` | Debug build → `build/borhan-<version>-<target>-dev` |
 | `make release` | Release build → `build/borhan-<version>-<target>` |
 | `make start-dev` | `make dev`, then runs `serve` with `--debug` |
 | `make clippy` | `cargo clippy --all-targets --no-deps -- -D warnings` |
 | `make check-style` | `cargo fmt --check` |
 | `make fmt` | Rewrites formatting in place |
-| `make check-arrow` | Fails if `Cargo.lock` has ≠1 arrow version, or a non-58 major |
-| `make lint` | `clippy` + `check-style` + `check-arrow`, no build |
+| `make lint` | `clippy` + `check-style`, no build |
 | `make test` | `cargo test --target …` |
 | `make seed` | `seed-scan` + `seed-test`: fetch a corpus, scan it, search it |
 | `make seed-fetch` | Clones the corpus into `seed/<name>/` (once; no-op if present) |
 | `make seed-scan` | Wipes `home/`, inits it, adds every document as a message |
-| `make seed-test` | `memory list`, three searches, and `memory get --json` of the top hit |
+| `make seed-test` | `memory list`, three searches, a lexicon lookup, and `memory cursor` of the top hit |
 | `make seed-clean` | Drops `home/`, keeps the fetched corpus |
-| `make clean` / `dist-clean` / `purge` | Drop `target/` / also `build/` / also `models/` and `seed/` |
-
-`make model` is deliberately *not* part of `make all` — it is a 31 MB network
-download, and only the directory-loader path needs it. The default embedder
-requires nothing: its model is compiled into the binary.
+| `make clean` / `dist-clean` / `purge` | Drop `target/` / also `build/` / also `seed/` and `home/` |
 
 ### The seed corpus
 
 `make seed` is the only thing that exercises storage on real volume: the
-splitter, the vector index and search all behave differently at 24k rows than at
-the handful a manual test types in.
+splitter, the index and search all behave differently at thousands of units than
+at the handful a manual test types in.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -86,8 +83,8 @@ directory and almost nothing else is: github/docs has an `index.md` in nearly
 every directory, and `basename` collides on **111** distinct names across its
 3737 documents. For the same reason the loop is a `find`, not a `*.md` glob,
 which would have matched nothing at all outside the top directory. 200 documents
-take ~50s and produce ~11k paragraphs and ~24k sentences, well past the 1024
-rows where the vector index gets built.
+take ~50s. 60 documents produce 3 087 units, which is enough for BM25's
+document-frequency weighting to mean something.
 
 Two things the Makefile does that are not obvious:
 
@@ -101,122 +98,43 @@ Two things the Makefile does that are not obvious:
 
 ## Stack
 
+Every entry carries its reasoning in `Cargo.toml`, next to the dependency
+itself; that file is the source of truth and this table is the index to it.
+
 | Crate | Version | Role |
 |-------|---------|------|
-| `model2vec-rs` | 0.2.1 | Static embeddings (no inference runtime, no GPU) |
-| `lancedb` | 0.37.1 | Vector store — on-disk, columnar, ANN search |
-| `rusqlite` | 0.40.2 | Metadata / keyword store, `bundled` SQLite |
-| `tokio` | 1.53.1 | Async runtime (`lancedb` is async throughout) |
+| `rusqlite` | 0.40.2 | The source of truth. `bundled`, so SQLite compiles from source |
+| `tantivy` | 0.26.1 | The inverted index: dictionary, postings, positions, BM25, merges |
+| `rust-stemmers` | 1.2.0 | Snowball English (Porter2), the second half of the normalizer |
+| `unicode-normalization` | 0.1.24 | NFC, the first half. Persian arrives in both forms |
+| `pulldown-cmark` | 0.13.4 | Breaks stored Markdown into units |
+| `axum` | 0.8.9 | The HTTP server, and MCP over it |
+| `tokio` | 1.53.1 | Async runtime for `serve` |
+| `ureq` | 2.12.1 | The CLI talking to a running `serve`. Blocking on purpose |
 | `clap` | 4.6.6 | Command line, derive API |
 | `tanzim` | 0.28.0 | Reads `server.toml`, with located errors |
 | `toml_edit` | 0.22.27 | Writes `server.toml` in `init server` |
+| `serde` / `serde_json` | 1.0 | The configuration structs; every `--json` body and the MCP envelope |
 | `getrandom` | 0.4.3 | The 80 random bits of a ULID, straight from the OS |
 | `chrono` | 0.4.45 | Renders `created_at` as ISO-8601 in `memory list`; no other date handling |
-| `futures` | 0.3.31 | `TryStreamExt::try_next`, to read LanceDB's result stream |
-| `pulldown-cmark` | 0.13.4 | Breaks stored Markdown into paragraphs and sentences |
-| `serde_json` | 1.0.151 | Builds the `memory get --json` array; already in the tree |
+| `thiserror` / `anyhow` | 2.0 / 1.0 | Module errors; the binary boundary |
 | `tracing` + `tracing-subscriber` | 0.1 / 0.3 | Structured JSON logging to stderr |
 
 ## Hard constraints
 
-- **arrow stays on 58.x.** `lancedb` 0.37.1 pins `arrow ^58`. arrow 59 exists and
-  will resolve fine, but its types do not unify with lancedb's — you get
-  `expected arrow_schema::Schema, found arrow_schema::Schema`, with no mention of
-  versions anywhere in the error. `make check-arrow` enforces this; if it fails,
-  `cargo tree -i arrow` shows who pulled the second one.
-- **Nothing downloads at runtime.** `model2vec-rs` is built with `local-only`,
-  which drops `hf-hub` and `ureq` from the graph. The default model is compiled
-  into the binary; `models/` only holds fixtures for the directory loader.
-- **`git lfs` must be installed before cloning.** `*.safetensors` is LFS-tracked
-  via `.gitattributes`. Without it you get pointer files and a runtime
-  `HeaderTooLarge` — see the Model section.
-- **`fancy-regex`, not `onig`.** The default `onig` feature pulls the oniguruma
-  C library; `fancy-regex` is pure Rust. Do not re-enable default features on
-  `model2vec-rs`.
-- **`protoc` must be on `PATH` to build.** `lance-encoding`'s build script
-  compiles `.proto` files and fails without it — `sudo apt-get install -y
-  protobuf-compiler`, or `brew install protobuf`. Nothing borhan writes uses
-  protobuf; it arrives through lancedb.
-
-## Model
-
-The default model is **`minishlab/potion-retrieval-32M`** — 131 MB,
-**512 dimensions**, `normalize: true`, embedding matrix `F32 [63091, 512]`.
-It is fine-tuned for asymmetric query→document retrieval, which is what memory
-recall is.
-
-It lives in `src/embedding/potion-retrieval-32M/` and is pulled into the binary
-with `include_bytes!`, so a `borhan` binary embeds text with no files on disk and
-no network. The cost is real and deliberate: the debug binary is ~235 MB. Do not
-add a second embedded model without asking.
-
-### The model is in Git LFS — install it before cloning
-
-`model.safetensors` is 124 MB, over GitHub's 100 MB hard limit, so it is stored
-via **Git LFS**. `.gitattributes` tracks `*.safetensors`.
-
-```sh
-sudo apt-get install -y git-lfs   # or: brew install git-lfs
-git lfs install                   # once per machine
-git clone git@github.com:pouriya/borhan.git
-```
-
-**Cloning without git-lfs installed leaves a ~130-byte pointer file in place of
-the model.** `include_bytes!` happily embeds the pointer text, the build
-succeeds, and the failure only shows up at runtime as:
-
-```
-Error: Could not load the built-in embedding model "potion-retrieval-32M"
-
-Caused by:
-    0: failed to parse safetensors
-    1: HeaderTooLarge
-```
-
-If you see that, you are missing git-lfs — run `git lfs install && git lfs pull`.
-
-Watch the quota: GitHub's free tier gives 1 GB of LFS storage and **1 GB/month of
-LFS bandwidth**, and every fresh clone or CI run pulls the full 124 MB. That is
-roughly eight clones a month. If CI starts cloning this repo regularly, either
-pay for a data pack or move the model out of git and fetch it in a build step.
-
-**It is English-only** — the tokenizer is `bge-base-en-v1.5`. Non-Latin text
-degrades to `[UNK]`. The only multilingual model2vec is
-`potion-multilingual-128M` at 537 MB; switching means changing the dimension and
-re-embedding everything already stored.
-
-`models/` (gitignored, populated by `make model`) holds `potion-base-8M`
-(31 MB, 256d) purely as a fixture for exercising the directory loader.
-
-## Embedding module
-
-`src/embedding/mod.rs` — one file plus the model directory.
-
-```rust
-pub trait Embedding: Send + Sync {
-    fn name(&self) -> &str;
-    fn dimensions(&self) -> usize;
-    fn embed(&self, texts: &[String]) -> Vec<Vec<f32>>;
-}
-
-pub struct Embedded;    // default: include_bytes! -> StaticModel::from_bytes
-pub struct Directory;   // Directory::new(path) -> StaticModel::from_pretrained
-
-pub fn load(name: &str) -> Result<Box<dyn Embedding>, Error>;
-```
-
-`load` treats `"default"` (the `DEFAULT_MODEL` const) as the embedded model and
-anything else as a directory path.
-
-- **`embed` is infallible.** model2vec is a lookup table plus pooling — there is
-  no inference step to fail. Everything that can go wrong happens at load time,
-  which is what `Error` covers. Do not add a `Result` to `embed` "just in case".
-- **`dimensions()` is probed, not read.** `StaticModel` keeps its shape private
-  and exposes no accessor, so `probe_dimensions` embeds `"a"` once at load time
-  and measures the result. If model2vec-rs ever exposes the width, use that.
-- **`Directory::new` checks for each required file itself**, because
-  model2vec-rs reports a missing directory, a missing `config.json` and a
-  missing `model.safetensors` with the same opaque message.
+- **Nothing downloads at runtime, and nothing is embedded.** There is no model,
+  no vector store and no inference: search is BM25 over a tantivy index with a
+  hand-written normalizer. `make seed` fetches a corpus, and that is the only
+  network access anywhere in the tree.
+- **The normalizer and the index version move together.** Changing `normalize.rs`
+  or the splitter means bumping the rules version, and every existing index then
+  answers with a `500` naming `memory rescan` until it is rebuilt. That error is
+  the design working: an index quietly disagreeing with the query side about what
+  a word folds to is a search that returns other things and says nothing.
+- **The tokenizer and the scoring loop are not delegated.** tantivy has no notion
+  of ZWNJ, ک/ی folding or Persian morphology, and group semantics, coverage and
+  min-span proximity are not expressible in its stock queries. Everything else
+  about the index is tantivy's.
 
 ## Identifiers
 
@@ -240,301 +158,134 @@ ten random bytes and an alphabet. **It has no monotonic factory**: two ULIDs
 made in the same millisecond sort arbitrarily against each other. Add one when
 something depends on within-millisecond ordering, not before.
 
+`Ulid::parse` reads the 26-character form back, case-insensitively — a ULID that
+has been through a shell or a copy-paste may arrive lowercased. `I`, `L` and `O`
+are **not** folded onto `1` and `0`: the alphabet omits them so a human does not
+misread one aloud, and accepting the mistake would file a row under an id nobody
+can type twice. A first character above `7` is refused, since 26 characters
+carry 130 bits and only 3 of the leading 5 fit.
+
 ## Storage
 
-`src/storage.rs` — `<home>/storage/`: `borhan.db`, and one
-`embedding_<model>.lance` directory beside it per embedding model.
+`src/storage.rs` — **one directory per memory**, `<home>/storage/<name>/`,
+holding `borhan.db` and an `index/` beside it. Nothing is shared between
+memories: no cross-memory table, no cross-memory index, and `memory delete` is
+`rm -rf` of one directory plus the row that named it.
 
 ```rust
-Storage::initialize(dir, model, dims) -> Result<Initialized, Error>  // the only creator
-Storage::open(directory) -> Result<Storage, Error>              // open + schema, no mkdir
-storage.create(name, description) -> Result<Ulid, Error>        // one row + its own table
-storage.add(memory, &Entry) -> Result<Vec<Row>, Error>          // rows in that memory
-storage.get(memory, &[Ulid]) -> Result<Vec<Record>, Error>      // rows back, text reassembled
-storage.walk(memory, session, message, paragraph, from, count)  // the children of what you name
-    -> Result<Vec<Record>, Error>                               // no ULID needed
-storage.list() -> Result<Vec<Memory>, Error>                    // every row, oldest first
-                                                                // Memory.name has no prefix
-                                                                // Memory.counts per type
-storage.create_vectors(model, dims) -> Result<bool, Error>      // called by initialize
-storage.open_vectors(model) -> Result<Vectors, Error>           // opens; never creates
-vectors.add(&[Vector]) -> Result<(), Error>                     // + indexes past the threshold
-vectors.search(memory, kind, query, limit) -> Result<Vec<Hit>, Error>
+Storage::create(root, name, description, languages) -> Result<(Storage, Ulid), Error>
+Storage::open(root, name)   -> Result<Storage, Error>   // opens; never creates
+Storage::list(root)         -> Result<Vec<Memory>, Error>
+Storage::delete(root, name) -> Result<Memory, Error>
+storage.describe()          -> Result<Memory, Error>    // + the three counts
+storage.add(&Entry)         -> Result<Written, Error>   // one message, split into units
+storage.replace(&Revision)  -> Result<(Ulid, Ulid, Vec<Indexed>), Error>  // one message, rewritten
+storage.sessions()          -> Result<Vec<SessionRow>, Error>       // what `outline` lists
+storage.messages(session)   -> Result<Vec<MessageRow>, Error>       // one session's, no bodies
+storage.resplit()           -> Result<Vec<(Ulid, Written)>, Error>   // what `rescan` runs
+storage.locate(&[Ulid])     -> Result<Vec<Located>, Error>          // units by id
+storage.around(unit, before, after, whole) -> Result<Vec<Located>, Error>
+storage.sentences(unit)     -> Result<Vec<(usize, usize)>, Error>   // for the snippet
 ```
 
-**`Storage::initialize` is the one thing in borhan that creates anything.** It
-makes the directory, the SQLite tables and the model's LanceDB table, each
-"create if missing", so running it twice is running it once and running it after
-a crash repairs whatever did not land. `main.rs` calls it once, from `init
-storage`, and `Initialized { existing, vectors }` is what the printed message is
-built from. Everything else opens with `Storage::open`, which will not make the
-directory — a typo'd `--home` has to be an error naming the missing mount, never
-a new empty store that silently remembers nothing.
+**`Storage::open` will not create the directory.** A typo'd `--home` has to be an
+error naming the missing mount, never a new empty store that silently remembers
+nothing. `init` is the only thing that writes the layout; see `check_storage` in
+`main.rs`, whose message spells out both fixes because an agent in a container
+has two and the wrong one *succeeds*.
 
 ```sql
-CREATE TABLE IF NOT EXISTS memory (
-    id          BLOB(16)      NOT NULL PRIMARY KEY,
-    ulid        TEXT          NOT NULL,
-    name        VARCHAR(47)   NOT NULL,
-    description VARCHAR(2000),
-    created_at  INTEGER       NOT NULL
-);
+memory (id, ulid, name, description, languages, created_at)
+session (id, ulid, external_ref UNIQUE, started_at, ended_at)
+message (id, ulid, session_id, external_ref, seq, author, role, ts, body,
+         UNIQUE (session_id, seq))
+unit     (id, message_id, seq, byte_start, byte_end, UNIQUE (message_id, seq))
+sentence (unit_id, seq, byte_start, byte_end, PRIMARY KEY (unit_id, seq))
+index_meta    (key, value)
 ```
 
-Every memory also gets a table of its own, named by its `memory.name` — the row
-and the table are created in one transaction, so neither exists without the
-other:
+- **`message.body` is the only copy of the text.** `unit` and `sentence` hold
+  byte offsets into it and no content of their own, which is why `Located::text`
+  is a slice and not a column. A unit's text therefore cannot drift from the
+  message it came from, and re-splitting is rewriting offsets rather than
+  rewriting text.
+- **Offsets are bytes, not characters.** Persian is two bytes per character in
+  UTF-8, so `length(body)` in SQLite — which counts characters on TEXT — is not
+  the same number, and `length(cast(body as blob))` is what a size check wants.
+- **`seq` is the reading order, not `id`.** A ULID is a millisecond plus 80
+  random bits with no monotonic factory (see `src/ulid.rs`), and `add` writes a
+  whole message inside one millisecond, so `ORDER BY id` would be ordering the
+  random halves. `message.seq` counts within its session and `unit.seq` within
+  its message, both gapless — which is what lets `around` turn a window counted
+  in units into one indexed range scan over messages.
+- **`external_ref` is somebody else's identifier**, arriving with the
+  transcript: a thread id, a filename, a page number. It is `UNIQUE` per session
+  on `message`, so replaying a transcript that overlaps what is stored fails
+  loudly instead of duplicating. It is what a hit reports as `session_ref` and
+  `message_ref`; the ULID beside it is what another call accepts.
+- **`role` is an integer**, not text: `Role::code`/`Role::from_code`.
+- **Nothing here records reads.** There is no table of queries and no table of
+  which results were expanded, and adding one is not a small change: it would
+  make `search` and `cursor` writers, so a store mounted read-only, or a server
+  configured without write permission, would start failing on reads. What a read
+  is worth saying goes to stderr.
+- **`replace` rewrites a body in place and keeps the `seq`.** Not remove-and-add:
+  the ordinal is gapless within a session and that is what makes `around` a range
+  scan, so a hole in it would silently shorten every window spanning the gap.
+  It keeps the author and the role too — a replacement corrects what a message
+  *says*, never who said it — and takes a new `ts`, because a correction ranked
+  by the time of the thing it corrects is ranked wrong.
+- **`replace` returns the whole session, and the caller reindexes all of it.**
+  A unit document carries a `session` term and no message term, so
+  `Index::forget` is the narrowest deletion tantivy can be asked for. The
+  alternative was a `message` field, which changes the schema `open_or_create`
+  compares against and so breaks every index already on disk with a tantivy
+  error rather than the `Stale` path that names `memory rescan`. Cost is
+  proportional to the session; the forget and the rewrite share one commit, so a
+  reader never sees the session half-present.
+- **`Permission::Replace` is not in `DEFAULT`.** Same argument as `Delete`, and
+  the only one: it overwrites a stored body with no copy kept, and a
+  `server.toml` written before it existed cannot have consented to it.
+- **`index_meta` holds the normalization rules version.** An index built by an
+  older normalizer answers with a `500` naming `memory rescan` rather than
+  quietly disagreeing with the query side about what a word folds to.
 
-```sql
-CREATE TABLE memory_<name> (
-    id           BLOB(16)      NOT NULL PRIMARY KEY,
-    ulid         TEXT          NOT NULL,
-    type         VARCHAR(9)    NOT NULL,   -- session | message | paragraph | sentence
-    session_id   VARCHAR(64)   NOT NULL,
-    message_id   VARCHAR(64),
-    paragraph_id BLOB(16),
-    sentence_id  BLOB(16),
-    position     INTEGER       NOT NULL,
-    content      VARCHAR(5000),
-    postfix      VARCHAR(16),              -- the whitespace that followed it
-    role         VARCHAR(9),               -- user | assistant
-    role_name    VARCHAR(64),              -- model id, or the user's name
-    created_at   INTEGER       NOT NULL
-);
-CREATE INDEX memory_<name>_session   ON memory_<name> (session_id, position);
-CREATE INDEX memory_<name>_message   ON memory_<name> (message_id, position);
-CREATE INDEX memory_<name>_paragraph ON memory_<name> (paragraph_id, position);
-```
+### Counting: what `memory list` shows
 
-- **The three indexes are "the children of this row, in order"** — the messages
-  of a session, the paragraphs of a message, the sentences of a paragraph. That
-  is what `storage.walk` asks for and what reading a transcript back *is*, so
-  without them every step of a cursor scans the whole memory. `position` is the
-  second column so the ordering comes out of the index instead of a sort. Index
-  names are database-wide, hence the table name in front. Nothing indexes `type`
-  or `role`: `memory list` groups by them once per listing, and one scan for a
-  listing is not worth a fourth index on every write.
+`describe()` runs three `count(*)` queries — sessions, messages, units — per
+memory. That is a scan, which is fine for a listing on a terminal; the day it is
+not, the fix is a counts row the writer keeps current, not a cleverer query.
+**The heading goes to stderr and the rows to stdout**, so a pipe reads nothing
+but data and a terminal is still told what the columns are.
 
-- **`id` and `ulid` are the same value**, in blob and text form. The text one is
-  there so that reading the table by hand does not mean decoding blobs; it is
-  deliberately unindexed, and code reads `id` — nothing keeps the copy honest.
-- **`created_at` is unix milliseconds**, taken from `id`'s own timestamp rather
-  than from a second clock reading, so the two can never disagree. ISO-8601 with
-  a `Z` is a rendering, and belongs at the CLI and API boundary — the table
-  keeps the number that sorts and compares.
-- **Every rule about the data is in `create`, none of it in SQL.** No `CHECK`,
-  no `UNIQUE`; the `VARCHAR(n)` widths are documentation, since SQLite reads
-  them as affinity and enforces nothing. Validate there or not at all.
-- **A name is `a-z`, `0-9` and `_`, and unique.** It has to survive being used
-  as a SQLite or LanceDB table name, where anything else needs quoting to be
-  safe. Uniqueness is a `SELECT count(*)` before the insert — with nothing
-  enforcing it in the database that is a race, and it is fine only because a
-  single process owns the storage. The day two writers exist, add a `UNIQUE`
-  index on `name`.
-- **`create` stores `memory_` + the name it was given**, so the stored value
-  *is* the table name and a caller can only ever name a table inside that
-  namespace — never `memory` itself, never anything else in the database. It is
-  also why a leading digit is allowed: `2024` is not an identifier, but
-  `memory_2024` is. The 40-character limit is on what the caller passes, hence
-  `VARCHAR(47)` on the column.
-- **The prefix never leaves `storage.rs`.** `create` puts it on, `list` strips
-  it back off, and everything outside — the CLI, the API, a future search —
-  deals in the name the user typed. A row that is not under the prefix was not
-  written by `create`, and `list` says so rather than guessing.
-- **The implicit rowid stays.** An FTS5 index over `name`/`description` needs a
-  rowid to point at (`content=memory`), so no `WITHOUT ROWID`.
-- **`Storage::open` creates what is missing**, which is why the caller does the
-  gating: `init storage` may call it, everything else calls `check_storage`
-  first. See below.
-
-### The per-memory table is a cursor
-
-One row per session, message, paragraph and sentence, all four in the same
-shape. Each row carries the ids of everything above it, and its own:
-
-| `type` | `session_id` | `message_id` | `paragraph_id` | `sentence_id` | `content` |
-|---|---|---|---|---|---|
-| `session` | x | | | | |
-| `message` | x | x | | | |
-| `paragraph` | x | x | x | | |
-| `sentence` | x | x | x | x | x |
-
-- **LanceDB stores this table's `id`** against each embedding — sentences,
-  paragraphs and messages are embedded, whole sessions are not — so a vector hit
-  comes back into SQLite as `WHERE id = ?`, a primary-key lookup, at whatever
-  level it matched. That row holds all four ids, and every walk starts there:
-  the sentences of a paragraph share its `paragraph_id`, the paragraphs of a
-  message share its `message_id`, and next/previous is `position` ± 1.
-- **`position` is the reading order, not `id`.** A ULID is a millisecond plus 80
-  random bits and there is no monotonic factory (see `src/ulid.rs`), so
-  splitting a paragraph writes every sentence inside the same millisecond and
-  `ORDER BY id` would be ordering the random halves. `position` counts from 0
-  within the parent, and it survives re-ingesting a transcript. On a `session`
-  row it is `0` — a session is not the nth of anything, and sessions arrive far
-  enough apart for `id` to order them.
-- **`paragraph_id` and `sentence_id` repeat `id` on their own row.** Redundant on
-  purpose: everything belonging to a paragraph, the paragraph row included, is
-  then one predicate — which is also all it takes to delete one.
-- **`session_id` and `message_id` are text because they are somebody else's
-  identifiers**, arriving with the transcript. 64 characters is a hyphenated
-  UUID (36) with room for a feeder that does not use UUIDs.
-- **Only `sentence` rows have `content`**, up to 5000 *characters* — a sentence
-  is the unit that gets embedded, and a paragraph or message is read back by
-  collecting its sentences. The original spacing and line breaks are not kept;
-  reconstructing a transcript verbatim is not a goal.
-- **No indexes yet**, same as `memory`. The walks above want
-  `(session_id, position)`, `(message_id, position)` and
-  `(paragraph_id, position)`; they land with the code that runs them.
-- **No `IF NOT EXISTS` on the per-memory table.** The name was free a moment
-  earlier, so a table already sitting under it is not one borhan made, and
-  writing into columns nobody checked is worse than failing. The table name is
-  interpolated, not bound — SQLite has no parameter for one — which is safe only
-  because the name has already been reduced to `memory_` plus `[a-z0-9_]`.
-- **`memory delete`, when it exists, must `DROP TABLE` in the same transaction**
-  as the row delete, for the same reason `create` makes both at once — and
-  delete the memory's rows from every `embedding_*` table.
-
-### Writing into it: `storage.add`
-
-One row per call, and **the parent is looked up, never described**:
-
-| `--type` | needs | inherits from the parent row |
-|---|---|---|
-| `message` | `--session`, `--message`, `--role` | — |
-| `paragraph` | `--message` | session, role, role name |
-| `sentence` | `--paragraph` (a ULID) | session, message, role, role name |
-
-- **An orphan is unwriteable.** There is no argument that could name a parent
-  which is not there, so the ids on a row cannot contradict the ids above it —
-  they are copied down, not supplied twice.
-- **The `session` row is written for you**, by the first message naming a
-  session that has none. A session has no text of its own, so it is never added
-  directly and is not a `Kind`.
-- **`position` is counted inside the transaction**, as the number of siblings
-  already filed. Never supplied.
-- **A duplicate `message_id` in one memory is refused**, because the paragraph
-  lookup would otherwise resolve silently to whichever came first.
-- **`content` is stored only on a `sentence` row, and nothing is lost by it.**
-  Every text is broken all the way down, so the sentences under a paragraph
-  *are* that paragraph and the sentences under a message are that message. A
-  message and a paragraph are still embedded whole — that is what lets a search
-  answer at the grain the question was asked at — but what is kept is the
-  sentences.
-- **A row under `MINIMUM_WORDS` (5) is written but not embedded.** `Row.embed`
-  says which, and the CLI builds vectors only for those. A two-word row is not
-  an answer to anything and is actively harmful in a ranking: a vector built
-  from two tokens sits close to every query mentioning either of them, so `}`
-  and `Compiler` and `// code` take the places a sentence saying something
-  would have had. Measured on the 24,343 sentences of rust-lang/rfcs, a third of
-  every top ten was a row under this line, and 8,699 rows — 36% — now need no
-  vector at all. What is lost is finding a heading or a stray line of code by
-  searching for it alone; the paragraph holding it is still embedded, still
-  found, and reads back with that line in it. **A message is always embedded**,
-  however short: one that short is somebody saying "yes", which is little to
-  search for but is still the thing that was said.
-- **The row goes in before the vector**, and they are not one transaction —
-  SQLite and LanceDB cannot be. That order decides how a crash between them
-  breaks: a row with no vector is invisible to search but still reachable by
-  walking the cursor, while a vector with no row would put an id into search
-  results that resolves to nothing.
-
-### Reading it back: `storage.get`
-
-`get(memory, &[Ulid]) -> Vec<Record>` is what turns a search result into
-something a person can read, because **a hit is a ULID and a ULID says
-nothing**. Both `memory get` and `memory search` go through it.
-
-Only a sentence stores its own content, so the layers above it are reassembled
-from the sentences underneath, each followed by its own `postfix`:
-
-| Kind | Where its text comes from |
-|------|---------------------------|
-| `sentence` | its own `content` column |
-| `paragraph` | its sentences and their postfixes, `ORDER BY position` |
-| `message` | every sentence under it, `ORDER BY paragraph.position, sentence.position` |
-
-**That two-level ordering on a message is the reason `position` exists.** A
-sentence's `position` counts from zero inside its *own* paragraph, so ordering a
-whole message by `position` alone would interleave the paragraphs, and ordering
-by `id` would scramble any split that happened inside one millisecond — which is
-every split, since `add` writes a whole message in one go. The join goes through
-the paragraph row to get the outer key.
-
-Two decisions to know about:
-
-- **Sentences are joined by their `postfix`**, so the text comes back with the
-  shape it went in with: code as lines, a heading above the prose it labels,
-  blank lines between the paragraphs of a message. It is also byte for byte the
-  string `add` built the paragraph's vector from, so what `get` prints is still
-  what the search actually matched on. A sentence with no postfix — one added on
-  its own, outside `split` — gets a space, and the trailing postfix is trimmed,
-  since it is the gap to whatever comes after what was asked for.
-- **Ids that are not there are left out, not raised.** A search resolving its
-  own hits would otherwise lose a whole page because one vector outlived its
-  row; `memory get` compares what it asked for against what it got and names
-  each miss on stderr. **Session rows are not addressable** — they hold no text
-  and are never embedded, so the query filters to the three real layers.
-
-### Walking it: `storage.walk`
-
-`walk(memory, session, message, paragraph, from, count) -> Vec<Record>` is the
-other way in, and **the one that needs no ULID**. A search hands back ids;
-everything else a reader wants — the message before this one, the rest of this
-document, what a session actually holds — is "the children of something I can
-name", and the names are the feeder's own.
-
-| Given | What comes back |
-|-------|-----------------|
-| `session` | the messages of that session |
-| `session` + `message` | the paragraphs of that message |
-| `paragraph` (a ULID) | the sentences of that paragraph |
-
-Each answer is the layer under the deepest thing named. A paragraph needs no
-session, since a ULID is already unique across the memory. `from` and `count`
-are a window counted in `position`, and **a `from` past the end is an empty
-result, not an error** — walking off the end is how a reader finds out where the
-end is.
-
-- **It collects ids and then calls `get`**, rather than being a second, wider
-  query. Reassembling a row out of the rows under it is the whole of what `get`
-  does, and doing it twice is how two readers start disagreeing about what a
-  paragraph's text is.
-- **The parent is bound as a `rusqlite::types::Value`**, not as bytes. The three
-  parent columns are not one type — a paragraph id is a blob, the feeder's two
-  are text — and SQLite compares a blob to a string as *unequal* rather than as
-  an error, so binding the wrong one silently finds nothing.
-
-### Splitting: what a paragraph and a sentence are
+### Splitting: what a unit and a sentence are
 
 **Stored text is read as Markdown**, because what borhan is fed is a chat
-transcript and that is what those are written in. A **paragraph is a CommonMark
+transcript and that is what those are written in. A **unit is a CommonMark
 block** — a paragraph, one list item, one table row, a fenced code block — not a
 run between blank lines. Splitting on blank lines would run a bullet list into
 one lump and cut a code block wherever the code happened to breathe; both are
-worse things to embed than what the author actually wrote.
+worse things to index than what the author actually wrote.
+
+A unit is what search scores and returns, and its ULID is the `cursor`. A
+sentence is a span inside a unit, and exists for one reason: the snippet on a
+hit is the best *sentence* of the unit rather than the whole block.
 
 - **A heading joins the block under it**, and is the one exception to
-  block-per-paragraph. `## Motivation` on its own answers no question and sits
+  block-per-unit. `## Motivation` on its own answers no question and sits
   close to every query that says "motivation"; in front of the prose it labels,
-  it says what that prose is about — to a reader and to a vector alike. Two
-  headings in a row both join the first block with words in it. A heading with
-  nothing under it is a paragraph of its own.
-- **Every sentence stores the whitespace that followed it**, its `postfix`: a
-  space inside a paragraph, a newline between lines of code, a blank line
-  between blocks, as many blank lines as were actually written. Content plus
-  postfix, concatenated, is the text back with its shape. Only the whitespace is
-  kept — everything else between two blocks is the next one's markup — and it is
-  capped at `POSTFIX_LIMIT` (16) characters. What is not recovered: the markup
-  that was dropped, the line wrapping inside a paragraph (which CommonMark
-  itself calls insignificant), and the very first prefix, the `#` of a heading
-  or the `- ` of the first list item, which nothing needs to read the text back.
+  it says what that prose is about. Two headings in a row both join the first
+  block with words in it. A heading with nothing under it is a unit of its own.
+- **Nothing is copied.** A unit and a sentence are byte offsets into
+  `message.body`, so the text comes back with the spacing it went in with and
+  cannot drift from the message it came from.
 - **Markup is dropped, not stored.** `**bold**` is `bold`, a link is its text.
   Nothing reaching a model or a screen has a bracket the author did not type.
 - **Code blocks keep their literal lines**, indentation included — in code the
   punctuation *is* the content. One sentence per line, blank lines dropped, and
-  one paragraph per `CODE_LINES` (20) lines: a screenful, long enough that a
+  one unit per `CODE_LINES` (20) lines: a screenful, long enough that a
   function usually lands whole and short enough that a 500-line file does not
-  become one vector answering every question about it equally. A 45-line block
+  become one unit answering every question about it equally. A 45-line block
   splits 20/20/5.
 - **An HTML block keeps its words and loses its tags.** `<details>`,
   `<summary>`, a hand-written `<table>`, an MDX-style `<Tabs>` — the tags go the
@@ -548,8 +299,9 @@ worse things to embed than what the author actually wrote.
   `<b>` is dropped without a space, since the text around it arrives on its own
   and already reads as one sentence; inline `<br>` breaks the line, wherever it
   was written.
-- **A table row is one sentence**, cells joined with ` | `. Not a sentence each:
-  `lancedb` alone is half a fact, `lancedb | vectors` answers something. The
+- **A table row is one unit**, cells joined with ` | `. Not one per cell:
+  `rusqlite` alone is half a fact, `rusqlite | the source of truth` answers
+  something. The
   separator goes in front of each cell so no punctuation is invented.
 - **A sentence ends at `.` `!` `?` `؟` `。` `！` `？` `…` `؛` followed by
   whitespace or the end of the block.** Requiring the whitespace is what keeps
@@ -561,80 +313,6 @@ worse things to embed than what the author actually wrote.
 - **A line with no terminator inside `CONTENT_LIMIT` is cut at the limit**
   rather than dropped or refused, because losing the tail is worse and failing
   a whole transcript over one long line is worse still.
-
-`Ulid::parse` reads the 26-character form back, case-insensitively — a ULID that
-has been through a shell or a copy-paste may arrive lowercased. `I`, `L` and `O`
-are **not** folded onto `1` and `0`: the alphabet omits them so a human does not
-misread one aloud, and accepting the mistake would file a row under an id nobody
-can type twice. A first character above `7` is refused, since 26 characters
-carry 130 bits and only 3 of the leading 5 fit.
-
-### Counting: what `memory list` shows
-
-`Memory.counts` is filled by one `SELECT type, role, count(*) … GROUP BY type,
-role` per memory. That is a scan of each table, since nothing indexes `type` —
-fine for a listing on a terminal; the day it is not, the fix is an index on
-`(type, role)` or a counts row the writer keeps current, not a cleverer query.
-
-- **An unrecognised `type` is an error; an unrecognised `role` is not.** A fifth
-  `type` means the row is not one of the four things a memory is made of. A
-  fifth speaker is odd but legible, so it counts in `messages` and in neither
-  share — **which is why the two percentages need not add up to 100**, and why
-  neither can be derived as the other's complement.
-- **The heading goes to stderr**, the rows to stdout, for the same reason the
-  "no memories" sentence does: a pipe reads nothing but data, a terminal still
-  gets told what the columns are.
-- A memory with no messages shows `-` for the share rather than `0%/0%`, which
-  would read as a fact about who spoke.
-
-### Vectors: one LanceDB table per model
-
-`embedding_<model>`, holding every memory's vectors for that one model. A new
-model is a new table beside the old one, so migrating is re-embedding at leisure
-with nothing dropped, and two models can be compared side by side.
-
-| column | type | |
-|---|---|---|
-| `memory` | `Utf8` | the name the user gave, no `memory_` prefix |
-| `type` | `Utf8` | `message`, `paragraph` or `sentence` — see `Kind` |
-| `id` | `Utf8` | 26-character ULID of the row in `memory_<memory>` |
-| `vector` | `FixedSizeList<Float32, D>` | `D` is the model's `dimensions()` |
-
-- **`session` is not a `Kind`.** Sessions are containers; there is no text that
-  *is* one, and a whole day's conversation embedded as a single vector would
-  come back for every query.
-- **`type` earns its place at query time.** A sentence, the paragraph holding it
-  and the message holding that are three vectors of nearly the same words. Left
-  unfiltered they take three of the top results — visibly, in testing. `--type`
-  picks the granularity.
-- **`id` is text, not the 16 bytes.** LanceDB filters are SQL expression
-  strings, and `id = '01M08...'` is something you can write in one. The `ulid`
-  column in SQLite exists for the same reason.
-- **The model name is taken verbatim, `[A-Za-z0-9_-]` only.** `potion-retrieval-32M`
-  keeps its hyphens and capitals; `.` and `/` are refused, which also stops a
-  `--model` directory name from walking out of the storage directory. Lowercasing
-  would collide `potion-base-8M` with `potion_base_8m`.
-- **Indexes are built lazily, past `INDEX_THRESHOLD` (1024 rows), all three at
-  once.** They cannot be made with the table: PQ trains 256 centroids and lance
-  refuses below that with `Not enough rows to train PQ`. 1024 rather than 256
-  because a flat scan of a few hundred vectors beats an approximate lookup
-  anyway. Verified by dropping the constant to 256, loading 300 rows and
-  watching three index directories appear under `_indices/`.
-- **Cosine, said twice.** `IvfPqIndexBuilder` *and* the query default to L2, and
-  a table too small to have an index is scanned flat through the second path —
-  so leaving either unsaid picks the wrong metric for some queries and not
-  others. The model normalises its output, so cosine and dot rank identically.
-- **The scalar `BTree` indexes on `memory` and `type` are not decoration.** A
-  search is always filtered to one memory; an approximate vector index answers a
-  filtered query by walking partitions, so a memory that is a small slice of the
-  table has its rows scattered and real hits get missed. With the scalar index
-  the filter resolves first.
-- **Rows written after the index exists are still found**, by scanning the
-  unindexed tail — verified: a row added after indexing came back as the top
-  hit. They are not *in* the index until an `optimize`, which nothing calls yet.
-- **`lancedb::Error` is boxed in the error enum.** It is over 130 bytes, and
-  clippy's `result_large_err` fires on returning it by value; every `Result` in
-  the module would carry that width on the success path too.
 
 ## Home directory
 
@@ -659,35 +337,81 @@ runs in front of every storage-touching command; its error spells out both fixes
 difference between the two matters: `init` there silently produces an *empty*
 store and hides every existing memory.
 
-Commands that touch no storage (`embedding load`, `embedding do` — model-only
-work) run fine without `init`.
-
 ### Local vs HTTP
 
 `server.toml` is the only configuration file. `init server --listen HOST:PORT [--token T]` writes it (`create_new`, mode `0600`). `serve` reads it to bind; if the file is missing it binds `127.0.0.1:1995` with no token. Every memory command probes that listen address (`GET /api/v1/health`, about 1s). If the file is missing, `listen` is unset, or the server does not answer, the command opens storage itself.
 
 A token in `server.toml` is required on every HTTP request as `Authorization: Bearer`. The same file is what the CLI sends.
 
+The same server serves `GET /` — `src/guide.md`, the whole REST API as Markdown
+— outside the token gate, and speaks MCP at `POST /mcp`, behind the same token. Every tool is one of `api.rs`'s `run_*` functions — the ones the REST handlers call, deserializing into the same body structs — so a tool and its endpoint cannot drift. There is one read tool per question and no two that overlap — `memory_cursor` covers every width of read — so a model never spends a turn choosing between them. `tools/list` shows the write tools only when `permissions` allows them, and `tools/call` checks again through the same `App::permit`, because a client is entitled to cache that list. Resources are the memories: one each, carrying the description and the counts, and reading one returns that memory's metadata plus the lemmas it actually uses — which is what a caller has to write its query in.
+
+Handshake era (`2025-11-25`, back to `2024-11-05`), not the ratified `2026-07-28`, because every client this is for — Claude Code, Cursor, Codex, OpenCode, Hermes — is on the handshake era today. `server/discover` is therefore answered with `404` and an **empty body**: a newer client falls back to `initialize` only when the body is *not* a recognized modern JSON-RPC error, so a `-32601` there would stop the fallback rather than trigger it. `GET` and `DELETE` get `405`, and `Origin` must be absent or loopback.
+
 Every HTTP response sets `Server: borhan/<version>` and `X-Borhan-Version` to the crate version (`Cargo.toml`). The CLI compares that header to its own version. A mismatch prints prettified JSON and does not try to format it. A match with `--json` decodes, re-encodes and pretty-prints the body. A match without `--json` prints the usual text. `X-Trace-Id` is shown only when the server answers 4xx or 5xx.
 
 Both `serve` and the CLI read the file with [`tanzim`](https://docs.rs/tanzim) into `Server`, via `read_configuration`. The helper formats tanzim's error with `{:#}` — that is the form carrying source, line, column and the caret; wrapping it as a `#[source]` throws all of it away. `init server` serializes the same `Server` struct back out with `toml_edit`.
 
+## Three ways in
+
+borhan is used by models more than by people, and a model reaches it one of
+three ways. All three are the same `run_*` functions in `api.rs`, so an
+operation is never available through only one of them — but each surface has to
+teach itself, because whoever arrives has arrived at exactly one of them and has
+nothing else to read.
+
+| Surface | Entry point | Where its guide text lives |
+|---------|-------------|----------------------------|
+| **MCP** (best case) | `POST /mcp`, configured into the client | `initialize`'s `instructions` and the tool `description`s, in `src/mcp.rs` |
+| **CLI** | `borhan`, `borhan memory`, `--help` at every level | the clap doc comments in `src/main.rs` |
+| **HTTP** | `GET /` on a running `serve` | `src/guide.md`, served verbatim |
+
+**Each one must stand alone.** A model given only an MCP server never sees
+`--help`; a model given only a URL never sees a tool schema. So the same handful
+of facts — a group is a concept and not a word, read `coverage` and not `score`,
+`lemma_units` of 0 means the corpus has never heard the word, one call reads
+every cursor — are written out in all three places on purpose. That duplication
+is the design, not drift to be factored out.
+
+**Three rules when changing any of this:**
+
+1. **Add a route, edit `src/guide.md`.** Nothing checks that the two agree, and
+   a documented endpoint that does not exist is worse than an undocumented one.
+2. **Rename a JSON field, grep all three.** `src/guide.md`, the tool schemas in
+   `src/mcp.rs`, and the doc comments in `src/main.rs`.
+3. **No surface may need another one to be usable.** If the answer to "how would
+   a model discover this" is "read the CLI help", it is not documented.
+
+`GET /` is served **outside the token gate** — it is registered after
+`.layer(token_gate)` in `router`, which is what makes axum skip the layer for
+it. It is documentation, not data, and an agent handed nothing but an address
+has to be able to read it before it can know a token is wanted. Everything the
+document describes stays gated.
+
+Bare `borhan` and bare `borhan memory` both print their long help and exit `0`.
+Neither has an implicit action: a caller who typed `borhan memory` did not
+choose `list`, and a caller who needed to be told what the nine subcommands are
+would get a listing instead of an answer. This is the same rule as One reader,
+one level up — a verb that quietly does one of nine things is a choice the
+caller did not know they were making.
+
 ## CLI
 
 Logging flags and `--home` are `global = true`, so they work before or after a
-subcommand. **A subcommand is required** — there is no implicit server.
+subcommand.
 
 ```
 borhan init                             # == borhan init storage
 borhan init storage                     # create ~/.borhan and ~/.borhan/storage
 borhan init server --listen H:P \
                   [--token T]           # write ~/.borhan/server.toml (0600)
-borhan serve                            # HTTP API, address from server.toml
+borhan serve                            # HTTP API + MCP + GET / , address from server.toml
 borhan memory create <NAME> \
                   --description T       # store a memory, print its ULID
                   [--languages L]       # description is required, more than 10 words
                   [--json]
-borhan memory                           # == borhan memory list
+borhan                                  # print the long help and exit 0
+borhan memory                           # print the memory help and exit 0
 borhan memory list [--json]             # ULID, created, name, counts, languages, description
 borhan memory update <NAME> \
                   [--description T] [--languages L] [--json]
@@ -695,12 +419,10 @@ borhan memory add <NAME> <TEXT> \
                   --session S [--message M]
                   [--role user|assistant|tool] [--author N] [--ts MS]
                   [--json]              # split into units, index, print the message ULID
-borhan memory get <NAME> <ULID>... \
-                  [--json]              # units back, in the order asked
 borhan memory search <NAME> <GROUPS>... \
                   [--limit N] [--json]  # concept groups, coverage, cursor
-borhan memory cursor <NAME> <ULID> \
-                  [--before N] [--after N] [--json]
+borhan memory cursor <NAME> <ULID>... \
+                  [--before N] [--after N] [--messages] [--json]
 borhan memory lexicon <NAME> <WORDS>... [--json]
 borhan memory rescan <NAME> [--json]
 ```
@@ -712,103 +434,117 @@ Text mode does not print stats on stdout.
 SQLite and the tantivy index, prints the message ULID on stdout and the unit
 count on stderr.
 
-`memory get` takes unit ULIDs and prints them back in the order asked. An id
-that resolves to nothing is named on stderr, one line each.
+### One reader
 
-The same command **walks** when given `--session`, `--message` or `--paragraph`
-instead of ULIDs, which is how you read *around* a hit rather than only at it:
-`--session S` gives that session's messages, `--session S --message M` gives
-that message's paragraphs, `--paragraph ULID` gives that paragraph's sentences.
-`--from` and `--count` are a window in reading order, defaulting to `0` and
-`20`, because a session can hold a whole corpus and a message a whole document.
-**ULIDs and walking are mutually exclusive** and asking for both is an error
-naming the two things it could have meant — validated in Rust rather than with
-a clap group, so the message can say what to do instead.
+`memory cursor` is the only way to read stored text back, at every width a
+caller might want it: `--before 0 --after 0` is the unit itself, the default of
+two is the paragraphs either side, and `--messages` counts the window in whole
+messages instead. There is deliberately no second command for reading a unit by
+id, because two readers taking the same ULID — which is what `memory get` was —
+made every caller stop and pick one, and a model picking between them picks
+wrong.
 
-**Every hit carries the feeder's `session` and `message` identifiers**, whatever
-layer it is: a paragraph and a sentence inherit both from the message they were
-split out of, and `add` requires them on every message — which, over the CLI, is
-every `add`, since `--type` defaults to `message`. Those two columns are the
-join back to whatever fed borhan in the first place, so a result can be turned
-into the surrounding conversation without a second query here. They are sized to
-their contents, like `memory list`'s columns, because a session id is a UUID in
-one deployment and a filename in another.
+**The window is counted in units, not messages.** A unit is a thirtieth of a
+message in a corpus fed from PDFs (2 577 bytes against 84 in `teletriage_fa`,
+6 967 against 133 in `rfcs`), so pulling the whole page to re-read one paragraph
+costs eleven to forty times the context for text the caller did not ask for.
+`--messages` is still there for when the paragraph does not say who was talking,
+and it costs what it always did.
 
-`memory search` prints one line per hit —
-`score  type  id  session  message  paragraph  sentence  words  text` — followed
-by a blank line, because a hundred words of preview wraps and without the gap a
-ranking reads as one block of text. **All four ids go out**, so a row says where
-it sits without a second query; a `-` is a layer the hit is *above*, not one
-that is missing, so a paragraph has no sentence and a message has neither.
+Several cursors are read in one call and the windows merged, because a page of
+hits is one question and over MCP each call is another turn of the model. A
+cursor this memory no longer holds comes back in `missing_list` rather than
+failing the read — a batch carried over from an older result set should read the
+ones that still resolve — while a string that is not a ULID at all is a `400`,
+because that is the caller malformed rather than the memory changed.
 
-The text is cut at `PREVIEW_WORDS` (100) with an `…` — enough that a sentence
-and most paragraphs arrive whole, few enough that a message, which is a whole
-document, does not bury the hits under it. **The word count is the size of the
-whole row, not of the preview.** The preview keeps the spacing it was stored
-with, with `\n`, `\r` and `\t` escaped, so a code block still reads as a code
-block while the hit stays one line and the columns stay lined up.
+Results are grouped by message: the fields that say *where* a unit sits are
+identical for every unit of a message, and a whole-message window is 122 units
+in `teletriage_fa`. Flat, that response was 57 KB of JSON around 5 KB of text.
+Each message carries its `unit_list` — the ids are what a caller passes back to
+move again — or its `body` when the window was counted in messages, where those
+ids would buy nothing.
 
-**The first row is the nearest**, said explicitly with a sort rather than taken
-on trust: LanceDB returns one batch per partition, and the floor, the duplicate
-check and the page all treat the first row they see as the best one.
+**A widened read writes nothing.** Whether the window was widened is a field on
+the stderr line and nothing else; `cursor` touches no table, the same as
+`search`.
 
-Three things narrow what gets printed, in this order:
+**A hit and a cursor row spell their ids the same way.** In both, `session` and
+`message` are ULIDs — what another call accepts, and `session` is exactly what
+the `session` filter of the next search wants — while `session_ref` and
+`message_ref` are the feeder's own names, which are what the text columns show
+and what nothing accepts as input. They used to be spelled the opposite way
+round on a search hit, so `hit.session` could not be fed back into a search at
+all. Two fields with one name meaning two things is the same failure as two
+tools taking one identifier.
 
-- **`--max-distance D` drops anything further than `D`.** No default, because
-  what counts as far depends on the model and on what is stored — on
-  rust-lang/rfcs with the built-in model, right answers landed at 0.13–0.28 and
-  beginner-phrased misses at a median of 0.50, so a floor near 0.45 separates
-  them. Everything being past the floor prints its own sentence, which is not
-  the same as the memory being empty and does not say so.
-- **The same text twice is one answer**, however many rows hold it. A corpus
-  repeats a line of code, a licence header, a stock sentence; each copy is its
-  own row with its own vector. The nearest copy survives, since the sort already
-  put it first.
-- **`OVERFETCH` (3) × `--limit` is what LanceDB is actually asked for**, so the
-  rows those two steps throw away come out of the surplus instead of out of the
-  page. Asking for exactly `--limit` and then dropping some is how a full page
-  turns into four rows.
+### What the text output looks like
 
-The header goes to stderr and the rows to stdout, as in `memory
-list`, so a pipe reads results and nothing else. When the
-memory has nothing stored under that model, stdout stays empty and the sentence
-goes to stderr. An empty result really does mean empty: there is no
-distance floor, so a search returns everything it has up to `--limit`. Searching
-with a different `--model` than you stored with finds nothing — the vectors are
-in another table — and that is what the message says.
+`memory search` prints two lines per hit under a header naming the columns:
 
-`memory create` prints the ULID on stdout and nothing else, so it pipes.
+```
+score  cover  cursor  session  message  size  matched
+"the best sentence of that unit, quoted"
+```
 
-`memory list` prints one aligned line per memory and nothing else; with no
-memories stdout stays empty and the sentence goes to stderr, so a pipe reads an
-empty list rather than prose. The description column is the first line of the
-description, cut at `SUMMARY_LIMIT` characters with a `…` — a listing is a
-summary, and one memory has to stay one row.
+- **`cover` before `score`.** Coverage is a fact — groups matched over groups
+  asked. The score is squashed to `0..1` against the top hit of *this* query and
+  orders these hits and nothing else.
+- **`matched` marks a nearby group with `~`.** A bare label means the word is in
+  the quoted line; `~` means it was reached through the surrounding units of the
+  same message. It still counts toward coverage — it is still evidence — but
+  quoting the line for it would be wrong. See `matched_cell` in `main.rs`.
+- The `session` and `message` columns are the feeder's refs, sized to their
+  contents like `memory list`'s columns, because a session id is a UUID in one
+  deployment and a filename in another.
+- The preview is cut at `PREVIEW_WORDS` (60) with an `…`, keeps the spacing it
+  was stored with, and escapes `\n`, `\r` and `\t` so a code block still reads
+  as a code block while the hit stays one line.
 
-`do` is a Rust keyword, hence `#[command(name = "do")]` on the `Do` variant.
+**Hits go to stdout and nothing else does.** The header, the unknown-word lines,
+`No hits.` and the closing vocabulary line all go to stderr, so a pipeline
+reading stdout receives only results. `memory create` prints the ULID and
+nothing else, so it pipes. `memory list` prints one aligned line per memory;
+with no memories stdout stays empty and the sentence goes to stderr, so a pipe
+reads an empty list rather than prose.
+
+**Read the unknown-word lines.** `unknown: "cva" (group "dx") matched nothing`
+is the difference between "this memory disagrees with you" and "this memory has
+never heard that word", and only the second is a reason to search again with
+different wording. The closing `also in these results:` line is the frequent
+terms these hits share that were not asked for — the cheapest source of a better
+second query, and how a caller learns that the corpus says `x-ray` where they
+said `radiograph`. Both come back as lemmas.
 
 ## Layout
 
 ```
-src/main.rs                          CLI + runtime setup. See the rule at the top.
-src/ulid.rs                          Ulid, the primary key everywhere
-src/storage.rs                       SQLite + LanceDB: the storage directory, both stores
-src/embedding/mod.rs                 Embedding trait, both impls, Error
-src/embedding/potion-retrieval-32M/  Committed model, embedded via include_bytes!
-Makefile                             Every build/check entry point. Use it, not cargo.
-scripts/fetch-model.sh               Fetches a model dir (via `make model`)
-scripts/fetch-seed.sh                Clones the seed corpus (via `make seed-fetch`)
-models/                              Test-fixture models (gitignored)
-seed/                                Corpus cloned by `make seed` (gitignored)
-home/                                BORHAN_HOME for `make seed` (gitignored)
-build/                               Named binaries from make dev/release (gitignored)
+src/main.rs        CLI, clap derive, logging setup, the HTTP client half. See the rule at the top.
+src/api.rs         Every operation, and the axum router that serves them
+src/mcp.rs         MCP over the HTTP server, at POST /mcp
+src/guide.md       The REST guide, served verbatim at GET /. Not code — prose, include_str!'d
+src/storage.rs     SQLite: the memory directory, the schema, add/locate/around
+src/index.rs       The tantivy schema, the writer and the reader
+src/search.rs      Groups, coverage, scoring, snippets, hints
+src/normalize.rs   NFC, ZWNJ, ک/ی folding, Persian affixes, Snowball English
+src/ulid.rs        Ulid, the primary key everywhere
+Makefile           Every build/check entry point. Use it, not cargo.
+scripts/           Corpus fetchers, called by the seed targets
+seed/              Corpus cloned by `make seed` (gitignored)
+home/              BORHAN_HOME for `make seed` (gitignored)
+build/             Named binaries from make dev/release (gitignored)
 ```
 
-`main.rs` holds: `CommandLine`/`Command`/`InitCommand`/`MemoryCommand`/
-`EmbeddingCommand` (clap derive), the `Remote`/`Server` configuration structs
-(serde derive), `logging_level()`,
+`src/guide.md` is the one non-Rust file under `src/`, and it is there rather
+than in a `docs/` directory because `include_str!` resolves relative to the file
+that calls it: the guide compiles into the binary, so a `serve` running from a
+copied binary on a machine with no repository still serves it.
+
+`main.rs` holds: `CommandLine`/`Command`/`InitCommand`/`MemoryCommand` (clap
+derive), the `Server` configuration struct (serde derive), `logging_level()`,
 `default_home_directory()` (with the vendored `dirs` logic inlined into it),
-`read_configuration()`, `check_storage()`, and `main()`.
+`read_configuration()`, `check_storage()`, `probe_server()`, the printers, and
+`main()`.
 
 `--home` defaults to `~/.borhan` (`$HOME` on Unix, `%USERPROFILE%` on Windows);
 see the Home directory section for what lives inside it.
@@ -836,7 +572,7 @@ deviation.** Do not vendor silently.
   `fn main() -> anyhow::Result<()>`, so every fallible call is just `?` plus
   `.context(...)`/`.with_context(...)` — never hand-roll a source-chain walker,
   and never convert errors to `String` to propagate them. Module-level errors
-  are `thiserror` enums with `#[source]` (see `embedding::Error`); they convert
+  are `thiserror` enums with `#[source]` (see `storage::Error`); they convert
   into `anyhow::Error` through `?` for free, and `main`'s `Debug` output prints
   the whole `Caused by:` chain.
 
@@ -853,7 +589,9 @@ deviation.** Do not vendor silently.
 
 ## Testing
 
-No `#[cfg(test)]` blocks in `src/` — ever. All tests live in `tests/`. Naming:
+No `#[cfg(test)]` blocks in `src/` — ever. All tests live in `tests/`, and there
+are none yet, so `make test` currently proves only that the crate builds under
+the test profile. Naming:
 module `x` → `tests/x.rs`; submodule `a::b` → `tests/a_b.rs`. A test needing a
 private item with no public path is deleted, not kept inline and not exposed via
 a new `pub`.
@@ -915,7 +653,7 @@ letter. Additional structured fields follow as `key=value` pairs. Use `?` for
 tracing::info!(msg = "Created storage directory", directory = ?settings.storage_directory);
 tracing::warn!(msg = "Skipped unreadable memory file", path = ?path, error = %error);
 tracing::debug!(msg = "Embedding batch", count = texts.len(), dimensions = DIM);
-tracing::trace!(msg = "Committed vectors", table = "memory", rows = batch.num_rows());
+tracing::trace!(msg = "Committed units", table = "unit", rows = written.units.len());
 ```
 
 Because `--quiet` sets `OFF`, never rely on a log line to communicate something

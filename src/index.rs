@@ -32,6 +32,7 @@
 //! measure a span between a group that matched exactly and one that matched
 //! after folding.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tantivy::schema::{
@@ -347,6 +348,24 @@ impl Index {
     }
 
     /// Throw the whole index away, for `rescan`.
+    /// Drop every unit of one session.
+    ///
+    /// By term, which is why `session` is an indexed field at all beyond the
+    /// search filter it was added for. A unit carries no message term, so this
+    /// is the narrowest thing the index can be asked to forget — narrower than
+    /// [`Index::clear`], and the reason `replace` rewrites a session rather
+    /// than rebuilding a memory.
+    ///
+    /// Deletion in tantivy is not visible until a commit, and the caller has
+    /// the writer, so this does not commit: the delete and the units that
+    /// replace it belong in one commit, or a crash between them leaves the
+    /// session missing from the index rather than merely out of date.
+    pub fn forget(&self, writer: &IndexWriter, session: Ulid) -> Result<(), Error> {
+        let term = Term::from_field_text(self.fields.session, &session.to_string());
+        writer.delete_term(term);
+        Ok(())
+    }
+
     pub fn clear(&self, writer: &mut IndexWriter) -> Result<(), Error> {
         if let Err(source) = writer.delete_all_documents() {
             return Err(Error::Write {
@@ -401,5 +420,80 @@ impl Index {
             }
         }
         Ok(None)
+    }
+
+    /// The memory's own vocabulary: the lemmas it uses most, minus the ones it
+    /// uses everywhere.
+    ///
+    /// What a caller about to search is missing is not the ranking rules but
+    /// the words. A memory of Persian tele-triage transcripts answers to `تب`
+    /// and not to `fever`, and nothing in its description says so — the
+    /// description was written by whoever created the memory, the vocabulary
+    /// was written by whoever filled it. Reading this before writing a query is
+    /// the difference between one shot in the dark and an informed one, which
+    /// is the same argument the lexicon and the hints already make.
+    ///
+    /// The ceiling is [`CONTEXT_CEILING`], reused rather than picked again
+    /// because the question is identical: a lemma present in a seventh of the
+    /// units names the corpus and not anything inside it, and a list headed by
+    /// `و` and `the` tells a caller nothing it could search for.
+    pub fn vocabulary(&self, limit: usize) -> Result<Vec<(String, u64)>, Error> {
+        let searcher = self.reader.searcher();
+        // Zero units is an empty memory, and an empty memory has an empty
+        // vocabulary — the ceiling below would be zero and exclude every term
+        // there is, which is the right answer arrived at the wrong way.
+        let ceiling = ((searcher.num_docs() as f64) * CONTEXT_CEILING) as u64;
+        if ceiling == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for reader in searcher.segment_readers() {
+            let inverted = match reader.inverted_index(self.fields.lemma) {
+                Ok(inverted) => inverted,
+                Err(source) => {
+                    return Err(Error::Read {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+            };
+            let mut stream = match inverted.terms().stream() {
+                Ok(stream) => stream,
+                Err(source) => {
+                    return Err(Error::Read {
+                        path: self.path.clone(),
+                        source: tantivy::TantivyError::from(source),
+                    });
+                }
+            };
+            // Summed across segments rather than read off one: a unit lives in
+            // exactly one segment, so the sum over segments *is* the index-wide
+            // document frequency. It counts units deleted but not yet merged
+            // away, which for an ordering of the hundred commonest words is
+            // noise rather than error.
+            while stream.advance() {
+                let Ok(word) = std::str::from_utf8(stream.key()) else {
+                    continue;
+                };
+                let frequency = counts.entry(word.to_string()).or_insert(0);
+                *frequency += stream.value().doc_freq as u64;
+            }
+        }
+
+        let mut words: Vec<(String, u64)> = Vec::new();
+        for (word, frequency) in counts {
+            if frequency > ceiling {
+                continue;
+            }
+            words.push((word, frequency));
+        }
+        // Frequency descending, then the word itself, so that two lemmas with
+        // the same count come out in the same order on every call. A resource a
+        // client is entitled to cache must not change because a `HashMap`
+        // iterated differently this time.
+        words.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        words.truncate(limit);
+        Ok(words)
     }
 }

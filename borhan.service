@@ -1,0 +1,37 @@
+# systemd unit for `borhan serve`, installed by `sudo make systemd-install`.
+#
+# This is a template, not a unit: @USER@, @GROUP@ and @HOME@ are substituted by
+# that target and the result is written to /etc/systemd/system/borhan.service.
+# @HOME@ is the borhan home directory — the `--home` every borhan command
+# reads — which the target resolves to ~/.borhan of the user who ran sudo, so
+# the served store is the same one that user's own `borhan` commands open.
+
+[Unit]
+Description=borhan memory store
+Documentation=https://github.com/pouriya/borhan
+After=network.target
+
+[Service]
+Type=exec
+User=@USER@
+Group=@GROUP@
+
+# Creates the storage the first time and rebuilds every memory's index on the
+# ones after, so a unit started against a store written by an older normalizer
+# serves an index that matches it rather than one that silently misses.
+ExecStartPre=/usr/local/bin/borhan --home @HOME@ init
+
+ExecStart=/usr/local/bin/borhan --home @HOME@ serve
+
+Restart=on-failure
+RestartSec=5
+
+# Nothing outside @HOME@ is written, so everything else can be read-only.
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@HOME@
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

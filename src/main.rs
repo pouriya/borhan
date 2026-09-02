@@ -1,5 +1,6 @@
 mod api;
 mod index;
+mod mcp;
 mod normalize;
 mod search;
 mod storage;
@@ -15,12 +16,11 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{filter::LevelFilter, fmt};
 
 use crate::index::Index;
 use crate::search::{Filter, Group};
-use crate::storage::{Entry, Role, Storage};
+use crate::storage::{Entry, Revision, Role, Storage};
 use crate::ulid::Ulid;
 
 /// Name of the environment variable holding the user's home directory.
@@ -41,9 +41,12 @@ const DEFAULT_HOME_DIRECTORY: &str = ".borhan";
 //       storage/            One directory per memory. Created by `init`.
 //         <name>/borhan.db  The messages. Never derived, never rebuilt.
 //         <name>/index/     The tantivy index. Entirely derived; `rescan` fodder.
-//       server.toml         Listen address and token. Written by `init server`.
-//                           `serve` binds it; the CLI probes it and talks HTTP
-//                           when that process answers, otherwise opens storage.
+//       server.toml         Listen address, token and permissions. Written by
+//                           `init server`. `serve` binds it; the CLI probes it
+//                           and talks HTTP when that process answers, otherwise
+//                           opens storage. The permissions bind only the served
+//                           process — a local command is doing what its user
+//                           could already do to these files by hand.
 //
 // None of it is created implicitly: `init` is the only thing that writes the
 // layout, so a missing directory always means "this machine was never set up",
@@ -52,12 +55,30 @@ const STORAGE_DIRECTORY: &str = "storage";
 const SERVER_CONFIGURATION: &str = "server.toml";
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// A skill is the one thing borhan writes outside `--home`, and it has to be.
+// It is not borhan's data: it is a file another program reads, and that program
+// looks in its own configuration directory and nowhere else. Putting it under
+// `--home` would be tidy and would mean no agent ever loads it.
+//
+// Both names below are the agent-skill convention rather than borhan's choice:
+// `<root>/skills/<name>/SKILL.md`, with the frontmatter at the top of the file
+// naming the skill again.
+const SKILL_DIRECTORY: &str = "skills";
+const SKILL_FILE: &str = "SKILL.md";
+
+/// Name of the remember skill on disk, and the slash command it becomes.
+///
+/// Prefixed, unlike the subcommand that prints it. `borhan skills remember` is
+/// unambiguous because `borhan` is already on the line; `/remember`, in an agent
+/// carrying a dozen other tools' skills, is not.
+const REMEMBER_SKILL: &str = "borhan-remember";
+
+/// Name of the survey skill on disk, and the slash command it becomes. Prefixed
+/// for the same reason as [`REMEMBER_SKILL`].
+const SURVEY_SKILL: &str = "borhan-survey";
+
 /// Where `serve` listens when `server.toml` does not say otherwise.
 const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:1995";
-
-/// Characters of a description `memory list` shows before cutting it off. The
-/// listing is one line per memory, so the full text is not what is wanted here.
-const SUMMARY_LIMIT: usize = 60;
 
 /// Words of a snippet shown on one line of `memory search` results.
 ///
@@ -68,31 +89,83 @@ const SUMMARY_LIMIT: usize = 60;
 /// hit has to stay one line for the columns beside it to line up.
 const PREVIEW_WORDS: usize = 60;
 
-/// Memory store: a SQLite source of truth under a tantivy index.
+/// Keyword memory over stored conversations, for text that mixes Persian and
+/// English in the same sentence.
 ///
-/// A memory holds messages. Every message is split into units — a paragraph, a
-/// heading, a list item, a table row, a fenced code block — and a unit is what
-/// search scores and returns. Nothing is created implicitly: `borhan init`
-/// writes the layout, and every command reads `--home`, or `BORHAN_HOME`,
-/// which defaults to `~/.borhan`.
+/// borhan stores messages, splits them into paragraph-sized units and searches
+/// those units by concept. It does not summarize, does not answer questions and
+/// does not embed anything: what comes back is stored text and the address of
+/// where it sits. A SQLite source of truth under a tantivy index.
 ///
-/// If none of this is familiar yet, the order to work in is:
+/// WHAT IS STORED
 ///
-/// `memory list` — what memories exist, how large each is, and which languages
-/// it was tagged with.
+/// A **memory** is a named corpus with a description saying what is in it and
+/// what is not. It holds **sessions** — a thread, a channel, a document set —
+/// which hold **messages**, one turn or one page each. Every message is split
+/// into **units**: a paragraph, a heading, a list item, a table row, a fenced
+/// code block. A unit is what search scores and returns, and its ULID is the
+/// `cursor` that reads it back. That ULID is the only address worth keeping.
 ///
-/// `memory lexicon <name> <words>…` — whether the words you are about to
-/// search for are in that memory at all, and what they fold to. This is the
-/// step most callers skip and should not: a search for a word the memory has
-/// never seen returns other things rather than nothing, and a result set full
-/// of other things looks exactly like a result set full of answers.
+/// THE LOOP
 ///
-/// `memory search <name> <groups>…` — concept groups, not a sentence.
+/// Four commands, in this order. Skipping the second is the most common way to
+/// end up with a result set that looks like answers and is not.
 ///
-/// `memory cursor <name> <cursor>` — read the messages around a hit, once
-/// search has told you where to look.
+/// (1) `memory list` — what memories exist, how large each is, which languages
+/// it was tagged with, and what its description says it does *not* hold.
 ///
-/// `memory get <name> <ids>…` — the full text of units, by id.
+/// (2) `memory lexicon <name> <words>…` — whether the words you are about to
+/// search for are in that memory at all, and what they fold to. A search for a
+/// word the memory has never seen returns other things rather than nothing,
+/// and a result set full of other things looks exactly like one full of
+/// answers.
+///
+/// (3) `memory search <name> <groups>…` — concept groups, not a sentence. A
+/// group is one idea spelled every way this corpus might spell it; separate
+/// groups are separate things being asked about.
+///
+/// (4) `memory cursor <name> <cursor>…` — read the hits back, at the width the
+/// question needs: the unit itself, the units around it, or the whole messages
+/// they came from. There is one reader, not one per depth.
+///
+/// A WORKED EXAMPLE
+///
+/// borhan memory list
+///
+/// borhan memory lexicon rfcs borrow mutable alias radiograph
+///
+/// borhan memory search rfcs borrow,borrowed,borrowing mutable,mutably,mut '!alias,aliasing'
+///
+/// borhan memory cursor rfcs 01M1BKH0YQ7YR34K2FKG3S4B0M --before 2 --after 2
+///
+/// Every command takes `--json` and prints exactly the object the HTTP API
+/// returns. Full prose for each one is under `--help`, and `memory search
+/// --help` and `memory cursor --help` are worth reading once before the first
+/// query — they are where the rules that decide whether a search works are
+/// written down.
+///
+/// THREE WAYS IN, ONE SET OF OPERATIONS
+///
+/// This command line is one of three surfaces over the same functions, so
+/// nothing below is reachable from only one of them:
+///
+/// **MCP** — `borhan serve` speaks the Model Context Protocol at `POST /mcp`.
+/// If your client can be configured with an MCP server, prefer it: the tool
+/// schemas carry this guidance where the model will actually read it.
+///
+/// **This CLI** — `borhan <command> --help` at every level. Nothing is
+/// abbreviated: `-h` and `--help` print the same long text.
+///
+/// **HTTP** — `borhan serve`, then `GET /` returns the whole REST API as
+/// Markdown, with a `curl` line per endpoint and no token required to read it.
+///
+/// WHERE IT LIVES
+///
+/// Everything borhan owns sits under `--home`, or `BORHAN_HOME`, which defaults
+/// to `~/.borhan`, and nothing sits outside it. **Nothing is created
+/// implicitly**: `borhan init` writes the layout, so a missing storage
+/// directory always means "this machine was never set up", never "it was set up
+/// somewhere you did not look".
 #[derive(Debug, Clone, Parser)]
 #[command(version, author, disable_help_flag = true)]
 pub struct CommandLine {
@@ -126,8 +199,11 @@ pub struct CommandLine {
     #[arg(short = 'h', long = "help", global = true, action = clap::ArgAction::HelpLong)]
     pub help: Option<bool>,
 
+    /// Absent prints this text. There is no implicit command: a bare `borhan`
+    /// is someone who does not know what this is yet, and the answer to that
+    /// is the guide, not a listing.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -138,19 +214,253 @@ pub enum Command {
         command: Option<InitCommand>,
     },
 
-    /// Serve the HTTP API that remote clients talk to.
+    /// Serve the HTTP API, and MCP over it, at the address in `server.toml`.
+    ///
+    /// Three things answer on that port. `/api/v1/…` is the REST API this
+    /// command line talks to. `POST /mcp` is the Model Context Protocol, over
+    /// the same operations and behind the same token. `GET /` is the whole REST
+    /// API written out as Markdown — a `curl` line per endpoint — and it is the
+    /// one route served without a token, so an agent handed nothing but an
+    /// address can read it before it knows a token is wanted.
+    ///
+    /// Address, token and permissions come from `<home>/server.toml`, written
+    /// by `init server`. Without that file it binds `127.0.0.1:1995` with no
+    /// token and everything but `delete` permitted.
+    ///
+    /// While it is running, every `memory` command on this machine goes through
+    /// it instead of opening storage directly — the CLI probes the same address
+    /// and uses HTTP when something answers.
     Serve,
 
-    /// Work with the memories themselves.
+    /// Work with the memories themselves. Given no subcommand, prints this.
+    ///
+    /// Read a memory, in four commands, in this order:
+    ///
+    /// borhan memory list
+    ///
+    /// borhan memory lexicon <NAME> <WORDS>...
+    ///
+    /// borhan memory search <NAME> <GROUPS>...
+    ///
+    /// borhan memory cursor <NAME> <CURSORS>...
+    ///
+    /// `list` says which memories exist and what each one's description claims
+    /// it holds and does not hold. `lexicon` says whether your words exist in
+    /// that corpus before you spend a query on them — a word with a lemma count
+    /// of 0 has never been seen there, and searching for it returns other
+    /// things rather than nothing. `search` takes concept groups, never a
+    /// sentence. `cursor` reads the hits back at whatever width the question
+    /// needs, and is the only reader.
+    ///
+    /// Write to a memory with three more:
+    ///
+    /// borhan memory create <NAME> --description "..." [--languages fa,en]
+    ///
+    /// borhan memory add <NAME> <TEXT> --session S [--message M] [--role user|assistant|tool]
+    ///
+    /// borhan memory rescan <NAME>
+    ///
+    /// `create` needs a description of more than ten words, because it is what
+    /// a later caller reads to decide whether a question belongs here. `add`
+    /// reads its text as Markdown and splits it into units. `rescan` rebuilds
+    /// the index from the stored messages, which is the supported way to pick
+    /// up a change to the splitter or the normalizer. `update` changes a
+    /// description or the language tags; `delete` destroys a memory and is the
+    /// one command here that cannot be undone.
+    ///
+    /// A WORKED EXAMPLE
+    ///
+    /// borhan memory lexicon rfcs borrow mutable alias
+    ///
+    /// borhan memory search rfcs borrow,borrowed,borrowing mutable,mutably,mut '!alias,aliasing'
+    ///
+    /// borhan memory cursor rfcs 01M1BKH0YQ7YR34K2FKG3S4B0M
+    ///
+    /// The third field of a hit's first line is its `cursor`; that is what the
+    /// last command takes, and several of them can be read in one call.
+    ///
+    /// Every subcommand takes `--json` and prints exactly the object the HTTP
+    /// API returns, pretty-printed. In text mode, results go to standard output
+    /// and everything else — headers, warnings, counts — goes to standard
+    /// error, so a pipeline reading stdout receives only results.
+    ///
+    /// Each subcommand's own `--help` is the full prose; `memory search --help`
+    /// and `memory cursor --help` are the two worth reading before the first
+    /// query.
     Memory {
         #[command(subcommand)]
         command: Option<MemoryCommand>,
     },
+
+    /// Print the skills borhan ships, or install them for the agents on this
+    /// machine. Given no subcommand, prints this.
+    ///
+    /// A skill is a Markdown file an agent reads to learn a workflow it was not
+    /// trained on. borhan ships them because the hard part of this tool is not
+    /// its API — that is in `--help` and in `GET /` — but knowing when to reach
+    /// for it and what is worth putting in, and neither of those fits in a tool
+    /// description.
+    ///
+    /// There is one so far:
+    ///
+    /// borhan skills remember             # print it
+    ///
+    /// borhan skills remember --install   # write it where the agents read
+    Skills {
+        #[command(subcommand)]
+        command: Option<SkillCommand>,
+    },
 }
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SkillCommand {
+    /// The end-of-conversation skill: read back over the session, pick what is
+    /// worth keeping, and store it.
+    ///
+    /// One half of a pair. `survey` describes a project's code in a session
+    /// named after the project; this records what happened in a session named
+    /// after the conversation. Same memory, never the same session — a result
+    /// line prints its session, and that is what tells a reader whether they
+    /// are looking at how the code works or at what was decided one afternoon.
+    ///
+    /// Printed to standard output as a complete `SKILL.md`, frontmatter
+    /// included, so redirecting it to a file gives a working skill and
+    /// `--install` is a convenience rather than the only way in.
+    ///
+    /// What it tells the agent, in short. Find borhan: MCP first, because the
+    /// tool schemas carry the argument rules where a model will read them, this
+    /// command line second, and if neither is there then stop and say so rather
+    /// than keeping it somewhere else. Check that storing is permitted
+    /// *before* composing anything, because a server without `add` in its
+    /// permissions does not list a writing tool at all and the discovery is
+    /// otherwise made after the work. Read `memory list` and ask the user which
+    /// memory to write to, every time. Keep decisions and the reasons for them
+    /// rather than transcript. And file each message under the session, role and
+    /// author it belongs to — the user and the agent are not the same author,
+    /// and a paraphrase stored as `role: user` answers a later question
+    /// confidently and wrongly.
+    ///
+    /// It takes memory names as its arguments — `/borhan-remember pouriya
+    /// project_borhan` — which say where, not what, and do not remove the
+    /// confirmation. A memory is a subject, so one conversation usually splits
+    /// across several of them, and making that split is most of the work.
+    Remember {
+        /// Write the skill to every agent on this machine instead of printing
+        /// it, replacing any copy already there.
+        ///
+        /// `~/.agents/skills` is written whether or not it exists already,
+        /// because it is the vendor-neutral path that more than one agent
+        /// reads. Every other root — `~/.claude`, `~/.codex`, `~/.hermes` — is
+        /// written only when it is already there, so an agent you do not run
+        /// never receives a tree it never asked for.
+        ///
+        /// Every destination is reported, including the ones skipped and why.
+        /// "opencode: covered" and "opencode: missing" look identical in
+        /// silence, and only one of them is fine.
+        #[arg(long)]
+        install: bool,
+    },
+
+    /// The codebase skill: read a project, then file what each part of it does
+    /// into a memory, one message per feature.
+    ///
+    /// What it tells the agent. Find borhan and check that both `add` and
+    /// `replace` are permitted before reading a single file, because a survey
+    /// is hours of reading that a `403` at the end throws away. Choose the
+    /// memory with the user — a codebase belongs in a memory about projects,
+    /// and if none exists, propose one and let the user write its description.
+    /// Name the session after the project, and check that name against
+    /// `memory outline` rather than against the filesystem: two clones of one
+    /// repo collide in the memory while looking unique on disk.
+    ///
+    /// Then the part that matters. If the project has been surveyed before,
+    /// `memory outline <memory> <session>` says what is already on file, and
+    /// the three answers are append what is new, replace what has gone stale,
+    /// and leave the rest alone — never wipe and start over. Each message is
+    /// one feature: what it does, how, where it lives and why it is that way.
+    /// Each *paragraph* has to stand alone, because a paragraph is the unit
+    /// search returns, and one that says "it does this by calling handle()"
+    /// names neither the feature nor the file and so answers nothing.
+    ///
+    /// It takes memory names as its arguments, the same as the remember skill,
+    /// and they say where rather than what. With none given, or with any doubt
+    /// about which session, both skills are told to list what exists and ask
+    /// with options — through a question tool where the agent has one, numbered
+    /// choices otherwise. Storing nothing is recoverable; storing in the wrong
+    /// place fails silently and surfaces months later as four answers to one
+    /// question.
+    Survey {
+        /// Write the skill to every agent on this machine instead of printing
+        /// it, replacing any copy already there. Same destinations and the same
+        /// report as `remember --install`.
+        #[arg(long)]
+        install: bool,
+    },
+}
+
+/// An agent that reads skills from a directory in the user's home.
+///
+/// opencode is on this list with nowhere of its own to write, on purpose: it
+/// reads `~/.agents/skills` and `~/.claude/skills` both, so a third copy under
+/// its own configuration directory would load the same skill twice and list it
+/// twice. It is named in the report rather than left out of it.
+struct SkillReader {
+    /// What the report calls it.
+    agent: &'static str,
+
+    /// Configuration root under the user's home. `None` means another entry
+    /// already covers this agent, and [`SkillReader::reason`] says how.
+    root: Option<&'static str>,
+
+    /// Create the tree even when `root` is not there yet.
+    always: bool,
+
+    /// Why nothing is written. Empty for every entry that has a `root`, which
+    /// is never the entry being explained.
+    reason: &'static str,
+}
+
+const SKILL_READERS: [SkillReader; 5] = [
+    SkillReader {
+        agent: "agents",
+        root: Some(".agents"),
+        always: true,
+        reason: "",
+    },
+    SkillReader {
+        agent: "claude",
+        root: Some(".claude"),
+        always: false,
+        reason: "",
+    },
+    SkillReader {
+        agent: "codex",
+        root: Some(".codex"),
+        always: false,
+        reason: "",
+    },
+    SkillReader {
+        agent: "hermes",
+        root: Some(".hermes"),
+        always: false,
+        reason: "",
+    },
+    SkillReader {
+        agent: "opencode",
+        root: None,
+        always: false,
+        reason: "reads ~/.agents/skills and ~/.claude/skills already, so a copy of \
+                 its own would load the same skill twice",
+    },
+];
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum InitCommand {
     /// Create the local storage. The default when `init` is given no subcommand.
+    ///
+    /// Safe to run again: an existing storage is not an error, and re-running
+    /// rebuilds the index of every memory in it from the stored messages, the
+    /// same work `memory rescan` does one memory at a time.
     Storage,
 
     /// Write `server.toml` so `serve` and the CLI share a listen address and token.
@@ -162,6 +472,16 @@ pub enum InitCommand {
         /// Token clients must present as `Authorization: Bearer`. Optional.
         #[arg(long)]
         token: Option<String>,
+
+        /// A store-changing operation `serve` may perform: `create`, `update`,
+        /// `add`, `rescan` or `delete`. Repeat the flag for each one.
+        ///
+        /// Omit it entirely and the key is left out of the file, which means
+        /// everything but `delete`. Pass it and the list is exactly what you
+        /// passed, so `--permission add` is a server that ingests and does
+        /// nothing else.
+        #[arg(long = "permission", value_name = "NAME")]
+        permissions: Vec<String>,
     },
 }
 
@@ -189,12 +509,11 @@ pub enum MemoryCommand {
         json: bool,
     },
 
-    /// List the memories, oldest first. The default when `memory` is given no
-    /// subcommand.
+    /// List the memories, oldest first.
     ///
-    /// One line per memory, six columns: the id, when it was created, the name,
-    /// what is in it, the language tags, and the description cut to 60
-    /// characters.
+    /// Two lines per memory: five columns — the id, when it was created, the
+    /// name, what is in it, the language tags — and under them the whole
+    /// description, uncut.
     ///
     /// The name is the first argument of every other subcommand. The language
     /// tags are a hint from whoever created the memory about which languages a
@@ -223,6 +542,36 @@ pub enum MemoryCommand {
         languages: Option<String>,
 
         /// Emit JSON instead of the ULID.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a memory: its messages, its index and its directory.
+    ///
+    /// Irreversible, and there is nothing to fall back on. `rescan` can rebuild
+    /// an index from the messages because the index is derived; nothing can
+    /// rebuild the messages, so this is the only command in the tool that
+    /// destroys something that was not a copy of something else.
+    ///
+    /// It therefore requires `--yes`. The flag is not a safety mechanism —
+    /// nothing here can tell a name you meant from a name you mistyped — it is
+    /// there so that deleting a memory cannot be a command you completed with a
+    /// shell history search and a return key.
+    ///
+    /// Against a server this needs the `delete` permission in `server.toml`; a
+    /// server without it answers 403 and nothing is removed. Locally there is
+    /// no permission to check: the files belong to whoever is running this.
+    ///
+    /// Prints the counts of what was destroyed, which is the last record of it.
+    Delete {
+        /// The memory to remove, by the name `memory list` prints.
+        name: String,
+
+        /// Required. Confirms that the memory and every message in it go.
+        #[arg(long)]
+        yes: bool,
+
+        /// Emit JSON instead of the counts.
         #[arg(long)]
         json: bool,
     },
@@ -268,20 +617,65 @@ pub enum MemoryCommand {
         json: bool,
     },
 
-    /// Print units back by id, in the order asked.
+    /// What a memory holds, without reading any of it.
     ///
-    /// A search result shows one sentence of a unit; this shows the unit.
+    /// With no session, every session in the memory. With one, that session's
+    /// messages — their ids, who wrote them, how long they are and how many
+    /// units they split into — and no bodies, so the answer stays readable
+    /// when a session runs to a hundred messages.
     ///
-    /// borhan memory get notes 01J8… 01J9…
-    Get {
-        /// The memory the units are in.
+    /// This is the question `memory search` cannot answer. Search finds text;
+    /// this asks what exists. Before storing something under a name, it is how
+    /// you find out whether that name is already taken and what is under it.
+    Outline {
+        /// The memory to look inside.
         name: String,
 
-        /// Unit ULIDs: the `cursor` column of a `memory search` result, which
-        /// is the third field of the first line of each hit.
-        ids: Vec<String>,
+        /// A session, by the id the `session` column prints. Omit for the
+        /// list of sessions.
+        session: Option<String>,
 
-        /// Emit JSON instead of text.
+        /// Emit JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rewrite a message that is already stored, keeping its place.
+    ///
+    /// For a description that has gone out of date: the thing it described
+    /// changed, so the text is now wrong, and adding a corrected copy beside it
+    /// would only mean a search returns both with nothing to tell them apart.
+    ///
+    /// In place, rather than by removing and re-adding: a message's ordinal
+    /// within its session is what makes `memory cursor` a range scan, so the
+    /// message keeps it and the units around it keep pointing at each other.
+    /// The old body is not kept anywhere.
+    ///
+    /// Both the session and the message have to exist already — this never
+    /// creates either, and `memory outline` is how you find out what they are
+    /// called. The timestamp is replaced too, because the text is new: a
+    /// correction that kept the old time would be ranked by recency as though
+    /// it were as old as the thing it corrected.
+    Replace {
+        /// The memory holding it.
+        name: String,
+
+        /// The new text, as Markdown.
+        text: String,
+
+        /// The session holding the message.
+        #[arg(long)]
+        session: String,
+
+        /// The message to rewrite, by the id it was stored under.
+        #[arg(long)]
+        message: String,
+
+        /// Unix milliseconds. Defaults to now.
+        #[arg(long)]
+        ts: Option<i64>,
+
+        /// Emit JSON instead of the ULID.
         #[arg(long)]
         json: bool,
     },
@@ -314,7 +708,7 @@ pub enum MemoryCommand {
     ///
     /// Two lines come back per hit, under a header that names the columns:
     ///
-    /// 0.847  2/3  01J8…  session  message  75 words  [site,sx]
+    /// 0.847  2/3  01J8…  session  message  75 words  [site,sx,~acuity]
     ///
     /// "the best sentence of the unit, quoted"
     ///
@@ -323,7 +717,15 @@ pub enum MemoryCommand {
     /// different search. `cover` is how many groups the unit matched out of how
     /// many were asked, and it is the more trustworthy of the two — prefer 3/3
     /// at a middling score over 1/3 at a high one. `cursor` is what both
-    /// `memory cursor` and `memory get` take.
+    /// `memory cursor` takes.
+    ///
+    /// `matched` names those groups. A bare label means the unit contains one
+    /// of that group's words, and you will find it in the quoted line. A `~`
+    /// in front means the group was reached only through the surrounding
+    /// units of the same message: the concept is somewhere in that message,
+    /// but not on this line, and quoting this line for it would be wrong. It
+    /// still counts toward `cover`, because it is still evidence — read it as
+    /// a pointer to `memory cursor` rather than as an answer.
     ///
     /// Hits go to standard output and nothing else does. The header, the
     /// unknown-word lines, `No hits.` and the closing vocabulary line all go to
@@ -358,7 +760,10 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = 2)]
         max_per_message: usize,
 
-        /// Confine the search to one session, by its ULID.
+        /// Confine the search to one session, by its ULID — which is what
+        /// the `session` field of a hit holds under `--json`. The `session`
+        /// *column* of the text output is the feeder's own name for it
+        /// (`session_ref`), and that is not accepted here.
         #[arg(long)]
         session: Option<String>,
 
@@ -376,33 +781,55 @@ pub enum MemoryCommand {
 
         /// Emit one JSON object holding `hit_list`, `unknown_list`, `hint_list`
         /// and `stats` instead of the table. All of it goes to standard output.
+        ///
+        /// Ids in a hit are spelled the way `memory cursor` spells them:
+        /// `session` and `message` are ULIDs and are what another call
+        /// accepts, `session_ref` and `message_ref` are the feeder's own
+        /// names and are what the text columns show.
         #[arg(long)]
         json: bool,
     },
 
-    /// Read the messages around a hit.
+    /// Read a hit back, at whatever width the question needs.
     ///
     /// The second half of the retrieval loop: recall a gist from a partial cue,
     /// then elaborate around it deliberately. No scoring and no snippets — the
     /// caller has already decided this region is worth reading.
     ///
-    /// borhan memory cursor notes 01J8… --before 2 --after 2
+    /// The window is counted in **units**, not messages, because a unit is a
+    /// thirtieth of a message in a corpus fed from PDFs and pulling the whole
+    /// page to re-read one paragraph is how a context window is wasted:
+    ///
+    /// borhan memory cursor notes 01J8…                     # the unit and two either side
+    ///
+    /// borhan memory cursor notes 01J8… --before 0 --after 0  # only that unit
+    ///
+    /// borhan memory cursor notes 01J8… --messages            # the whole messages instead
+    ///
+    /// Several cursors may be read at once and the windows are merged, so a
+    /// page of hits costs one call rather than one per hit. A cursor this
+    /// memory no longer holds is named on standard error rather than failing
+    /// the read.
     Cursor {
-        /// The memory the hit came from.
+        /// The memory the hits came from.
         name: String,
 
-        /// The `cursor` of a hit, as `memory search` printed it: the third
-        /// field of the first line of the hit.
-        cursor: String,
+        /// One or more `cursor` values, as `memory search` printed them: the
+        /// third field of the first line of each hit.
+        #[arg(required = true, num_args = 1..)]
+        cursors: Vec<String>,
 
-        /// Messages to include before the anchor. Whole messages, not units, so
-        /// `--before 0 --after 0` returns the one message the hit came from.
+        /// Units before each anchor, or messages before it with `--messages`.
         #[arg(long, default_value_t = 2)]
         before: i64,
 
-        /// Messages to include after the anchor.
+        /// Units after each anchor, or messages after it with `--messages`.
         #[arg(long, default_value_t = 2)]
         after: i64,
+
+        /// Count the window in whole messages and return every unit of them.
+        #[arg(long)]
+        messages: bool,
 
         /// Emit JSON instead of text.
         #[arg(long)]
@@ -475,6 +902,47 @@ pub struct Server {
     /// Token clients must present as `Authorization: Bearer`. Unset means open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+
+    /// Which store-changing operations `serve` will perform: any of `create`,
+    /// `update`, `add`, `rescan` and `delete`. Reads are not on the list and
+    /// are governed by `token`.
+    ///
+    /// The list is exact — `permissions = ["create", "delete"]` is a server
+    /// that will make a memory and destroy one and will not add a message to
+    /// either. Unset is the one loose case, and it means everything but
+    /// `delete`: a file written before this key existed said nothing about
+    /// deletion, and reading silence as consent to the one irreversible
+    /// operation is the wrong direction to be wrong in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<String>>,
+}
+
+impl Server {
+    /// Resolve [`Server::permissions`] into what the router checks.
+    ///
+    /// An unknown name is an error and not a warning. The consequence of
+    /// ignoring `["crate", "delete"]` is a server that refuses to create
+    /// anything and says so for the first time on a request some hours from
+    /// now, which is a long way from the typo that caused it.
+    fn permissions(&self) -> anyhow::Result<Vec<crate::api::Permission>> {
+        let Some(names) = &self.permissions else {
+            return Ok(crate::api::Permission::DEFAULT.to_vec());
+        };
+        let mut permissions = Vec::new();
+        for name in names {
+            match crate::api::Permission::parse(name) {
+                Some(permission) => permissions.push(permission),
+                None => {
+                    let known: Vec<&str> = crate::api::Permission::ALL
+                        .iter()
+                        .map(|permission| permission.as_str())
+                        .collect();
+                    anyhow::bail!("{name:?} in permissions is not one of {}", known.join(", "));
+                }
+            }
+        }
+        Ok(permissions)
+    }
 }
 
 impl CommandLine {
@@ -611,22 +1079,29 @@ fn preview(text: &str) -> String {
 ///    known-folder fallback, so the result is the same while keeping one code
 ///    path for every platform.
 fn default_home_directory() -> PathBuf {
-    let mut home = None;
-    if let Some(value) = env::var_os(HOME_VARIABLE)
-        && !value.is_empty()
-    {
-        home = Some(PathBuf::from(value));
-    }
-    if home.is_none() {
-        // Unix: getpwuid_r. Windows: SHGetKnownFolderPath(FOLDERID_Profile).
-        home = env::home_dir();
-    }
-    match home {
+    match user_home() {
         Some(home) => home.join(DEFAULT_HOME_DIRECTORY),
         // Neither the environment nor the OS gave us anything; fall back to a
         // path relative to the working directory so `--help` still renders.
         None => PathBuf::from(DEFAULT_HOME_DIRECTORY),
     }
+}
+
+/// The user's home directory itself, by the rule documented on
+/// [`default_home_directory`] above.
+///
+/// Separate from that function, rather than inlined into it, because
+/// `skills --install` wants the same directory for the opposite reason: it
+/// writes into the *other* programs' configuration, which sits beside
+/// `~/.borhan` and not inside it.
+fn user_home() -> Option<PathBuf> {
+    if let Some(value) = env::var_os(HOME_VARIABLE)
+        && !value.is_empty()
+    {
+        return Some(PathBuf::from(value));
+    }
+    // Unix: getpwuid_r. Windows: SHGetKnownFolderPath(FOLDERID_Profile).
+    env::home_dir()
 }
 
 /// Read one of the TOML files under `--home` into `T`.
@@ -678,16 +1153,47 @@ fn check_storage(home: &Path, storage: &Path, command: &str) -> anyhow::Result<(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let settings = CommandLine::parse();
+    let mut settings = CommandLine::parse();
+
+    // Before the subscriber, so that a help text is never interleaved with a
+    // log line. `print_long_help` and not the short form for the same reason
+    // `--help` is mapped to `HelpLong`: the reader here is as likely to be a
+    // model that has never run this before as a person who has, and the short
+    // form omits exactly what the first reader needs.
+    let Some(command) = settings.command.take() else {
+        <CommandLine as clap::CommandFactory>::command().print_long_help()?;
+        return Ok(());
+    };
 
     let level = settings.logging_level();
     let show_target = matches!(level, LevelFilter::DEBUG | LevelFilter::TRACE);
     let show_location = level == LevelFilter::TRACE;
+    // One line per thing that happened, and every line self-contained.
+    //
+    // No `FmtSpan`: those synthetic `new`/`close` events tripled the line count
+    // and carried a `message` of literally "close", which is nothing anybody
+    // can search for or alert on. A span here exists to name and nest the work,
+    // not to narrate its own lifetime; the one event a span emits before it
+    // closes already carries the durations.
+    //
+    // `spans` is kept and `span` dropped, which is the opposite of what the
+    // duplication suggests. Every field used to be written three times —
+    // flattened onto the event, again under `span`, and again under `spans` —
+    // but that was because the spans carried the measurements. They carry no
+    // fields now, only names, so `spans` costs about sixty bytes and buys the
+    // thing a trace view is for: the path the work took, `[http.server,
+    // memory.search]`, on the line that reports the result. `span` would just
+    // repeat the last element of it.
+    //
+    // Correlation does not depend on any of that: `trace_id` is set explicitly
+    // as a field on every event, so a Loki query is `{...} | json |
+    // trace_id = "..."` and needs no span context to have survived.
     fmt::Subscriber::builder()
         .with_max_level(level)
         .json()
         .flatten_event(true)
-        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_current_span(false)
+        .with_span_list(true)
         .log_internal_errors(true)
         .with_level(true)
         .with_file(show_location)
@@ -700,22 +1206,48 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = settings.home.join(STORAGE_DIRECTORY);
 
-    match settings.command {
+    match command {
         Command::Init { command } => match command.unwrap_or(InitCommand::Storage) {
             InitCommand::Storage => {
                 let existing = storage.is_dir();
                 fs::create_dir_all(&storage)
                     .with_context(|| format!("Could not create {storage:?}"))?;
-                tracing::info!(msg = "Initialized storage", directory = ?storage, existing = existing);
-                if existing {
-                    println!("Already initialized: {}", storage.display());
-                } else {
+                tracing::info!(directory = ?storage, existing = existing, "initialized storage");
+                if !existing {
                     println!("Initialized {}", storage.display());
+                    return Ok(());
+                }
+
+                // Re-initializing an existing storage is not an error and not a
+                // no-op: the directory being there says nothing about whether
+                // the indexes inside it were built by the normalizer that is
+                // about to read them. So a second `init` rebuilds every memory
+                // from its messages, which is what the systemd unit's
+                // `ExecStartPre` leans on — one line that sets a machine up the
+                // first time and keeps the indexes honest on every boot after.
+                println!("Already initialized: {}", storage.display());
+                let (memories, _) = crate::api::list(&storage, &Ulid::new()?)?;
+                for memory in &memories {
+                    let store = Storage::open(&storage, &memory.name)?;
+                    let built = Index::attach(&store.directory.join(crate::index::DIRECTORY))?;
+                    let writer = built.writer()?;
+                    let store = Mutex::new(store);
+                    let writer = Mutex::new(writer);
+                    let (messages, units, _) =
+                        crate::api::rescan(&store, &built, &writer, &memory.name, &Ulid::new()?)?;
+                    println!(
+                        "Rescanned {}: {messages} messages, {units} units",
+                        memory.name
+                    );
                 }
                 Ok(())
             }
 
-            InitCommand::Server { listen, token } => {
+            InitCommand::Server {
+                listen,
+                token,
+                permissions,
+            } => {
                 let server_configuration = settings.home.join(SERVER_CONFIGURATION);
                 if server_configuration.is_file() {
                     anyhow::bail!(
@@ -726,7 +1258,14 @@ async fn main() -> anyhow::Result<()> {
                 let server = Server {
                     listen: Some(listen.clone()),
                     token,
+                    permissions: match permissions.is_empty() {
+                        true => None,
+                        false => Some(permissions),
+                    },
                 };
+                // Parsed before the file is written, so a misspelled permission
+                // is a message here rather than a `serve` that will not start.
+                let allowed = server.permissions()?;
                 let configuration = match toml_edit::ser::to_string_pretty(&server) {
                     Ok(configuration) => configuration,
                     Err(error) => {
@@ -752,10 +1291,11 @@ async fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("Could not write {server_configuration:?}"))?;
 
                 tracing::info!(
-                    msg = "Initialized server configuration",
                     configuration = ?server_configuration,
                     listen = listen,
-                    token = server.token.is_some()
+                    token = server.token.is_some(),
+                    permissions = allowed.len(),
+                    "initialized server configuration",
                 );
                 println!(
                     "Initialized {} listening at {}",
@@ -773,23 +1313,32 @@ async fn main() -> anyhow::Result<()> {
             let mut server = Server::default();
             if server_configuration.is_file() {
                 server = read_configuration(&server_configuration)?;
-                tracing::debug!(msg = "Read server configuration", configuration = ?server_configuration);
+                tracing::debug!(configuration = ?server_configuration, "read server configuration");
             }
+            let permissions = server.permissions()?;
             let address = match server.listen {
                 Some(listen) => listen,
                 None => DEFAULT_LISTEN_ADDRESS.to_string(),
             };
 
-            let router =
-                crate::api::router(crate::api::App::new(storage.clone(), server.token.clone()));
+            let router = crate::api::router(crate::api::App::new(
+                storage.clone(),
+                server.token.clone(),
+                permissions.clone(),
+            ));
             let listener = tokio::net::TcpListener::bind(&address)
                 .await
                 .with_context(|| format!("Could not listen on {address}"))?;
+            let allowed: Vec<&str> = permissions
+                .iter()
+                .map(|permission| permission.as_str())
+                .collect();
             tracing::info!(
-                msg = "Started HTTP server",
-                address = address,
+                server.address = address,
                 storage = ?storage,
-                token = server.token.is_some()
+                token = server.token.is_some(),
+                permissions = allowed.join(","),
+                "started HTTP server",
             );
             axum::serve(listener, router)
                 .await
@@ -798,8 +1347,25 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Memory { command } => {
+            // No implicit `list`. Two readers of the same identifier is the
+            // mistake `memory get` was, and a bare verb that quietly does one
+            // of nine things is the same mistake spelled differently: the
+            // caller who typed it did not choose `list`, and the caller who
+            // needed to be told what the nine are gets a listing instead.
+            let Some(command) = command else {
+                // `build` first: until it runs, a subcommand fetched out of
+                // the tree has neither the propagated global options nor a
+                // `bin_name`, and prints `Usage: memory` — a command that does
+                // not exist — instead of `Usage: borhan memory`.
+                let mut root = <CommandLine as clap::CommandFactory>::command();
+                root.build();
+                match root.find_subcommand_mut("memory") {
+                    Some(memory) => memory.print_long_help()?,
+                    None => root.print_long_help()?,
+                }
+                return Ok(());
+            };
             let origin = probe_server(&settings.home)?;
-            let command = command.unwrap_or(MemoryCommand::List { json: false });
             match command {
                 MemoryCommand::Create {
                     name,
@@ -909,6 +1475,55 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
 
+                MemoryCommand::Delete { name, yes, json } => {
+                    if !yes {
+                        anyhow::bail!(
+                            "Refusing to delete {name:?} without --yes. This removes every \
+                             message in it and cannot be undone."
+                        );
+                    }
+                    if let Some((origin, token)) = &origin {
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "DELETE",
+                            &format!("/api/v1/memory/{name}"),
+                            None,
+                        )?;
+                        print_http(&response, json, |body| {
+                            print_deleted(
+                                body["name"].as_str().unwrap_or(&name),
+                                body["sessions"].as_u64().unwrap_or(0),
+                                body["messages"].as_u64().unwrap_or(0),
+                                body["units"].as_u64().unwrap_or(0),
+                            );
+                            Ok(())
+                        })?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory delete ...")?;
+                        let trace = Ulid::new()?;
+                        let (memory, stats) = crate::api::delete(&storage, &name, None, &trace)?;
+                        if json {
+                            print_pretty(&serde_json::json!({
+                                "id": memory.id.to_string(),
+                                "name": memory.name,
+                                "sessions": memory.sessions,
+                                "messages": memory.messages,
+                                "units": memory.units,
+                                "stats": stats,
+                            }))?;
+                        } else {
+                            print_deleted(
+                                &memory.name,
+                                memory.sessions,
+                                memory.messages,
+                                memory.units,
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+
                 MemoryCommand::Add {
                     name,
                     text,
@@ -991,43 +1606,100 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
 
-                MemoryCommand::Get { name, ids, json } => {
-                    if ids.is_empty() {
-                        anyhow::bail!("Pass at least one unit ULID to read back");
-                    }
+                MemoryCommand::Outline {
+                    name,
+                    session,
+                    json,
+                } => {
                     if let Some((origin, token)) = &origin {
+                        let mut payload = serde_json::json!({});
+                        if let Some(session) = &session {
+                            payload["session"] = serde_json::Value::String(session.clone());
+                        }
                         let response = request(
                             origin,
                             token.as_deref(),
                             "POST",
-                            &format!("/api/v1/memory/{name}/unit_list"),
-                            Some(serde_json::json!({ "id_list": ids })),
+                            &format!("/api/v1/memory/{name}/outline"),
+                            Some(payload),
                         )?;
-                        print_http(&response, json, print_units_json)?;
+                        print_http(&response, json, print_outline_json)?;
                     } else {
-                        check_storage(&settings.home, &storage, "memory get ...")?;
+                        check_storage(&settings.home, &storage, "memory outline ...")?;
                         let store = Storage::open(&storage, &name)?;
-                        let mut units = Vec::new();
-                        for id in &ids {
-                            match Ulid::parse(id) {
-                                Ok(id) => units.push(id),
-                                Err(error) => {
-                                    return Err(anyhow::Error::new(error)
-                                        .context(format!("{id:?} is not a ULID")));
-                                }
-                            }
-                        }
                         let trace = Ulid::new()?;
-                        let (located, stats) = crate::api::get(&store, &units, &name, &trace)?;
-                        for id in &units {
-                            if !located.iter().any(|row| row.unit == *id) {
-                                eprintln!("No unit {id}");
-                            }
-                        }
+                        let (outline, stats) =
+                            crate::api::outline(&store, &name, session.as_deref(), &trace)?;
                         if json {
-                            print_pretty(&crate::api::get_json(&located, &stats))?;
+                            print_pretty(&crate::api::outline_json(&outline, &stats))?;
                         } else {
-                            print_units(&located);
+                            print_outline(&outline);
+                        }
+                    }
+                    Ok(())
+                }
+
+                MemoryCommand::Replace {
+                    name,
+                    text,
+                    session,
+                    message,
+                    ts,
+                    json,
+                } => {
+                    if let Some((origin, token)) = &origin {
+                        let mut payload = serde_json::json!({
+                            "session": session,
+                            "message": message,
+                            "body": text,
+                        });
+                        if let Some(ts) = ts {
+                            payload["ts"] = serde_json::json!(ts);
+                        }
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/message"),
+                            Some(payload),
+                        )?;
+                        print_http(&response, json, |body| {
+                            if let Some(units) = body["units"].as_u64() {
+                                eprintln!("{units} units");
+                            }
+                            println!("{}", body["id"].as_str().unwrap_or(""));
+                            Ok(())
+                        })?;
+                    } else {
+                        check_storage(&settings.home, &storage, "memory replace ...")?;
+                        let store = Storage::open(&storage, &name)?;
+                        let built = Index::open(&store)?;
+                        let ts = match ts {
+                            Some(ts) => ts,
+                            None => Ulid::now(),
+                        };
+                        let writer = built.writer()?;
+                        let store = Mutex::new(store);
+                        let writer = Mutex::new(writer);
+                        let revision = Revision {
+                            session: &session,
+                            message: &message,
+                            ts,
+                            body: &text,
+                        };
+                        let trace = Ulid::new()?;
+                        let (id, units, reindexed, stats) =
+                            crate::api::replace(&store, &built, &writer, &revision, &name, &trace)?;
+                        if json {
+                            print_pretty(&serde_json::json!({
+                                "id": id.to_string(),
+                                "units": units,
+                                "reindexed": reindexed,
+                                "stats": stats,
+                            }))?;
+                        } else {
+                            eprintln!("{units} units, {reindexed} messages reindexed");
+                            println!("{id}");
                         }
                     }
                     Ok(())
@@ -1130,35 +1802,54 @@ async fn main() -> anyhow::Result<()> {
 
                 MemoryCommand::Cursor {
                     name,
-                    cursor,
+                    cursors,
                     before,
                     after,
+                    messages,
                     json,
                 } => {
+                    let body = serde_json::json!({
+                        "cursor_list": cursors,
+                        "before": before,
+                        "after": after,
+                        "messages": messages,
+                    });
                     if let Some((origin, token)) = &origin {
-                        let path = format!(
-                            "/api/v1/memory/{name}/cursor/{cursor}?before={before}&after={after}"
-                        );
-                        let response = request(origin, token.as_deref(), "GET", &path, None)?;
+                        let response = request(
+                            origin,
+                            token.as_deref(),
+                            "POST",
+                            &format!("/api/v1/memory/{name}/cursor"),
+                            Some(body),
+                        )?;
                         print_http(&response, json, print_cursor_json)?;
                     } else {
                         check_storage(&settings.home, &storage, "memory cursor ...")?;
-                        let unit = match Ulid::parse(&cursor) {
-                            Ok(unit) => unit,
-                            Err(error) => {
-                                return Err(anyhow::Error::new(error).context(format!(
-                                    "{cursor:?} is not a cursor from a search hit"
-                                )));
+                        let mut units = Vec::new();
+                        for cursor in &cursors {
+                            match Ulid::parse(cursor) {
+                                Ok(unit) => units.push(unit),
+                                Err(error) => {
+                                    return Err(anyhow::Error::new(error).context(format!(
+                                        "{cursor:?} is not a cursor from a search hit"
+                                    )));
+                                }
                             }
-                        };
+                        }
                         let store = Storage::open(&storage, &name)?;
                         let trace = Ulid::new()?;
-                        let (messages, stats) =
-                            crate::api::cursor(&store, &name, unit, before, after, &trace)?;
+                        let (rows, missing, stats) = crate::api::cursor(
+                            &store, &name, &units, before, after, messages, &trace,
+                        )?;
+                        for unit in &missing {
+                            eprintln!("No unit {unit}");
+                        }
                         if json {
-                            print_pretty(&crate::api::cursor_json(&messages, &stats))?;
+                            print_pretty(&crate::api::cursor_json(
+                                &rows, &units, &missing, messages, &stats,
+                            ))?;
                         } else {
-                            print_cursor(&messages);
+                            print_cursor(&rows, &units, messages);
                         }
                     }
                     Ok(())
@@ -1233,18 +1924,105 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        Command::Skills { command } => {
+            // Same reasoning as `memory`: no implicit subcommand. A bare
+            // `skills` is someone who does not yet know what is on offer, and
+            // quietly printing one of them is not the answer to that.
+            let Some(command) = command else {
+                let mut root = <CommandLine as clap::CommandFactory>::command();
+                root.build();
+                match root.find_subcommand_mut("skills") {
+                    Some(skills) => skills.print_long_help()?,
+                    None => root.print_long_help()?,
+                }
+                return Ok(());
+            };
+
+            // Both arms differ only in which file and which name, so the
+            // work is done once below rather than twice here. The pair is what
+            // makes that worth doing: with one skill an inlined loop was the
+            // simpler thing.
+            let (name, skill, install) = match command {
+                SkillCommand::Remember { install } => {
+                    // The whole file, frontmatter included, so that whether it
+                    // is redirected by hand or written by `--install` the
+                    // result is the same bytes.
+                    (REMEMBER_SKILL, include_str!("skills/remember.md"), install)
+                }
+                SkillCommand::Survey { install } => {
+                    (SURVEY_SKILL, include_str!("skills/survey.md"), install)
+                }
+            };
+            if !install {
+                print!("{skill}");
+                return Ok(());
+            }
+
+            let Some(home) = user_home() else {
+                anyhow::bail!(
+                    "Could not find your home directory, and --install writes into \
+                     the agent configuration directories under it. Set \
+                     {HOME_VARIABLE}, or place the skill yourself:\n\
+                     \n    borhan skills ... > \
+                     ~/.agents/{SKILL_DIRECTORY}/{name}/{SKILL_FILE}",
+                );
+            };
+
+            let mut installed = 0;
+            for reader in SKILL_READERS {
+                let Some(root) = reader.root else {
+                    println!("skipped    {:<9} {}", reader.agent, reader.reason);
+                    continue;
+                };
+                let root = home.join(root);
+                if !reader.always && !root.is_dir() {
+                    println!(
+                        "skipped    {:<9} {} is not there, so {} is not set up here",
+                        reader.agent,
+                        root.display(),
+                        reader.agent,
+                    );
+                    continue;
+                }
+
+                let directory = root.join(SKILL_DIRECTORY).join(name);
+                let file = directory.join(SKILL_FILE);
+                // Read before the write, because "replaced" and "installed"
+                // are the difference between a copy the user had edited and
+                // one they never had.
+                let replaced = file.is_file();
+                fs::create_dir_all(&directory)
+                    .with_context(|| format!("Could not create {directory:?}"))?;
+                fs::write(&file, skill).with_context(|| format!("Could not write {file:?}"))?;
+                installed += 1;
+                let verb = match replaced {
+                    true => "replaced",
+                    false => "installed",
+                };
+                println!("{verb:<10} {:<9} {}", reader.agent, file.display());
+            }
+
+            tracing::info!(skill = name, destinations = installed, "installed skill");
+            eprintln!();
+            eprintln!(
+                "{installed} destination(s). Each agent offers /{name} from its next \
+                 session; nothing under --home was touched.",
+            );
+            Ok(())
+        }
     }
 }
 
 fn probe_server(home: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
     let path = home.join(SERVER_CONFIGURATION);
     if !path.is_file() {
-        tracing::debug!(msg = "Running against local storage");
+        tracing::debug!(reason = "no server.toml", "using local storage");
         return Ok(None);
     }
     let server: Server = read_configuration(&path)?;
     let Some(listen) = server.listen else {
-        tracing::debug!(msg = "server.toml has no listen, using local storage");
+        tracing::debug!(reason = "server.toml has no listen", "using local storage");
         return Ok(None);
     };
     let origin = format!("http://{listen}");
@@ -1256,18 +2034,19 @@ fn probe_server(home: &Path) -> anyhow::Result<Option<(String, Option<String>)>>
     }
     match req.call() {
         Ok(response) if response.status() == 200 => {
-            tracing::debug!(msg = "Using HTTP server", origin = origin.as_str());
+            tracing::debug!(server.address = origin.as_str(), "using HTTP server");
             Ok(Some((origin, server.token)))
         }
         Ok(response) => {
             tracing::debug!(
-                msg = "Server health was not 200, using local storage",
-                status = response.status()
+                reason = "health was not 200",
+                http.response.status_code = response.status(),
+                "using local storage",
             );
             Ok(None)
         }
         Err(error) => {
-            tracing::debug!(msg = "Server did not respond, using local storage", error = %error);
+            tracing::debug!(reason = "no response", error = %error, "using local storage");
             Ok(None)
         }
     }
@@ -1331,27 +2110,12 @@ fn request(
         Some(value) => value.to_string().len() as u64,
         None => 0,
     };
-    let span = tracing::info_span!(
-        "Client",
-        op = "http_client",
-        http_method = method,
-        http_path = http_path,
-        http_query = http_query,
-        http_request_bytes = request_bytes,
-        http_status = tracing::field::Empty,
-        http_response_bytes = tracing::field::Empty,
-        trace = tracing::field::Empty,
-        total_ms = tracing::field::Empty,
-    );
-    let _entered = span.enter();
+    // `http.client` is the mirror of the server's `http.server`, down to the
+    // field names, so one Grafana panel can show both sides of a call and the
+    // `trace_id` that joins them is the server's own — read off `X-Trace-Id`
+    // and logged here, so the CLI line and the two server lines are one query.
+    let _span = tracing::info_span!("http.client").entered();
     let started = std::time::Instant::now();
-    tracing::debug!(
-        msg = "Sending HTTP request",
-        http_method = method,
-        http_path = http_path,
-        http_query = http_query,
-        http_request_bytes = request_bytes,
-    );
     let mut req = ureq::request(method, &url);
     req = req.timeout(Duration::from_secs(120));
     if let Some(token) = token {
@@ -1371,22 +2135,16 @@ fn request(
             };
             let version = response.header("x-borhan-version").map(str::to_string);
             let trace = response.header("x-trace-id").map(str::to_string);
-            span.record("http_status", status);
-            span.record("http_response_bytes", response_bytes);
-            span.record("total_ms", total_ms);
-            if let Some(trace) = &trace {
-                span.record("trace", tracing::field::display(trace));
-                tracing::debug!(msg = "Server trace", trace = trace.as_str());
-            }
             tracing::info!(
-                msg = "HTTP client request",
-                http_method = method,
-                http_path = http_path,
-                http_query = http_query,
-                http_status = status,
-                http_request_bytes = request_bytes,
-                http_response_bytes = response_bytes,
+                trace_id = trace.as_deref().unwrap_or("-"),
+                http.request.method = method,
+                url.path = http_path,
+                url.query = http_query,
+                http.request.body.size = request_bytes,
+                http.response.status_code = status,
+                http.response.body.size = response_bytes,
                 total_ms = total_ms,
+                "sent request",
             );
             let body = match response.into_json::<serde_json::Value>() {
                 Ok(value) => value,
@@ -1399,9 +2157,6 @@ fn request(
                 Some(value) => value.parse().unwrap_or_default(),
                 None => 0,
             };
-            span.record("http_status", code);
-            span.record("http_response_bytes", response_bytes);
-            span.record("total_ms", total_ms);
             let version = response.header("x-borhan-version").map(str::to_string);
             let mut trace = response.header("x-trace-id").map(str::to_string);
             let body = match response.into_json::<serde_json::Value>() {
@@ -1416,31 +2171,25 @@ fn request(
             {
                 trace = Some(value.to_string());
             }
-            if let Some(trace) = &trace {
-                span.record("trace", tracing::field::display(trace));
+            macro_rules! report {
+                ($level:ident, $said:literal) => {
+                    tracing::$level!(
+                        trace_id = trace.as_deref().unwrap_or("-"),
+                        http.request.method = method,
+                        url.path = http_path,
+                        url.query = http_query,
+                        http.request.body.size = request_bytes,
+                        http.response.status_code = code,
+                        http.response.body.size = response_bytes,
+                        total_ms = total_ms,
+                        $said,
+                    )
+                };
             }
             if code >= 500 {
-                tracing::error!(
-                    msg = "HTTP client request",
-                    http_method = method,
-                    http_path = http_path,
-                    http_query = http_query,
-                    http_status = code,
-                    http_request_bytes = request_bytes,
-                    http_response_bytes = response_bytes,
-                    total_ms = total_ms,
-                );
+                report!(error, "server failed the request");
             } else {
-                tracing::warn!(
-                    msg = "HTTP client request",
-                    http_method = method,
-                    http_path = http_path,
-                    http_query = http_query,
-                    http_status = code,
-                    http_request_bytes = request_bytes,
-                    http_response_bytes = response_bytes,
-                    total_ms = total_ms,
-                );
+                report!(warn, "server rejected the request");
             }
             print_trace(trace.as_deref());
             if !versions_match(version.as_deref()) {
@@ -1454,15 +2203,17 @@ fn request(
             anyhow::bail!("{message}")
         }
         Err(error) => {
-            span.record("total_ms", total_ms);
+            // No status and no `X-Trace-Id`: the request never reached a
+            // handler, so there is no server-side line to join this to and the
+            // error string is the whole of what happened.
             tracing::error!(
-                msg = "HTTP client request failed",
-                http_method = method,
-                http_path = http_path,
-                http_query = http_query,
-                http_request_bytes = request_bytes,
+                http.request.method = method,
+                url.path = http_path,
+                url.query = http_query,
+                http.request.body.size = request_bytes,
                 total_ms = total_ms,
                 error = %error,
+                "no response from server",
             );
             Err(anyhow::Error::new(error).context(format!("{method} {url}")))
         }
@@ -1505,20 +2256,33 @@ fn print_column_header(titles: &[&str], widths: &[usize]) {
     eprintln!("{}", columns_line(&cells, widths));
 }
 
+fn print_deleted(name: &str, sessions: u64, messages: u64, units: u64) {
+    println!("Deleted {name}: {sessions} sessions, {messages} messages, {units} units.");
+}
+
 fn print_memory_list(memories: &[crate::storage::Memory]) {
     if memories.is_empty() {
         eprintln!("No memories yet — `borhan memory create <name>`.");
         return;
     }
-    const TITLES: [&str; 6] = [
-        "id",
-        "created",
-        "name",
-        "counts",
-        "languages",
-        "description",
-    ];
+    // Five columns and the description underneath, the same two-line shape
+    // `memory search` and `memory cursor` use, rather than six columns with the
+    // description cut to sixty characters.
+    //
+    // The description is the one field here written for a reader: it is what
+    // says which memory this is and, more usefully, what is *not* in it, and a
+    // caller choosing between memories has to read all of it to choose. Sixty
+    // characters reliably ended mid-clause, so the listing showed the half of
+    // the sentence that says what the memory holds and cut the half that says
+    // where it stops — and the only way to see the rest was a command that
+    // requires already knowing which memory you wanted.
+    //
+    // It cannot be a sixth column either: the text runs to two thousand
+    // characters and the padding is computed from the widest cell, so one long
+    // description sets the width of a table nothing else in it needs.
+    const TITLES: [&str; 5] = ["id", "created", "name", "counts", "languages"];
     let mut rows = Vec::new();
+    let mut bodies = Vec::new();
     for memory in memories {
         let created = chrono::DateTime::from_timestamp_millis(memory.created_at);
         let created = match created {
@@ -1529,28 +2293,19 @@ fn print_memory_list(memories: &[crate::storage::Memory]) {
             "{} sessions, {} messages, {} units",
             memory.sessions, memory.messages, memory.units
         );
-        let summary = match &memory.description {
-            Some(description) => {
-                let line = description.lines().next().unwrap_or("");
-                if line.chars().count() > SUMMARY_LIMIT {
-                    let cut: String = line.chars().take(SUMMARY_LIMIT).collect::<String>();
-                    format!("{cut}…")
-                } else {
-                    line.to_string()
-                }
-            }
-            None => String::new(),
-        };
         rows.push(vec![
             memory.id.to_string(),
             created,
             memory.name.clone(),
             counts,
             memory.languages.clone(),
-            summary,
         ]);
+        bodies.push(match &memory.description {
+            Some(description) => description.clone(),
+            None => "(no description)".to_string(),
+        });
     }
-    print_table(&TITLES, &rows);
+    print_block_list(&TITLES, &rows, &bodies);
 }
 
 fn print_table(titles: &[&str], rows: &[Vec<String>]) {
@@ -1575,6 +2330,119 @@ fn print_block_list(titles: &[&str], rows: &[Vec<String>], bodies: &[String]) {
         println!("{body}");
         println!();
     }
+}
+
+fn print_outline(outline: &crate::api::Outline) {
+    match outline {
+        crate::api::Outline::Sessions(sessions) => {
+            if sessions.is_empty() {
+                eprintln!("No sessions yet — `borhan memory add <name> ... --session <id>`.");
+                return;
+            }
+            const TITLES: [&str; 5] = ["session", "started", "ended", "messages", "units"];
+            let mut rows = Vec::new();
+            for session in sessions {
+                rows.push(vec![
+                    session.reference.clone(),
+                    stamp(Some(session.started_at)),
+                    stamp(session.ended_at),
+                    session.messages.to_string(),
+                    session.units.to_string(),
+                ]);
+            }
+            print_table(&TITLES, &rows);
+        }
+        crate::api::Outline::Messages(messages) => {
+            const TITLES: [&str; 7] = [
+                "message",
+                "seq",
+                "role",
+                "author",
+                "written",
+                "characters",
+                "units",
+            ];
+            let mut rows = Vec::new();
+            for message in messages {
+                let reference = match &message.reference {
+                    Some(reference) => reference.clone(),
+                    // A message stored without one. It can still be read, but
+                    // it cannot be named again, so it cannot be replaced.
+                    None => "-".to_string(),
+                };
+                rows.push(vec![
+                    reference,
+                    message.seq.to_string(),
+                    message.role.as_str().to_string(),
+                    message.author.clone(),
+                    stamp(Some(message.ts)),
+                    message.characters.to_string(),
+                    message.units.to_string(),
+                ]);
+            }
+            print_table(&TITLES, &rows);
+        }
+    }
+}
+
+/// Unix milliseconds as a date a person can read, and `-` for no time at all.
+fn stamp(ts: Option<i64>) -> String {
+    let Some(ts) = ts else {
+        return "-".to_string();
+    };
+    match chrono::DateTime::from_timestamp_millis(ts) {
+        Some(time) => time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        None => "-".to_string(),
+    }
+}
+
+fn print_outline_json(body: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(list) = body.get("session_list").and_then(|value| value.as_array()) {
+        let mut sessions = Vec::new();
+        for session in list {
+            let id = match Ulid::parse(session["id"].as_str().unwrap_or("")) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            sessions.push(crate::storage::SessionRow {
+                id,
+                reference: session["session"].as_str().unwrap_or("").to_string(),
+                started_at: session["started_at"].as_i64().unwrap_or(0),
+                ended_at: session["ended_at"].as_i64(),
+                messages: session["messages"].as_u64().unwrap_or(0),
+                units: session["units"].as_u64().unwrap_or(0),
+            });
+        }
+        print_outline(&crate::api::Outline::Sessions(sessions));
+        return Ok(());
+    }
+
+    let Some(list) = body.get("message_list").and_then(|value| value.as_array()) else {
+        anyhow::bail!("server response has neither session_list nor message_list");
+    };
+    let mut messages = Vec::new();
+    for message in list {
+        let id = match Ulid::parse(message["id"].as_str().unwrap_or("")) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let role = match Role::parse(message["role"].as_str().unwrap_or("")) {
+            Some(role) => role,
+            None => Role::User,
+        };
+        messages.push(crate::storage::MessageRow {
+            id,
+            reference: message["message"].as_str().map(str::to_string),
+            seq: message["seq"].as_i64().unwrap_or(0),
+            author: message["author"].as_str().unwrap_or("").to_string(),
+            role,
+            ts: message["ts"].as_i64().unwrap_or(0),
+            characters: message["characters"].as_u64().unwrap_or(0),
+            units: message["units"].as_u64().unwrap_or(0),
+        });
+    }
+    print_outline(&crate::api::Outline::Messages(messages));
+    Ok(())
 }
 
 fn print_memory_list_json(body: &serde_json::Value) -> anyhow::Result<()> {
@@ -1606,40 +2474,12 @@ fn print_memory_list_json(body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_units_json(body: &serde_json::Value) -> anyhow::Result<()> {
-    let Some(list) = body.get("unit_list").and_then(|value| value.as_array()) else {
-        anyhow::bail!("server response has no unit_list");
-    };
-    const TITLES: [&str; 4] = ["unit", "role", "session", "seq"];
-    let mut rows = Vec::new();
-    let mut bodies = Vec::new();
-    for row in list {
-        rows.push(vec![
-            row["unit"].as_str().unwrap_or("").to_string(),
-            row["role"].as_str().unwrap_or("").to_string(),
-            row["session_ref"].as_str().unwrap_or("").to_string(),
-            row["unit_seq"].as_i64().unwrap_or(0).to_string(),
-        ]);
-        bodies.push(row["text"].as_str().unwrap_or("").to_string());
+fn matched_cell(matched: &[String], nearby: &[String]) -> String {
+    let mut cells: Vec<String> = matched.to_vec();
+    for label in nearby {
+        cells.push(format!("~{label}"));
     }
-    print_block_list(&TITLES, &rows, &bodies);
-    Ok(())
-}
-
-fn print_units(located: &[crate::storage::Located]) {
-    const TITLES: [&str; 4] = ["unit", "role", "session", "seq"];
-    let mut rows = Vec::new();
-    let mut bodies = Vec::new();
-    for row in located {
-        rows.push(vec![
-            row.unit.to_string(),
-            row.role.as_str().to_string(),
-            row.session_ref.clone(),
-            row.unit_seq.to_string(),
-        ]);
-        bodies.push(row.text().to_string());
-    }
-    print_block_list(&TITLES, &rows, &bodies);
+    format!("[{}]", cells.join(","))
 }
 
 fn print_search(outcome: &crate::search::Outcome) {
@@ -1663,10 +2503,10 @@ fn print_search(outcome: &crate::search::Outcome) {
             format!("{:.3}", hit.score),
             format!("{}/{}", hit.coverage.0, hit.coverage.1),
             hit.cursor.to_string(),
-            hit.session.to_string(),
-            hit.message.as_deref().unwrap_or("-").to_string(),
+            hit.session_ref.to_string(),
+            hit.message_ref.as_deref().unwrap_or("-").to_string(),
             format!("{} words", hit.words),
-            format!("[{}]", hit.matched.join(",")),
+            matched_cell(&hit.matched, &hit.nearby),
         ]);
         bodies.push(format!("\"{}\"", preview(&hit.snippet)));
     }
@@ -1714,22 +2554,27 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
             }
             _ => "-/-".to_string(),
         };
-        let mut matched = Vec::new();
-        if let Some(list) = hit["matched_list"].as_array() {
-            for label in list {
-                if let Some(label) = label.as_str() {
-                    matched.push(label.to_string());
+        let labels = |key: &str| {
+            let mut labels = Vec::new();
+            if let Some(list) = hit[key].as_array() {
+                for label in list {
+                    if let Some(label) = label.as_str() {
+                        labels.push(label.to_string());
+                    }
                 }
             }
-        }
+            labels
+        };
+        let matched = labels("matched_list");
+        let nearby = labels("nearby_list");
         rows.push(vec![
             format!("{:.3}", hit["score"].as_f64().unwrap_or(0.0)),
             cover,
             hit["cursor"].as_str().unwrap_or("").to_string(),
-            hit["session"].as_str().unwrap_or("").to_string(),
-            hit["message"].as_str().unwrap_or("-").to_string(),
+            hit["session_ref"].as_str().unwrap_or("").to_string(),
+            hit["message_ref"].as_str().unwrap_or("-").to_string(),
             format!("{} words", hit["words"].as_u64().unwrap_or(0)),
-            format!("[{}]", matched.join(",")),
+            matched_cell(&matched, &nearby),
         ]);
         bodies.push(format!(
             "\"{}\"",
@@ -1753,51 +2598,108 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_cursor(messages: &[crate::storage::Message]) {
-    const TITLES: [&str; 5] = ["hit", "message", "author", "role", "seq"];
-    let mut rows = Vec::new();
+fn print_cursor(rows: &[crate::storage::Located], asked: &[Ulid], whole: bool) {
+    let mut table = Vec::new();
     let mut bodies = Vec::new();
-    for message in messages {
-        let hit = if message.anchor {
-            "→".to_string()
-        } else {
-            String::new()
-        };
-        rows.push(vec![
-            hit,
-            message.id.to_string(),
-            message.author.clone(),
-            message.role.as_str().to_string(),
-            message.seq.to_string(),
-        ]);
-        bodies.push(message.body.clone());
+    if whole {
+        const TITLES: [&str; 5] = ["hit", "message", "author", "role", "seq"];
+        let mut at = None;
+        for row in rows {
+            if at == Some(row.message) {
+                continue;
+            }
+            at = Some(row.message);
+            let hit = rows
+                .iter()
+                .any(|other| other.message == row.message && asked.contains(&other.unit));
+            table.push(vec![
+                if hit {
+                    "\u{2192}".to_string()
+                } else {
+                    String::new()
+                },
+                row.message.to_string(),
+                row.author.clone(),
+                row.role.as_str().to_string(),
+                row.seq.to_string(),
+            ]);
+            bodies.push(row.body.clone());
+        }
+        print_block_list(&TITLES, &table, &bodies);
+        return;
     }
-    print_block_list(&TITLES, &rows, &bodies);
+    const TITLES: [&str; 5] = ["hit", "unit", "role", "session", "seq"];
+    for row in rows {
+        table.push(vec![
+            if asked.contains(&row.unit) {
+                "\u{2192}".to_string()
+            } else {
+                String::new()
+            },
+            row.unit.to_string(),
+            row.role.as_str().to_string(),
+            row.session_ref.clone(),
+            format!("{}.{}", row.seq, row.unit_seq),
+        ]);
+        bodies.push(row.text().to_string());
+    }
+    print_block_list(&TITLES, &table, &bodies);
 }
 
 fn print_cursor_json(body: &serde_json::Value) -> anyhow::Result<()> {
     let Some(list) = body.get("message_list").and_then(|value| value.as_array()) else {
         anyhow::bail!("server response has no message_list");
     };
-    const TITLES: [&str; 5] = ["hit", "message", "author", "role", "seq"];
-    let mut rows = Vec::new();
-    let mut bodies = Vec::new();
-    for message in list {
-        let hit = if message["anchor"].as_bool().unwrap_or(false) {
-            "→".to_string()
+    if let Some(missing) = body.get("missing_list").and_then(|value| value.as_array()) {
+        for unit in missing {
+            eprintln!("No unit {}", unit.as_str().unwrap_or(""));
+        }
+    }
+    let mark = |value: &serde_json::Value| {
+        if value["anchor"].as_bool().unwrap_or(false) {
+            "\u{2192}".to_string()
         } else {
             String::new()
-        };
-        rows.push(vec![
-            hit,
-            message["message"].as_str().unwrap_or("").to_string(),
-            message["author"].as_str().unwrap_or("").to_string(),
-            message["role"].as_str().unwrap_or("").to_string(),
-            message["seq"].as_i64().unwrap_or(0).to_string(),
-        ]);
-        bodies.push(message["body"].as_str().unwrap_or("").to_string());
+        }
+    };
+    let mut table = Vec::new();
+    let mut bodies = Vec::new();
+    if list.iter().any(|message| message.get("body").is_some()) {
+        const TITLES: [&str; 5] = ["hit", "message", "author", "role", "seq"];
+        for message in list {
+            table.push(vec![
+                mark(message),
+                message["message"].as_str().unwrap_or("").to_string(),
+                message["author"].as_str().unwrap_or("").to_string(),
+                message["role"].as_str().unwrap_or("").to_string(),
+                message["seq"].as_i64().unwrap_or(0).to_string(),
+            ]);
+            bodies.push(message["body"].as_str().unwrap_or("").to_string());
+        }
+        print_block_list(&TITLES, &table, &bodies);
+        return Ok(());
     }
-    print_block_list(&TITLES, &rows, &bodies);
+    const TITLES: [&str; 5] = ["hit", "unit", "role", "session", "seq"];
+    for message in list {
+        let Some(units) = message["unit_list"].as_array() else {
+            continue;
+        };
+        for unit in units {
+            table.push(vec![
+                mark(unit),
+                unit["unit"].as_str().unwrap_or("").to_string(),
+                message["role"].as_str().unwrap_or("").to_string(),
+                message["session_ref"].as_str().unwrap_or("").to_string(),
+                format!(
+                    "{}.{}",
+                    message["seq"].as_i64().unwrap_or(0),
+                    unit["unit_seq"].as_i64().unwrap_or(0)
+                ),
+            ]);
+            bodies.push(unit["text"].as_str().unwrap_or("").to_string());
+        }
+    }
+    print_block_list(&TITLES, &table, &bodies);
     Ok(())
 }
 
