@@ -21,7 +21,11 @@ Group=@GROUP@
 # serves an index that matches it rather than one that silently misses.
 ExecStartPre=/usr/local/bin/borhan --home @HOME@ init
 
-ExecStart=/usr/local/bin/borhan --home @HOME@ serve
+# `--info` because the default level is `warn`, which for a server means a
+# journal holding nothing but failures: no line saying what it bound to, and no
+# line per request. On a one-shot command that quiet is right, the result being
+# on stdout already; a daemon has no stdout anybody reads.
+ExecStart=/usr/local/bin/borhan --home @HOME@ --info serve
 
 Restart=on-failure
 RestartSec=5

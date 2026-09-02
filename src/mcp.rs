@@ -3,7 +3,7 @@
 //! A wrapper and nothing else. Every tool here is one of the `run_*` functions
 //! in `api.rs` — the same ones the REST handlers call, deserializing into the
 //! same body structs — so a tool and its endpoint cannot drift apart, and the
-//! permission list in `server.toml` governs both without being consulted twice.
+//! `refuse` list in `server.toml` governs both without being consulted twice.
 //! What this file adds is the JSON-RPC envelope, the schemas that tell a model
 //! what the arguments mean, and the catalogue of memories as resources.
 //!
@@ -314,13 +314,18 @@ A hit is one paragraph or sentence, with a `cursor`. Pass those cursors — all 
     })
 }
 
-/// The tool list, which is where the permission list becomes visible.
+/// The tool list, which is where `server.toml`'s refusals become visible.
 ///
 /// A server that may not write does not describe writing tools, so a model
 /// never plans around an operation it will be refused. `tools/call` checks
 /// again anyway, through the same `App::permit` the REST handlers use, because
 /// a client is entitled to cache this list and a server is not entitled to
 /// trust it.
+///
+/// Absence is the whole of the message. There is no disabled tool carrying a
+/// note about how to enable it, because a model that reads such a note treats
+/// it as the next step — the refusal has to look like the world being a
+/// certain way, not like a door with the key taped to it.
 fn tools(app: &App) -> Vec<Value> {
     let memory = json!({
         "type": "string",

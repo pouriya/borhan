@@ -87,7 +87,7 @@ unless something is slow.
 |--------|-------|
 | `400` | The request is malformed: a bad role, a string that is not a ULID, an empty list, a description under 10 words. The sentence says which. |
 | `401` | Missing or wrong bearer token. The gate runs before routing, so on a server with a token an unknown path answers `401` rather than `404`. |
-| `403` | The server is not permitted to do this. `permissions` in its `server.toml` governs `create`, `update`, `add`, `rescan` and `delete`; reads are never gated by it. Do not retry — retrying cannot change the answer. |
+| `403` | This server refuses this operation. `refuse` in its `server.toml` names any of `create`, `update`, `add`, `replace`, `rescan` and `delete`; reads are never on that list. It is a setting, not a fault: do not retry, do not look for the file, and do not try to change it. Tell whoever you are working for and let them decide. |
 | `404` | No such memory, or no such route. |
 | `409` | A name already taken, or a `message` id already used in that session. |
 | `500` | Storage or index failure. One of these is fixable from here: *"the index … was built with normalization rules v2, this borhan is v3"* means the index is older than the binary — `POST /api/v1/memory/{name}/rescan` and try again. |
@@ -338,9 +338,13 @@ the ones that resolve. A string that is not a ULID at all is a `400`.
 
 # Writing
 
-These five are refused with `403` unless the server's `server.toml` permits
-them. A read-only server is the normal deployment, and `replace` is off even on
-a server that permits everything else — see the note under it.
+Any of these six can be refused with `403`, by name, in the server's
+`server.toml`. By default none are: a server refuses only what it was told to
+refuse. A read-only deployment is one that names all six.
+
+A `403` here is a decision somebody made about this server, not an obstacle in
+the way of the request. There is no retry that changes it and no argument that
+routes around it. Say which operation was refused, and stop.
 
 ## `POST /api/v1/memory` — create a memory
 
@@ -404,10 +408,9 @@ carries a session term and no message term, so the narrowest thing the index can
 be told to forget is every unit of the session, and it is written back in the
 same commit.
 
-`replace` is **not** in the default permission set, unlike `create`, `update`,
-`add` and `rescan`. It is the second operation that destroys something with no
-copy kept, and a `server.toml` written before it existed cannot have consented
-to it.
+`replace` is the second operation that destroys something with no copy kept —
+the old body is gone, not versioned — so it is a common one to find in a
+server's `refuse` list even where writing is allowed.
 
 ## `PATCH /api/v1/memory/{name}` — change description or languages
 
@@ -430,10 +433,9 @@ touched. Returns `{"messages": 60, "units": 3087, "stats": {}}`.
     curl -s -X DELETE "$BORHAN/api/v1/memory/project_borhan"
 
 **Irreversible, and there is nothing to fall back on.** `rescan` can rebuild an
-index because an index is derived; nothing can rebuild the messages. Requires
-the `delete` permission, which is the one permission a server without an
-explicit list does *not* have. Returns the counts of what was destroyed, which
-is the last record of it.
+index because an index is derived; nothing can rebuild the messages. It is the likeliest of
+the six to be refused. Returns the counts of what was destroyed, which is the
+last record of it.
 
 ---
 

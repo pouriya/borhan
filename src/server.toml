@@ -1,0 +1,41 @@
+# borhan server configuration.
+#
+# Written by `borhan init server`. Read by `borhan serve`, which binds `listen`,
+# and by every other `borhan` command, which probes that same address and routes
+# through the server when something answers there. Nothing here is re-read while
+# `serve` is running: change the file, restart the server.
+
+# Address to bind, and the address the CLI probes.
+listen = "@LISTEN@"
+
+# Token clients must present as `Authorization: Bearer <token>`. It governs who
+# may talk to this server at all, including for reads. Comment it out to serve
+# without one.
+@TOKEN@
+
+# What this server will NOT do.
+#
+# Everything is allowed except what is named here. Reads are never on the list —
+# a server that can answer one search can answer any search, and who may ask at
+# all is `token`'s question, not this one.
+#
+# The names, all of them:
+#
+#   create     make a new memory
+#   update     change a memory's description or its language tags
+#   add        store a message in a memory
+#   replace    rewrite a stored message's body, keeping no copy of the old one
+#   rescan     re-split every message and rebuild the index from them
+#   delete     destroy a memory: its messages, its index, its directory
+#
+# `delete` and `replace` are the two that destroy something. `rescan` reads
+# alarming and is not: it rebuilds what was derived from the messages and never
+# touches the messages.
+#
+# An unknown name here stops the server at startup rather than being skipped. A
+# typo in a list of refusals is not a refusal, and the way that failure shows up
+# is the destructive operation someone meant to switch off, quietly working.
+#
+# Callers are told only that an operation is refused, never how to un-refuse it:
+# the party reading that error is the one the refusal is aimed at.
+refuse = [@REFUSE@]

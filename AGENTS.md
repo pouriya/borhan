@@ -243,9 +243,20 @@ index_meta    (key, value)
   error rather than the `Stale` path that names `memory rescan`. Cost is
   proportional to the session; the forget and the rewrite share one commit, so a
   reader never sees the session half-present.
-- **`Permission::Replace` is not in `DEFAULT`.** Same argument as `Delete`, and
-  the only one: it overwrites a stored body with no copy kept, and a
-  `server.toml` written before it existed cannot have consented to it.
+- **`server.toml` lists what the server refuses, not what it permits.**
+  `refuse = ["delete", "replace"]`; absent or empty means all six operations are
+  allowed, which is right for a store on the machine of whoever started the
+  server — they can already `rm` it. An allowing list would have withheld every
+  operation invented after the file was written, which is how `replace` shipped
+  switched off on servers whose owners had never heard of it. An unknown name in
+  `refuse` stops the server at startup: skipping it would leave an operation
+  *on*.
+- **A `403` says what is refused and never how to un-refuse it.** The old text
+  named the key and the file; a model read that as a repair instruction and
+  looped trying to edit the configuration and restart the server. The party
+  reading the error is the party the refusal is aimed at, and the party who can
+  change it is not in that conversation. Same rule for the MCP tool list: a
+  refused operation has no tool, not a disabled tool with a note.
 - **`index_meta` holds the normalization rules version.** An index built by an
   older normalizer answers with a `500` naming `memory rescan` rather than
   quietly disagreeing with the query side about what a word folds to.
@@ -344,7 +355,7 @@ store and hides every existing memory.
 A token in `server.toml` is required on every HTTP request as `Authorization: Bearer`. The same file is what the CLI sends.
 
 The same server serves `GET /` — `src/guide.md`, the whole REST API as Markdown
-— outside the token gate, and speaks MCP at `POST /mcp`, behind the same token. Every tool is one of `api.rs`'s `run_*` functions — the ones the REST handlers call, deserializing into the same body structs — so a tool and its endpoint cannot drift. There is one read tool per question and no two that overlap — `memory_cursor` covers every width of read — so a model never spends a turn choosing between them. `tools/list` shows the write tools only when `permissions` allows them, and `tools/call` checks again through the same `App::permit`, because a client is entitled to cache that list. Resources are the memories: one each, carrying the description and the counts, and reading one returns that memory's metadata plus the lemmas it actually uses — which is what a caller has to write its query in.
+— outside the token gate, and speaks MCP at `POST /mcp`, behind the same token. Every tool is one of `api.rs`'s `run_*` functions — the ones the REST handlers call, deserializing into the same body structs — so a tool and its endpoint cannot drift. There is one read tool per question and no two that overlap — `memory_cursor` covers every width of read — so a model never spends a turn choosing between them. `tools/list` shows the write tools unless `server.toml` refuses them, and `tools/call` checks again through the same `App::permit`, because a client is entitled to cache that list. Resources are the memories: one each, carrying the description and the counts, and reading one returns that memory's metadata plus the lemmas it actually uses — which is what a caller has to write its query in.
 
 Handshake era (`2025-11-25`, back to `2024-11-05`), not the ratified `2026-07-28`, because every client this is for — Claude Code, Cursor, Codex, OpenCode, Hermes — is on the handshake era today. `server/discover` is therefore answered with `404` and an **empty body**: a newer client falls back to `initialize` only when the body is *not* a recognized modern JSON-RPC error, so a `-32601` there would stop the fallback rather than trigger it. `GET` and `DELETE` get `405`, and `Origin` must be absent or loopback.
 
@@ -523,6 +534,8 @@ src/main.rs        CLI, clap derive, logging setup, the HTTP client half. See th
 src/api.rs         Every operation, and the axum router that serves them
 src/mcp.rs         MCP over the HTTP server, at POST /mcp
 src/guide.md       The REST guide, served verbatim at GET /. Not code — prose, include_str!'d
+src/server.toml    The commented server.toml template `init server` fills in and writes
+src/skills/*.md    The agent skills `skills <name> --install` writes out
 src/storage.rs     SQLite: the memory directory, the schema, add/locate/around
 src/index.rs       The tantivy schema, the writer and the reader
 src/search.rs      Groups, coverage, scoring, snippets, hints
@@ -535,10 +548,17 @@ home/              BORHAN_HOME for `make seed` (gitignored)
 build/             Named binaries from make dev/release (gitignored)
 ```
 
-`src/guide.md` is the one non-Rust file under `src/`, and it is there rather
-than in a `docs/` directory because `include_str!` resolves relative to the file
-that calls it: the guide compiles into the binary, so a `serve` running from a
-copied binary on a machine with no repository still serves it.
+The non-Rust files under `src/` are there rather than in a `docs/` directory
+because `include_str!` resolves relative to the file that calls it: they compile
+into the binary, so a `serve` running from a copied binary on a machine with no
+repository still serves its guide, writes its skills and can write a
+`server.toml` with all of its comments intact.
+
+`src/server.toml` is a template, not a config: `@LISTEN@`, `@TOKEN@` and
+`@REFUSE@` are substituted by `init server`. It is not serialized from the
+`Server` struct because serializing drops every comment, and the comments — what
+the six operation names mean, which two destroy — are most of what the file is
+for.
 
 `main.rs` holds: `CommandLine`/`Command`/`InitCommand`/`MemoryCommand` (clap
 derive), the `Server` configuration struct (serde derive), `logging_level()`,
@@ -605,11 +625,18 @@ output. Verbosity comes from `CommandLine::logging_level()`:
 | Flag | Level | Extra fields |
 |------|-------|--------------|
 | `--quiet` | `OFF` | — |
-| *(none)* | `INFO` | — |
+| *(none)* | `WARN` | — |
+| `--info` | `INFO` | — |
 | `--debug` | `DEBUG` | target |
 | `--trace` | `TRACE` | target, file, line |
 
-`--quiet` wins over `--trace`, which wins over `--debug`.
+`--quiet` wins over `--trace`, which wins over `--debug`, which wins over
+`--info`.
+
+The default is `WARN`, so **the per-operation `info` line is off unless asked
+for**. Every operation logs one, with its timings, and for a one-shot command
+that is a second copy of the result already on stdout. A server wants it: the
+systemd unit passes `--info`, and so does `make start-dev` by way of `--debug`.
 
 ### Level guide
 
@@ -656,5 +683,7 @@ tracing::debug!(msg = "Embedding batch", count = texts.len(), dimensions = DIM);
 tracing::trace!(msg = "Committed units", table = "unit", rows = written.units.len());
 ```
 
-Because `--quiet` sets `OFF`, never rely on a log line to communicate something
-the user must see — return it from `main` or write it to stdout.
+Because the default is `WARN` and `--quiet` sets `OFF`, never rely on a log line
+to communicate something the user must see — return it from `main` or write it
+to stdout. `info` and below are for an operator reading a journal, not for the
+person who typed the command.

@@ -96,28 +96,42 @@ In this order, and stop at the first one that answers:
 
 ## 2. Check that it will accept the writes, before reading any code
 
-A survey needs two capabilities, and a server can be configured without either.
+A survey needs two operations, `add` and `replace`, and a server can be
+configured to refuse either.
 
 **Over MCP**, read your tool list:
 
-- `memory_add` missing → this server is read-only by configuration. Say so, name
-  the permission (`add`), and stop.
+- `memory_add` missing → this server does not store. Say so and stop.
 - `memory_replace` missing → you can write a first survey but cannot correct an
   existing one. This is only fatal if step 5 finds a survey already on file. Note
   it and carry on; raise it there.
 
 **Over the CLI**, a server may be answering behind it, in which case a write
-comes back as:
+comes back as `refused: this server does not do add`.
 
-    this server is not allowed to add — add "add" to permissions in server.toml
-    and restart it
+Same conclusion.
 
-Same conclusion. Tell the user which permission is missing and where it goes.
+### A refusal is an answer, not an obstacle
 
-`replace` is deliberately not on by default even when everything else is, so a
-server that permits `create`, `update`, `add` and `rescan` can still be missing
-it. That is not a misconfiguration to work around; it is the operator saying that
-stored text is not to be overwritten here.
+**It is somebody's decision, already made, and your job is to report it — not to
+undo it.** A server that refuses `replace` is one whose operator has said that
+stored text is not overwritten here.
+
+So when you hit one:
+
+- **Do not retry.** Nothing about the request was wrong; the second attempt is
+  refused identically.
+- **Do not go looking for `server.toml`,** do not edit it, do not restart
+  anything, and do not reach around the server to the files underneath. None of
+  that is yours to do, and an agent that starts down that path spends the rest of
+  the session on it. It will not be reading the code, which is what it was asked
+  for.
+- **Tell the user, in one line:** which operation is refused, and what that costs
+  them here — *this server refuses `replace`, so I can write a new survey but
+  cannot correct the one already on file.*
+- **Then let them choose.** If they tell you to change the configuration, do it;
+  that is a different instruction and it is theirs to give. Until they do, the
+  refusal stands.
 
 Do not begin reading the project until this passes. And if you have to stop, do
 not paste a survey you already wrote into the chat as a consolation — the user

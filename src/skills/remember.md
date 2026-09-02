@@ -101,23 +101,33 @@ In this order, and stop at the first one that answers:
 
 ## 2. Check that it will accept a write, before composing anything
 
-A borhan server declares what it may do. One that is not permitted to store
-**does not list a `memory_add` tool at all** — the tool list is the permission
-list. So:
+A borhan server declares what it will do by what it offers. One configured not
+to store **does not list a `memory_add` tool at all** — absence is the whole of
+the message. So:
 
-- **MCP:** if `memory_search` is there and `memory_add` is not, this server is
-  read-only by configuration.
+- **MCP:** if `memory_search` is there and `memory_add` is not, this server does
+  not store.
 - **Command line:** the CLI routes through the server whenever one answers on
-  the address in `server.toml`, so a read-only server refuses a local command
-  too, with `this server is not allowed to add — add "add" to permissions in
-  server.toml and restart it`.
+  the address in `server.toml`, so the same server refuses a local command too,
+  with `refused: this server does not do add`.
 
-In either case: **say so to the user and do nothing.** Quote the reason —
-`permissions` in `<home>/server.toml` does not include `add`, and the server has
-to be restarted after that is changed. Do not retry, do not try to reach storage
-around the server, and do not paste what you would have stored into the chat as
-a consolation: the user asked for something kept, and a wall of text they now
-have to file by hand is not a smaller version of that.
+### A refusal is an answer, not an obstacle
+
+**Say so to the user and do nothing else.** It is somebody's decision, already
+made, and reporting it is the whole of your job here.
+
+- **Do not retry.** The request was not malformed; the second attempt is refused
+  identically.
+- **Do not go looking for `server.toml`,** do not edit it, do not restart
+  anything, and do not reach around the server to the storage underneath. An
+  agent that starts down that path spends the rest of the session on it instead
+  of on what it was asked for.
+- **Do not paste what you would have stored into the chat as a consolation.**
+  The user asked for something kept; a wall of text they now have to file by
+  hand is not a smaller version of that.
+- **Then let them choose.** If they tell you to change the configuration, do it
+  — that is a different instruction and it is theirs to give. Until they do, the
+  refusal stands.
 
 ## 3. Read the memories, then ask
 

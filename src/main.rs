@@ -41,12 +41,14 @@ const DEFAULT_HOME_DIRECTORY: &str = ".borhan";
 //       storage/            One directory per memory. Created by `init`.
 //         <name>/borhan.db  The messages. Never derived, never rebuilt.
 //         <name>/index/     The tantivy index. Entirely derived; `rescan` fodder.
-//       server.toml         Listen address, token and permissions. Written by
-//                           `init server`. `serve` binds it; the CLI probes it
-//                           and talks HTTP when that process answers, otherwise
-//                           opens storage. The permissions bind only the served
-//                           process — a local command is doing what its user
-//                           could already do to these files by hand.
+//       server.toml         Listen address, token, and the operations the
+//                           server refuses. Written by `init server` from a
+//                           commented template. `serve` binds it; the CLI
+//                           probes it and talks HTTP when that process
+//                           answers, otherwise opens storage. The refusals
+//                           bind only the served process — a local command is
+//                           doing what its user could already do to these
+//                           files by hand.
 //
 // None of it is created implicitly: `init` is the only thing that writes the
 // layout, so a missing directory always means "this machine was never set up",
@@ -231,9 +233,9 @@ pub enum Command {
     /// one route served without a token, so an agent handed nothing but an
     /// address can read it before it knows a token is wanted.
     ///
-    /// Address, token and permissions come from `<home>/server.toml`, written
-    /// by `init server`. Without that file it binds `127.0.0.1:1995` with no
-    /// token and everything but `delete` permitted.
+    /// Address, token and refusals come from `<home>/server.toml`, written by
+    /// `init server`. Without that file it binds `127.0.0.1:1995` with no token
+    /// and refuses nothing.
     ///
     /// While it is running, every `memory` command on this machine goes through
     /// it instead of opening storage directly — the CLI probes the same address
@@ -339,9 +341,9 @@ pub enum SkillCommand {
     /// tool schemas carry the argument rules where a model will read them, this
     /// command line second, and if neither is there then stop and say so rather
     /// than keeping it somewhere else. Check that storing is permitted
-    /// *before* composing anything, because a server without `add` in its
-    /// permissions does not list a writing tool at all and the discovery is
-    /// otherwise made after the work. Read `memory list` and ask the user which
+    /// *before* composing anything, because a server that refuses `add`
+    /// does not list a writing tool at all and the discovery is otherwise made
+    /// after the work. Read `memory list` and ask the user which
     /// memory to write to, every time. Keep decisions and the reasons for them
     /// rather than transcript. And file each message under the session, role and
     /// author it belongs to — the user and the agent are not the same author,
@@ -472,6 +474,10 @@ pub enum InitCommand {
     Storage,
 
     /// Write `server.toml` so `serve` and the CLI share a listen address and token.
+    ///
+    /// The file is written from a commented template that lists every operation
+    /// and says what each one does, so the way to change what this server will
+    /// do afterwards is to open it and read it, not to remember flags.
     Server {
         /// `HOST:PORT` to bind, and the address the CLI probes.
         #[arg(long)]
@@ -481,15 +487,15 @@ pub enum InitCommand {
         #[arg(long)]
         token: Option<String>,
 
-        /// A store-changing operation `serve` may perform: `create`, `update`,
-        /// `add`, `rescan` or `delete`. Repeat the flag for each one.
+        /// A store-changing operation `serve` must NOT perform: `create`,
+        /// `update`, `add`, `replace`, `rescan` or `delete`. Repeat the flag
+        /// for each one.
         ///
-        /// Omit it entirely and the key is left out of the file, which means
-        /// everything but `delete`. Pass it and the list is exactly what you
-        /// passed, so `--permission add` is a server that ingests and does
-        /// nothing else.
-        #[arg(long = "permission", value_name = "NAME")]
-        permissions: Vec<String>,
+        /// Everything not named is allowed. Omit the flag and the server does
+        /// all six; `--refuse delete --refuse replace` is a server that writes
+        /// and never destroys.
+        #[arg(long = "refuse", value_name = "NAME")]
+        refuse: Vec<String>,
     },
 }
 
@@ -566,9 +572,9 @@ pub enum MemoryCommand {
     /// there so that deleting a memory cannot be a command you completed with a
     /// shell history search and a return key.
     ///
-    /// Against a server this needs the `delete` permission in `server.toml`; a
-    /// server without it answers 403 and nothing is removed. Locally there is
-    /// no permission to check: the files belong to whoever is running this.
+    /// Against a server that refuses `delete` this answers 403 and nothing is
+    /// removed. Locally there is nothing to check: the files belong to whoever
+    /// is running this.
     ///
     /// Prints the counts of what was destroyed, which is the last record of it.
     Delete {
@@ -911,45 +917,55 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
-    /// Which store-changing operations `serve` will perform: any of `create`,
-    /// `update`, `add`, `rescan` and `delete`. Reads are not on the list and
-    /// are governed by `token`.
+    /// Store-changing operations `serve` will refuse: any of `create`,
+    /// `update`, `add`, `replace`, `rescan` and `delete`. Reads are not on the
+    /// list and are governed by `token`.
     ///
-    /// The list is exact — `permissions = ["create", "delete"]` is a server
-    /// that will make a memory and destroy one and will not add a message to
-    /// either. Unset is the one loose case, and it means everything but
-    /// `delete`: a file written before this key existed said nothing about
-    /// deletion, and reading silence as consent to the one irreversible
-    /// operation is the wrong direction to be wrong in.
+    /// A list of what is withheld, not of what is granted. Unset or empty means
+    /// a server that does everything, which is the right default for the common
+    /// case of a store on the machine of the person who started it — they can
+    /// already `rm` the directory. Naming an operation here is how someone says
+    /// *not this one*, and it is worth saying only when the caller is not that
+    /// person.
+    ///
+    /// The direction matters beyond taste: a granting list silently withholds
+    /// every operation invented after it was written, so the file that said
+    /// `["create", "add"]` last year is a file that refuses this year's
+    /// `replace` on behalf of an author who never considered it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub permissions: Option<Vec<String>>,
+    pub refuse: Option<Vec<String>>,
 }
 
 impl Server {
-    /// Resolve [`Server::permissions`] into what the router checks.
+    /// Everything except what [`Server::refuse`] names.
     ///
-    /// An unknown name is an error and not a warning. The consequence of
-    /// ignoring `["crate", "delete"]` is a server that refuses to create
-    /// anything and says so for the first time on a request some hours from
-    /// now, which is a long way from the typo that caused it.
-    fn permissions(&self) -> anyhow::Result<Vec<crate::api::Permission>> {
-        let Some(names) = &self.permissions else {
-            return Ok(crate::api::Permission::DEFAULT.to_vec());
-        };
-        let mut permissions = Vec::new();
-        for name in names {
-            match crate::api::Permission::parse(name) {
-                Some(permission) => permissions.push(permission),
-                None => {
-                    let known: Vec<&str> = crate::api::Permission::ALL
-                        .iter()
-                        .map(|permission| permission.as_str())
-                        .collect();
-                    anyhow::bail!("{name:?} in permissions is not one of {}", known.join(", "));
+    /// An unknown name is an error and not a warning, and this is the direction
+    /// in which that matters most: a skipped name in a refusal list is an
+    /// operation left switched **on**. `refuse = ["delte"]` ignored is a server
+    /// that deletes, and nothing about the day it does will point back here.
+    fn allowed(&self) -> anyhow::Result<Vec<crate::api::Permission>> {
+        let mut refused = Vec::new();
+        if let Some(names) = &self.refuse {
+            for name in names {
+                match crate::api::Permission::parse(name) {
+                    Some(permission) => refused.push(permission),
+                    None => {
+                        let known: Vec<&str> = crate::api::Permission::ALL
+                            .iter()
+                            .map(|permission| permission.as_str())
+                            .collect();
+                        anyhow::bail!("{name:?} in refuse is not one of {}", known.join(", "));
+                    }
                 }
             }
         }
-        Ok(permissions)
+        let mut allowed = Vec::new();
+        for permission in crate::api::Permission::ALL {
+            if !refused.contains(&permission) {
+                allowed.push(permission);
+            }
+        }
+        Ok(allowed)
     }
 }
 
@@ -1266,7 +1282,7 @@ async fn main() -> anyhow::Result<()> {
             InitCommand::Server {
                 listen,
                 token,
-                permissions,
+                refuse,
             } => {
                 let server_configuration = settings.home.join(SERVER_CONFIGURATION);
                 if server_configuration.is_file() {
@@ -1277,22 +1293,34 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let server = Server {
                     listen: Some(listen.clone()),
-                    token,
-                    permissions: match permissions.is_empty() {
+                    token: token.clone(),
+                    refuse: match refuse.is_empty() {
                         true => None,
-                        false => Some(permissions),
+                        false => Some(refuse.clone()),
                     },
                 };
-                // Parsed before the file is written, so a misspelled permission
-                // is a message here rather than a `serve` that will not start.
-                let allowed = server.permissions()?;
-                let configuration = match toml_edit::ser::to_string_pretty(&server) {
-                    Ok(configuration) => configuration,
-                    Err(error) => {
-                        return Err(anyhow::Error::new(error)
-                            .context("Could not render the server configuration"));
-                    }
+                // Parsed before the file is written, so a misspelled name is a
+                // message here rather than a `serve` that will not start.
+                let allowed = server.allowed()?;
+
+                // Rendered from the template rather than serialized from
+                // `server`, because serializing loses every comment — and the
+                // comments are most of what this file is. A generated
+                // `refuse = []` says nothing; the template's twenty lines above
+                // it say what the six names are, which two destroy, and why the
+                // list is of refusals.
+                let token_line = match &token {
+                    Some(token) => format!("token = {}", quoted(token)),
+                    None => "# token = \"a-long-random-string\"".to_string(),
                 };
+                let mut names = Vec::new();
+                for name in &refuse {
+                    names.push(quoted(name));
+                }
+                let configuration = include_str!("server.toml")
+                    .replace("@LISTEN@", &listen)
+                    .replace("@TOKEN@", &token_line)
+                    .replace("@REFUSE@", &names.join(", "));
 
                 fs::create_dir_all(&settings.home).with_context(|| {
                     format!("Could not create home directory {:?}", settings.home)
@@ -1314,7 +1342,8 @@ async fn main() -> anyhow::Result<()> {
                     configuration = ?server_configuration,
                     listen = listen,
                     token = server.token.is_some(),
-                    permissions = allowed.len(),
+                    refused = refuse.join(","),
+                    allowed = allowed.len(),
                     "initialized server configuration",
                 );
                 println!(
@@ -1335,7 +1364,7 @@ async fn main() -> anyhow::Result<()> {
                 server = read_configuration(&server_configuration)?;
                 tracing::debug!(configuration = ?server_configuration, "read server configuration");
             }
-            let permissions = server.permissions()?;
+            let permissions = server.allowed()?;
             let address = match server.listen {
                 Some(listen) => listen,
                 None => DEFAULT_LISTEN_ADDRESS.to_string(),
@@ -2406,6 +2435,33 @@ fn print_outline(outline: &crate::api::Outline) {
 }
 
 /// Unix milliseconds as a date a person can read, and `-` for no time at all.
+/// One TOML basic string, quoted and escaped.
+///
+/// `format!("{text:?}")` is nearly this and not quite: Rust escapes an
+/// unprintable character as `\u{1}`, which TOML does not accept. The permission
+/// names are known-safe, but the token is whatever was typed on the command
+/// line, and a token that lands in the file wrongly quoted is a server that
+/// will not start.
+fn quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if (character as u32) < 0x20 || character as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", character as u32));
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn stamp(ts: Option<i64>) -> String {
     let Some(ts) = ts else {
         return "-".to_string();

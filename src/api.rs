@@ -46,9 +46,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    // Deliberately says nothing about how to enable the operation.
+    //
+    // It used to name the key and the file: `add "replace" to permissions in
+    // server.toml and restart it`. A model that read that took it as a repair
+    // instruction and went looking for the file, and when it could not restart
+    // the server it tried again — the error had turned a settled decision into
+    // a task. An error is read by whoever is holding the failure, and here that
+    // is the caller, who is precisely the party the refusal is aimed at. The
+    // person who can change it is not in this conversation.
     #[error(
-        "this server is not allowed to {permission} — add {permission:?} to \
-         permissions in server.toml and restart it"
+        "refused: this server does not do {permission}. This is how it is \
+         configured, not a fault and not a problem to solve — do not retry, do \
+         not go looking for the configuration, and do not restart anything. \
+         Report it to the person you are working for and let them decide."
     )]
     Forbidden { permission: &'static str },
 
@@ -139,8 +150,13 @@ impl Stats {
 /// token's business, and a server that answers a search at all can answer any
 /// search. These are the operations that leave the store different afterwards,
 /// which is a different question with a different answer per deployment — a
-/// read-mostly server behind an agent wants `add` and nothing else, and the one
-/// place `delete` belongs is a workstation.
+/// read-mostly server behind an agent may want `add` and nothing else, and the
+/// one place `delete` belongs is a workstation.
+///
+/// **Every one of them is allowed unless `server.toml` refuses it by name.**
+/// The configuration is a list of what this server will not do, not a list of
+/// what it will; see [`Permission::ALL`], which is what an absent list resolves
+/// to.
 ///
 /// The CLI does not consult these. It is running as whoever invoked it, on
 /// files they can already remove with `rm`, and a permission list in a file
@@ -157,26 +173,22 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// Everything the server may do when `permissions` is not in `server.toml`.
+    /// Every operation there is, and what a server with no `refuse` list does.
     ///
-    /// Everything except [`Permission::Delete`], which is the whole of the
-    /// reasoning: a configuration file written before this key existed cannot
-    /// have consented to anything, so the compatible default is what the server
-    /// could already do — and it could not delete, because there was nothing to
-    /// delete with. Every other operation stays on so that adding the key is
-    /// what turns deletion on, not what turns writing back on.
+    /// The default is *everything*, including the two that destroy. That is a
+    /// choice about who is being protected from what: the store belongs to
+    /// whoever started the server, on files they can already remove with `rm`,
+    /// and a default that withholds `delete` from them protects nobody — it
+    /// only produces a refusal on the day they meant it, from a server they
+    /// configured themselves.
     ///
-    /// [`Permission::Replace`] is absent for exactly that reason and no other.
-    /// It overwrites a stored body with no copy kept, so it is the second
-    /// operation this server can do that destroys something — and a file
-    /// written before it existed cannot have consented to it either.
-    pub const DEFAULT: [Permission; 4] = [
-        Permission::Create,
-        Permission::Update,
-        Permission::Add,
-        Permission::Rescan,
-    ];
-
+    /// What the refusals are for is the other direction: a server that a model
+    /// talks to, where `refuse = ["delete", "replace"]` says *this agent may
+    /// write and may not destroy*. That is a sentence someone has to mean, so
+    /// it has to be written down, and the file says what is withheld rather
+    /// than what is granted — a granting list quietly withholds every operation
+    /// added after it was written, which is how `replace` arrived switched off
+    /// on servers whose owners had never heard of it.
     pub const ALL: [Permission; 6] = [
         Permission::Create,
         Permission::Update,
@@ -198,9 +210,9 @@ impl Permission {
     }
 
     /// Parse one name from `server.toml`. An unknown name is refused rather
-    /// than ignored: a typo in a permission list is silently a *denial*, and
-    /// the failure it produces is a 403 hours later on the one request that
-    /// needed it.
+    /// than ignored: a typo in a `refuse` list is silently a *permission*, and
+    /// the failure it produces is not an error at all — it is the destructive
+    /// operation somebody meant to switch off, running.
     pub fn parse(text: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
