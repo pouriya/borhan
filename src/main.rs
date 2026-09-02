@@ -188,6 +188,14 @@ pub struct CommandLine {
     #[arg(long, global = true)]
     pub debug: bool,
 
+    /// Enable info level logging: one line per operation, with its timings.
+    ///
+    /// Off by default. A command reports its own result on stdout, so the
+    /// operation line is a second copy of something the reader already has —
+    /// useful to a server writing to a journal, noise in a terminal.
+    #[arg(long, global = true)]
+    pub info: bool,
+
     /// Disable all logging.
     #[arg(long, global = true)]
     pub quiet: bool,
@@ -946,6 +954,16 @@ impl Server {
 }
 
 impl CommandLine {
+    /// The most verbose flag given wins, except `--quiet`, which wins over
+    /// everything.
+    ///
+    /// The default is `WARN` and not `INFO`. Every operation logs an `info`
+    /// line carrying what it did and how long each phase took, which is what a
+    /// server's journal is for and is exactly duplicated, for a one-shot
+    /// command, by the result the command already prints. Defaulting to `INFO`
+    /// meant every `memory search` answered twice: once as a table for the
+    /// person, once as JSON for nobody. `warn` still shows the things a silent
+    /// success would hide — a fallback taken, an error swallowed.
     pub fn logging_level(&self) -> LevelFilter {
         if self.quiet {
             LevelFilter::OFF
@@ -953,8 +971,10 @@ impl CommandLine {
             LevelFilter::TRACE
         } else if self.debug {
             LevelFilter::DEBUG
-        } else {
+        } else if self.info {
             LevelFilter::INFO
+        } else {
+            LevelFilter::WARN
         }
     }
 }
