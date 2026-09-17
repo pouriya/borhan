@@ -84,7 +84,7 @@ struct Rejection {
     message: String,
 }
 
-pub async fn endpoint(
+pub(crate) async fn endpoint(
     State(app): State<Arc<App>>,
     Extension(RequestTrace(trace)): Extension<RequestTrace>,
     headers: HeaderMap,

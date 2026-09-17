@@ -1,11 +1,3 @@
-mod api;
-mod index;
-mod mcp;
-mod normalize;
-mod search;
-mod storage;
-mod ulid;
-
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -18,10 +10,10 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{filter::LevelFilter, fmt};
 
-use crate::index::Index;
-use crate::search::Filter;
-use crate::storage::{Entry, Revision, Role, Storage};
-use crate::ulid::Ulid;
+use borhan::index::Index;
+use borhan::search::Filter;
+use borhan::storage::{Entry, Revision, Role, Storage};
+use borhan::ulid::Ulid;
 
 /// Name of the environment variable holding the user's home directory.
 ///
@@ -78,9 +70,6 @@ const REMEMBER_SKILL: &str = "borhan-remember";
 /// Name of the survey skill on disk, and the slash command it becomes. Prefixed
 /// for the same reason as [`REMEMBER_SKILL`].
 const SURVEY_SKILL: &str = "borhan-survey";
-
-/// Where `serve` listens when `server.toml` does not say otherwise.
-const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:1995";
 
 /// Words of a snippet shown on one line of `memory search` results.
 ///
@@ -962,7 +951,7 @@ pub enum MemoryCommand {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
-    /// Address to bind, and the address the CLI probes. [`DEFAULT_LISTEN_ADDRESS`]
+    /// Address to bind, and the address the CLI probes. [`borhan::DEFAULT_LISTEN_ADDRESS`]
     /// when unset for `serve`; the CLI treats a missing value as "use storage".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
@@ -997,14 +986,14 @@ impl Server {
     /// in which that matters most: a skipped name in a refusal list is an
     /// operation left switched **on**. `refuse = ["delte"]` ignored is a server
     /// that deletes, and nothing about the day it does will point back here.
-    fn allowed(&self) -> anyhow::Result<Vec<crate::api::Permission>> {
+    fn allowed(&self) -> anyhow::Result<Vec<borhan::api::Permission>> {
         let mut refused = Vec::new();
         if let Some(names) = &self.refuse {
             for name in names {
-                match crate::api::Permission::parse(name) {
+                match borhan::api::Permission::parse(name) {
                     Some(permission) => refused.push(permission),
                     None => {
-                        let known: Vec<&str> = crate::api::Permission::ALL
+                        let known: Vec<&str> = borhan::api::Permission::ALL
                             .iter()
                             .map(|permission| permission.as_str())
                             .collect();
@@ -1014,7 +1003,7 @@ impl Server {
             }
         }
         let mut allowed = Vec::new();
-        for permission in crate::api::Permission::ALL {
+        for permission in borhan::api::Permission::ALL {
             if !refused.contains(&permission) {
                 allowed.push(permission);
             }
@@ -1275,15 +1264,15 @@ async fn main() -> anyhow::Result<()> {
                 // `ExecStartPre` leans on — one line that sets a machine up the
                 // first time and keeps the indexes honest on every boot after.
                 println!("Already initialized: {}", storage.display());
-                let (memories, _) = crate::api::list(&storage, &Ulid::new()?)?;
+                let (memories, _) = borhan::api::list(&storage, &Ulid::new()?)?;
                 for memory in &memories {
                     let store = Storage::open(&storage, &memory.name)?;
-                    let built = Index::attach(&store.directory.join(crate::index::DIRECTORY))?;
+                    let built = Index::attach(&store.directory.join(borhan::index::DIRECTORY))?;
                     let writer = built.writer()?;
                     let store = Mutex::new(store);
                     let writer = Mutex::new(writer);
                     let (messages, units, _) =
-                        crate::api::rescan(&store, &built, &writer, &memory.name, &Ulid::new()?)?;
+                        borhan::api::rescan(&store, &built, &writer, &memory.name, &Ulid::new()?)?;
                     println!(
                         "Rescanned {}: {messages} messages, {units} units",
                         memory.name
@@ -1380,10 +1369,10 @@ async fn main() -> anyhow::Result<()> {
             let permissions = server.allowed()?;
             let address = match server.listen {
                 Some(listen) => listen,
-                None => DEFAULT_LISTEN_ADDRESS.to_string(),
+                None => borhan::DEFAULT_LISTEN_ADDRESS.to_string(),
             };
 
-            let router = crate::api::router(crate::api::App::new(
+            let router = borhan::api::router(borhan::api::App::new(
                 storage.clone(),
                 server.token.clone(),
                 permissions.clone(),
@@ -1455,9 +1444,9 @@ async fn main() -> anyhow::Result<()> {
                         check_storage(&settings.home, &storage, "memory create ...")?;
                         let trace = Ulid::new()?;
                         let (id, stats) =
-                            crate::api::create(&storage, &name, &description, &languages, &trace)?;
+                            borhan::api::create(&storage, &name, &description, &languages, &trace)?;
                         if json {
-                            print_pretty(&crate::api::id_json(&id, &stats))?;
+                            print_pretty(&borhan::api::id_json(&id, &stats))?;
                         } else {
                             println!("{id}");
                         }
@@ -1473,9 +1462,9 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         check_storage(&settings.home, &storage, "memory list")?;
                         let trace = Ulid::new()?;
-                        let (memories, stats) = crate::api::list(&storage, &trace)?;
+                        let (memories, stats) = borhan::api::list(&storage, &trace)?;
                         if json {
-                            print_pretty(&crate::api::list_json(&memories, &stats))?;
+                            print_pretty(&borhan::api::list_json(&memories, &stats))?;
                         } else {
                             print_memory_list(&memories);
                         }
@@ -1521,7 +1510,7 @@ async fn main() -> anyhow::Result<()> {
                         check_storage(&settings.home, &storage, "memory update ...")?;
                         let store = Storage::open(&storage, &name)?;
                         let trace = Ulid::new()?;
-                        let (id, stats) = crate::api::update(
+                        let (id, stats) = borhan::api::update(
                             &store,
                             &name,
                             description.as_deref(),
@@ -1529,7 +1518,7 @@ async fn main() -> anyhow::Result<()> {
                             &trace,
                         )?;
                         if json {
-                            print_pretty(&crate::api::id_json(&id, &stats))?;
+                            print_pretty(&borhan::api::id_json(&id, &stats))?;
                         } else {
                             println!("{id}");
                         }
@@ -1564,7 +1553,7 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         check_storage(&settings.home, &storage, "memory delete ...")?;
                         let trace = Ulid::new()?;
-                        let (memory, stats) = crate::api::delete(&storage, &name, None, &trace)?;
+                        let (memory, stats) = borhan::api::delete(&storage, &name, None, &trace)?;
                         if json {
                             print_pretty(&serde_json::json!({
                                 "id": memory.id.to_string(),
@@ -1653,7 +1642,7 @@ async fn main() -> anyhow::Result<()> {
                         };
                         let trace = Ulid::new()?;
                         let (written, stats) =
-                            crate::api::add(&store, &built, &writer, &entry, &name, &trace)?;
+                            borhan::api::add(&store, &built, &writer, &entry, &name, &trace)?;
                         if json {
                             print_pretty(&serde_json::json!({
                                 "id": written.message.to_string(),
@@ -1691,9 +1680,9 @@ async fn main() -> anyhow::Result<()> {
                         let store = Storage::open(&storage, &name)?;
                         let trace = Ulid::new()?;
                         let (outline, stats) =
-                            crate::api::outline(&store, &name, session.as_deref(), &trace)?;
+                            borhan::api::outline(&store, &name, session.as_deref(), &trace)?;
                         if json {
-                            print_pretty(&crate::api::outline_json(&outline, &stats))?;
+                            print_pretty(&borhan::api::outline_json(&outline, &stats))?;
                         } else {
                             print_outline(&outline);
                         }
@@ -1750,8 +1739,9 @@ async fn main() -> anyhow::Result<()> {
                             body: &text,
                         };
                         let trace = Ulid::new()?;
-                        let (id, units, reindexed, stats) =
-                            crate::api::replace(&store, &built, &writer, &revision, &name, &trace)?;
+                        let (id, units, reindexed, stats) = borhan::api::replace(
+                            &store, &built, &writer, &revision, &name, &trace,
+                        )?;
                         if json {
                             print_pretty(&serde_json::json!({
                                 "id": id.to_string(),
@@ -1834,7 +1824,7 @@ async fn main() -> anyhow::Result<()> {
                         let store = Storage::open(&storage, &name)?;
                         let built = Index::open(&store)?;
                         let trace = Ulid::new()?;
-                        let (outcome, stats) = crate::api::search(
+                        let (outcome, stats) = borhan::api::search(
                             &store,
                             &built,
                             &name,
@@ -1844,7 +1834,7 @@ async fn main() -> anyhow::Result<()> {
                             &trace,
                         )?;
                         if json {
-                            print_pretty(&crate::api::search_json(&outcome, &stats))?;
+                            print_pretty(&borhan::api::search_json(&outcome, &stats))?;
                         } else {
                             print_search(&outcome);
                         }
@@ -1890,14 +1880,14 @@ async fn main() -> anyhow::Result<()> {
                         }
                         let store = Storage::open(&storage, &name)?;
                         let trace = Ulid::new()?;
-                        let (rows, missing, stats) = crate::api::cursor(
+                        let (rows, missing, stats) = borhan::api::cursor(
                             &store, &name, &units, before, after, messages, &trace,
                         )?;
                         for unit in &missing {
                             eprintln!("No unit {unit}");
                         }
                         if json {
-                            print_pretty(&crate::api::cursor_json(
+                            print_pretty(&borhan::api::cursor_json(
                                 &rows, &units, &missing, messages, &stats,
                             ))?;
                         } else {
@@ -1925,9 +1915,9 @@ async fn main() -> anyhow::Result<()> {
                         let store = Storage::open(&storage, &name)?;
                         let built = Index::open(&store)?;
                         let trace = Ulid::new()?;
-                        let (rows, stats) = crate::api::lexicon(&built, &name, &words, &trace)?;
+                        let (rows, stats) = borhan::api::lexicon(&built, &name, &words, &trace)?;
                         if json {
-                            print_pretty(&crate::api::lexicon_json(&rows, &stats))?;
+                            print_pretty(&borhan::api::lexicon_json(&rows, &stats))?;
                         } else {
                             print_lexicon(&rows);
                         }
@@ -1955,13 +1945,13 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         check_storage(&settings.home, &storage, "memory rescan ...")?;
                         let store = Storage::open(&storage, &name)?;
-                        let built = Index::attach(&store.directory.join(crate::index::DIRECTORY))?;
+                        let built = Index::attach(&store.directory.join(borhan::index::DIRECTORY))?;
                         let writer = built.writer()?;
                         let store = Mutex::new(store);
                         let writer = Mutex::new(writer);
                         let trace = Ulid::new()?;
                         let (messages, units, stats) =
-                            crate::api::rescan(&store, &built, &writer, &name, &trace)?;
+                            borhan::api::rescan(&store, &built, &writer, &name, &trace)?;
                         if json {
                             print_pretty(&serde_json::json!({
                                 "messages": messages,
@@ -2312,7 +2302,7 @@ fn print_deleted(name: &str, sessions: u64, messages: u64, units: u64) {
     println!("Deleted {name}: {sessions} sessions, {messages} messages, {units} units.");
 }
 
-fn print_memory_list(memories: &[crate::storage::Memory]) {
+fn print_memory_list(memories: &[borhan::storage::Memory]) {
     if memories.is_empty() {
         eprintln!("No memories yet — `borhan memory create <name>`.");
         return;
@@ -2384,9 +2374,9 @@ fn print_block_list(titles: &[&str], rows: &[Vec<String>], bodies: &[String]) {
     }
 }
 
-fn print_outline(outline: &crate::api::Outline) {
+fn print_outline(outline: &borhan::api::Outline) {
     match outline {
-        crate::api::Outline::Sessions(sessions) => {
+        borhan::api::Outline::Sessions(sessions) => {
             if sessions.is_empty() {
                 eprintln!("No sessions yet — `borhan memory add <name> ... --session <id>`.");
                 return;
@@ -2404,7 +2394,7 @@ fn print_outline(outline: &crate::api::Outline) {
             }
             print_table(&TITLES, &rows);
         }
-        crate::api::Outline::Messages(messages) => {
+        borhan::api::Outline::Messages(messages) => {
             const TITLES: [&str; 7] = [
                 "message",
                 "seq",
@@ -2483,7 +2473,7 @@ fn print_outline_json(body: &serde_json::Value) -> anyhow::Result<()> {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            sessions.push(crate::storage::SessionRow {
+            sessions.push(borhan::storage::SessionRow {
                 id,
                 reference: session["session"].as_str().unwrap_or("").to_string(),
                 started_at: session["started_at"].as_i64().unwrap_or(0),
@@ -2492,7 +2482,7 @@ fn print_outline_json(body: &serde_json::Value) -> anyhow::Result<()> {
                 units: session["units"].as_u64().unwrap_or(0),
             });
         }
-        print_outline(&crate::api::Outline::Sessions(sessions));
+        print_outline(&borhan::api::Outline::Sessions(sessions));
         return Ok(());
     }
 
@@ -2509,7 +2499,7 @@ fn print_outline_json(body: &serde_json::Value) -> anyhow::Result<()> {
             Some(role) => role,
             None => Role::User,
         };
-        messages.push(crate::storage::MessageRow {
+        messages.push(borhan::storage::MessageRow {
             id,
             reference: message["message"].as_str().map(str::to_string),
             seq: message["seq"].as_i64().unwrap_or(0),
@@ -2520,7 +2510,7 @@ fn print_outline_json(body: &serde_json::Value) -> anyhow::Result<()> {
             units: message["units"].as_u64().unwrap_or(0),
         });
     }
-    print_outline(&crate::api::Outline::Messages(messages));
+    print_outline(&borhan::api::Outline::Messages(messages));
     Ok(())
 }
 
@@ -2538,7 +2528,7 @@ fn print_memory_list_json(body: &serde_json::Value) -> anyhow::Result<()> {
             Ok(id) => id,
             Err(_) => continue,
         };
-        memories.push(crate::storage::Memory {
+        memories.push(borhan::storage::Memory {
             id,
             name: memory["name"].as_str().unwrap_or("").to_string(),
             description: memory["description"].as_str().map(str::to_string),
@@ -2561,7 +2551,7 @@ fn matched_cell(matched: &[String], nearby: &[String]) -> String {
     format!("[{}]", cells.join(","))
 }
 
-fn print_search(outcome: &crate::search::Outcome) {
+fn print_search(outcome: &borhan::search::Outcome) {
     for unknown in &outcome.unknown {
         eprintln!(
             "unknown: {:?} (in {:?}) matched nothing",
@@ -2701,7 +2691,7 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_cursor(rows: &[crate::storage::Located], asked: &[Ulid], whole: bool) {
+fn print_cursor(rows: &[borhan::storage::Located], asked: &[Ulid], whole: bool) {
     let mut table = Vec::new();
     let mut bodies = Vec::new();
     if whole {
@@ -2806,7 +2796,7 @@ fn print_cursor_json(body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_lexicon(rows: &[crate::api::Lexeme]) {
+fn print_lexicon(rows: &[borhan::api::Lexeme]) {
     const TITLES: [&str; 4] = ["word", "surface", "lemma", "context"];
     let mut table = Vec::new();
     for row in rows {

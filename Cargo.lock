@@ -171,6 +171,7 @@ dependencies = [
  "serde_json",
  "tantivy",
  "tanzim",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml_edit",

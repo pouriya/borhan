@@ -154,6 +154,11 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 
 
+[dev-dependencies]
+# A directory per test for `--home`, removed when the test ends. Already in the
+# tree under tantivy.
+tempfile = "3.27.0"
+
 [profile.release]
 opt-level = 'z'     # Optimize for size.
 lto = true          # Enable Link Time Optimization
