@@ -1,6 +1,6 @@
 [package]
 name = "borhan"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Keyword memory for AI agents over MCP, CLI and HTTP, for Persian and English text"
 authors = ["Pouriya Jahanbakhsh <pouriya.jb@gmail.com>"]
