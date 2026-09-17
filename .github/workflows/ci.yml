@@ -66,7 +66,7 @@ jobs:
           }
 
           Run init
-          Run memory create notes --languages fa,en --description "Continuous integration check on Windows: one message in Persian and English, stored, searched and then deleted again."
+          Run memory create notes --languages 'fa,en' --description "Continuous integration check on Windows: one message in Persian and English, stored, searched and then deleted again."
           Run memory add notes --session ci --role user --author ci "We retry failed webhooks with exponential backoff. خطای ۵۰۰ از درگاه پرداخت را هم دوباره تلاش می‌کنیم."
           $hits = Run memory search notes '(retry retries) +(خطا error)' | Out-String
           Write-Host $hits

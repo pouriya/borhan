@@ -38,7 +38,7 @@ fn search(
     fuzzy: bool,
     filter: &Filter,
     page: (usize, usize),
-) -> Result<Outcome, api::Error> {
+) -> Result<Outcome, Box<api::Error>> {
     let trace = Ulid::new().unwrap();
     match api::search(
         store,
@@ -50,7 +50,7 @@ fn search(
         &trace,
     ) {
         Ok((outcome, _)) => Ok(outcome),
-        Err(error) => Err(error),
+        Err(error) => Err(Box::new(error)),
     }
 }
 
@@ -240,8 +240,10 @@ fn what_a_query_cannot_say() {
     let refused =
         |query: &str| match search(&store, &index, query, false, &Filter::default(), (10, 2)) {
             Ok(outcome) => panic!("{query:?} was accepted with {} hits", outcome.hits.len()),
-            Err(api::Error::Search(error)) => error,
-            Err(error) => panic!("{query:?}: {error}"),
+            Err(error) => match *error {
+                api::Error::Search(error) => error,
+                error => panic!("{query:?}: {error}"),
+            },
         };
 
     assert!(matches!(refused(""), Error::Empty));
