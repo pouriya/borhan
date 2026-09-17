@@ -2,8 +2,18 @@
 name = "borhan"
 version = "0.1.0"
 edition = "2024"
-description = "Memory store: a SQLite source of truth under a tantivy index"
+description = "Keyword memory for AI agents over MCP, CLI and HTTP, for Persian and English text"
 authors = ["Pouriya Jahanbakhsh <pouriya.jb@gmail.com>"]
+# Edition 2024 and let-chains, and ordered-float (under tantivy) needs 1.90.
+# Without this an older toolchain reports a wall of errors instead of saying it
+# is too old.
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/pouriya/borhan"
+homepage = "https://github.com/pouriya/borhan"
+readme = "README.md"
+keywords = ["memory", "mcp", "search", "persian", "agent"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 # Metadata / keyword store. `bundled` compiles SQLite from source: no
@@ -63,9 +73,8 @@ chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 
 # The inverted index: term dictionary, postings, positions, fieldnorms, BM25,
 # segment merging, and the query syntax a search is written in, parsed by its
-# grammar and scored per word and per phrase by its weights. Everything layer
-# two of the design document describes, with an FST-backed dictionary and a
-# segment format that no hand-rolled SQLite posting table is going to beat. What
+# grammar and scored per word and per phrase by its weights. An FST-backed
+# dictionary and a segment format that no hand-rolled SQLite posting table is going to beat. What
 # is *not* delegated is the tokenizer — tantivy has no notion of ZWNJ, ک/ی
 # folding or Persian morphology, and no Snowball algorithm for Persian exists to
 # delegate them to — and the loop combining those scores, because best-in-clause,

@@ -1,0 +1,115 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  # The whole gate is `make all`, because that is the gate a contributor runs
+  # before committing. Anything CI checks that the Makefile does not is a check
+  # nobody can reproduce locally.
+  #
+  # Windows is here rather than in a workflow of its own because it is the
+  # platform nobody working on borhan runs: whatever is not checked on every
+  # push is checked by a user, after a release. Everything runs under Git Bash
+  # there, because the recipes are sh.
+  gate:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # A Windows runner ships no make at all.
+      - if: runner.os == 'Windows'
+        run: choco install make -y --no-progress
+      - run: make all
+
+  # install.sh is exercised by anyone who installs; install.ps1 is exercised by
+  # nobody until it is broken. So: build the archive a release would publish,
+  # install from it, and use what comes out — locally, then through a running
+  # `serve`, ending in the two operations that remove index files while a server
+  # has that index open, which Unix allows and Windows may not.
+  windows-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - shell: bash
+        run: |
+          choco install make -y --no-progress
+          make dist TARGET=x86_64-pc-windows-msvc
+
+      - shell: pwsh
+        run: |
+          $zip = Get-ChildItem build/dist/*.zip | Select-Object -First 1
+          $env:BORHAN_ARCHIVE = $zip.FullName
+          $env:BORHAN_BIN_DIR = "$env:RUNNER_TEMP\borhan-bin"
+          ./install.ps1
+
+      - name: the installed binary stores, searches and deletes
+        shell: pwsh
+        run: |
+          $borhan = "$env:RUNNER_TEMP\borhan-bin\borhan.exe"
+          $home_ = "$env:RUNNER_TEMP\borhan-home"
+          function Run {
+            & $borhan --home $home_ @args
+            if ($LASTEXITCODE -ne 0) { throw "borhan $args exited $LASTEXITCODE" }
+          }
+
+          Run init
+          Run memory create notes --languages fa,en --description "Continuous integration check on Windows: one message in Persian and English, stored, searched and then deleted again."
+          Run memory add notes --session ci --role user --author ci "We retry failed webhooks with exponential backoff. خطای ۵۰۰ از درگاه پرداخت را هم دوباره تلاش می‌کنیم."
+          $hits = Run memory search notes '(retry retries) +(خطا error)' | Out-String
+          Write-Host $hits
+          if ($hits -notmatch '2/2') { throw "local search did not cover both ideas" }
+
+          Run init server --listen 127.0.0.1:1995
+          $server = Start-Process -FilePath $borhan -ArgumentList '--home', $home_, 'serve' -PassThru -NoNewWindow
+          try {
+            $up = $false
+            foreach ($i in 1..50) {
+              try { Invoke-RestMethod http://127.0.0.1:1995/api/v1/health | Out-Null; $up = $true; break }
+              catch { Start-Sleep -Milliseconds 200 }
+            }
+            if (-not $up) { throw "serve never answered /api/v1/health" }
+
+            $hits = Run memory search notes '"exponential backoff"' | Out-String
+            Write-Host $hits
+            if ($hits -notmatch '1/1') { throw "search through serve found nothing" }
+            Run memory rescan notes
+            Run memory delete notes --yes
+          }
+          finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+  # The image is built from the Makefile like everything else, and started the
+  # way its README line starts it: a Dockerfile that builds but whose first start
+  # fails is only found by the first person who pulls it.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: make docker
+      - run: |
+          docker run -d --name borhan -p 127.0.0.1:1995:1995 -e BORHAN_TOKEN=ci borhan:latest
+          for i in $(seq 50); do
+            if curl -sf -H 'Authorization: Bearer ci' http://127.0.0.1:1995/api/v1/health; then
+              up=1; break
+            fi
+            sleep 0.2
+          done
+          docker logs borhan
+          [ -n "${up:-}" ] || { echo "the container never answered /api/v1/health"; exit 1; }
+          docker exec borhan borhan memory create notes --description "Continuous integration check of the Docker image: one message stored and searched through the running server."
+          docker exec borhan borhan memory add notes --session ci --role user --author ci "We retry failed webhooks with exponential backoff."
+          docker exec borhan borhan memory search notes '"exponential backoff"' | grep -q '1/1'

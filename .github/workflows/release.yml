@@ -1,0 +1,103 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  # A tag that disagrees with the version in Cargo.toml produces a release whose
+  # tarballs are named after something else, and a binary whose `--version` and
+  # `X-Borhan-Version` header say a third thing. Fail here, before anything is
+  # built.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          tag="${GITHUB_REF_NAME#v}"
+          have="$(make version)"
+          if [ "$tag" != "$have" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($have)"
+            exit 1
+          fi
+
+  build:
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { runner: macos-latest,     target: aarch64-apple-darwin }
+          - { runner: macos-latest,     target: x86_64-apple-darwin }
+          # x86_64 only. Windows on ARM runs x64 binaries under emulation, and
+          # install.ps1 hands ARM machines this same archive: one verified build
+          # beats a second one nothing has ever run.
+          - { runner: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # musl, so one Linux binary runs on any distribution. SQLite and zstd
+      # are compiled from C by their build scripts, which is what musl-gcc is for.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # A Windows runner ships no make at all. It does ship Git Bash, which is
+      # why the build step runs under it: the Makefile's recipes are sh.
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: choco install make -y --no-progress
+      # The only thing this workflow knows how to do. Packaging lives in the
+      # Makefile so a release can be reproduced by hand.
+      - shell: bash
+        run: make dist TARGET=${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          # Windows packages a zip, for install.ps1's Expand-Archive. Everything
+          # else stays a tarball.
+          path: |
+            build/dist/*.tar.gz*
+            build/dist/*.zip*
+
+  # One linux/amd64 image, pushed as ghcr.io/<owner>/borhan:<version> and :latest.
+  # Built by the Makefile so the image can be reproduced by hand; logging in,
+  # tagging and pushing are this workflow's business and live only here.
+  docker:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: make docker
+      - env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          version="$(make version)"
+          image="ghcr.io/${{ github.repository_owner }}/borhan"
+          for tag in "$version" latest; do
+            docker tag "borhan:$version" "$image:$tag"
+            docker push "$image:$tag"
+          done
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

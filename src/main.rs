@@ -311,11 +311,13 @@ pub enum Command {
     /// for it and what is worth putting in, and neither of those fits in a tool
     /// description.
     ///
-    /// There is one so far:
+    /// There are two:
     ///
     /// borhan skills remember             # print it
     ///
     /// borhan skills remember --install   # write it where the agents read
+    ///
+    /// borhan skills survey --install     # the same, for the codebase skill
     Skills {
         #[command(subcommand)]
         command: Option<SkillCommand>,

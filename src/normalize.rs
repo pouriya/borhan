@@ -247,7 +247,7 @@ pub fn lemma(word: &str, script: Script) -> String {
     // 40-character sha are not words, and the morphology below is a set of
     // rules about words; running it on them mangles the one kind of token
     // where exact matching is the entire value.
-    if !embeddable(&folded, script) {
+    if !word_shaped(&folded, script) {
         return folded.replace('\u{200C}', "");
     }
     // Latin words go through Snowball English (Porter2). This is the whole of
@@ -269,8 +269,8 @@ pub fn lemma(word: &str, script: Script) -> String {
     // Alef with madda to bare alef. [`surface`] leaves this alone so that
     // `آسم` and `اسم` stay two words there; here, on the field whose whole
     // job is recall, they become one — which is what rescues a corpus whose
-    // producer dropped the madda, as the extracted triage deck did on every
-    // one of its pages, from being unsearchable by anybody typing the word
+    // producer dropped the madda, as text extracted from PDFs often does on
+    // every page, from being unsearchable by anybody typing the word
     // correctly. The exact spelling still outscores it when the corpus has it.
     let folded = match folded.contains('\u{0622}') {
         true => folded.replace('\u{0622}', "\u{0627}"),
@@ -356,15 +356,14 @@ pub fn lemma(word: &str, script: Script) -> String {
     stem.replace('\u{200C}', "")
 }
 
-/// Whether a token is word-shaped enough that morphology and, later, any
-/// expansion may touch it.
+/// Whether a token is word-shaped enough that morphology may touch it.
 ///
 /// False for digits, underscores, dots, slashes, internal capitals and
 /// excessive length — which is to say, for identifiers. They keep their term
 /// and match exactly; they just have no path by which a search for something
 /// else can reach them, and that is the correct behaviour for a token whose
 /// whole meaning is that it is spelled that way.
-pub fn embeddable(word: &str, script: Script) -> bool {
+pub fn word_shaped(word: &str, script: Script) -> bool {
     if word.chars().count() > LONG || script == Script::Other {
         return false;
     }

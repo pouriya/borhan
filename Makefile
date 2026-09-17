@@ -6,9 +6,14 @@ BINARY_NAME := $(if $(findstring windows,$(TARGET)),borhan.exe,borhan)
 RELEASE_FILENAME_POSTFIX := $(if $(findstring windows,$(TARGET)),.exe,)
 CMD=${BUILD_DIR}/borhan-${VERSION}-${TARGET}${RELEASE_FILENAME_POSTFIX}
 DEV_CMD=${BUILD_DIR}/borhan-${VERSION}-${TARGET}-dev${RELEASE_FILENAME_POSTFIX}
+DIST_DIR=${BUILD_DIR}/dist
+DIST_NAME=borhan-${VERSION}-${TARGET}
+# A zip for Windows, because install.ps1 unpacks with Expand-Archive, which is in
+# every PowerShell; a tarball everywhere else, because tar is on every Unix.
+ARCHIVE := $(if $(findstring windows,$(TARGET)),${DIST_NAME}.zip,${DIST_NAME}.tar.gz)
 
-# A corpus to scan into a real storage, so that the splitter, the vector index
-# and search get exercised on something bigger than a hand-typed sentence.
+# A corpus to scan into a real storage, so that the splitter, the index and
+# search get exercised on something bigger than a hand-typed sentence.
 # Override the four variables to point at any repository of Markdown files:
 #
 #     make seed SEED_REPO=https://github.com/rust-lang/reference.git \
@@ -20,8 +25,8 @@ SEED_NAME ?= rfcs
 SEED_DIR=$(CURDIR)/seed/${SEED_NAME}
 
 # Documents to scan. The whole of rust-lang/rfcs is ~3 minutes; the default
-# slice is well past the 1024 rows where the vector index gets built, which is
-# the interesting threshold. `make seed SEED_LIMIT=99999` for all of it.
+# slice is enough for BM25's document frequencies to mean something.
+# `make seed SEED_LIMIT=99999` for all of it.
 SEED_LIMIT ?= 200
 
 # The seed writes into the working tree, never into ~/.borhan: BORHAN_HOME is
@@ -43,6 +48,13 @@ SERVER_LISTEN ?= 127.0.0.1:${SERVER_PORT}
 # Same name main.rs appends to a user's home when --home is absent.
 BORHAN_HOME_DIRECTORY=.borhan
 
+# `make docker`. DOCKER_REGISTRY is a prefix for both base images, with its
+# trailing slash (`registry.example.com/`), for a machine that cannot reach
+# Docker Hub; empty means Docker Hub.
+DOCKER_REGISTRY ?=
+DOCKER_ALPINE_VERSION ?= 3.23
+DOCKER_IMAGE_VERSION ?= ${VERSION}
+
 
 all: dev clippy test check-style
 
@@ -51,6 +63,55 @@ release: ${BUILD_DIR}
 	cargo build --release --target ${TARGET}
 	@ cp ${CARGO_TARGET_DIR}/${TARGET}/release/$(BINARY_NAME) ${CMD}
 	@ ls -sh ${BUILD_DIR}/borhan-*
+
+
+# One release archive for one target triple, and its checksum, in ${DIST_DIR}.
+# `.github/workflows/release.yml` runs this once per triple with TARGET set, and
+# install.sh or install.ps1 is what reads the result, so a release can be
+# reproduced by hand:
+#
+#     make dist TARGET=x86_64-unknown-linux-musl
+#
+# Deliberately not built on `release`: that one copies into ${BUILD_DIR} under a
+# name for local use, and `make all` must never be the thing that cross-compiles.
+dist:
+	cargo build --release --target ${TARGET}
+	@ rm -rf ${DIST_DIR}/${DIST_NAME}
+	@ mkdir -p ${DIST_DIR}/${DIST_NAME}
+	@ cp ${CARGO_TARGET_DIR}/${TARGET}/release/$(BINARY_NAME) ${DIST_DIR}/${DIST_NAME}/
+	@ # An arm64 Mach-O with no signature will not execute at all. The Rust linker
+	@ # ad-hoc signs already, so this is only insurance against one that did not.
+	@ case "${TARGET}" in *-apple-darwin) codesign -s - --force ${DIST_DIR}/${DIST_NAME}/$(BINARY_NAME);; esac
+	@ cp LICENSE README.md ${DIST_DIR}/${DIST_NAME}/
+	@ # Compress-Archive rather than `zip`, which Git for Windows does not ship.
+	@ # Both forms put ${DIST_NAME}/ at the root of the archive, which is the shape
+	@ # both installers look for.
+	@ cd ${DIST_DIR} && rm -f ${ARCHIVE} && case "${TARGET}" in \
+		*windows*) powershell -NoProfile -Command \
+			"Compress-Archive -Force -Path '${DIST_NAME}' -DestinationPath '${ARCHIVE}'";; \
+		*) COPYFILE_DISABLE=1 tar czf ${ARCHIVE} ${DIST_NAME};; \
+	esac
+	@ # macOS has no sha256sum and most Linuxes no shasum; the .sha256 names the
+	@ # file with no path in it, so the installers verify from beside it.
+	@ cd ${DIST_DIR} && { command -v sha256sum >/dev/null && sha256sum ${ARCHIVE} \
+		|| shasum -a 256 ${ARCHIVE} ; } > ${ARCHIVE}.sha256
+	@ echo ${DIST_DIR}/${ARCHIVE}
+
+
+# The Alpine image, tagged with the version and `latest`. Builds inside Docker
+# with `make release`, so the host needs neither Rust nor a C compiler. Pushing is
+# not here: the release workflow logs in, tags and pushes on its own.
+docker:
+	docker build --build-arg DOCKER_REGISTRY=${DOCKER_REGISTRY} \
+		--build-arg DOCKER_ALPINE_VERSION=${DOCKER_ALPINE_VERSION} \
+		--build-arg BORHAN_VERSION=${VERSION} \
+		--force-rm -t borhan:${DOCKER_IMAGE_VERSION} -t borhan:latest .
+
+
+# Printed for the release workflow, which refuses a tag that disagrees with it.
+version:
+	@ test -n "${VERSION}" || { echo "cannot read the version out of Cargo.toml" >&2; exit 1; }
+	@ echo ${VERSION}
 
 
 dev: ${BUILD_DIR}
@@ -278,4 +339,4 @@ ${BUILD_DIR}:
 	@ mkdir -p ${BUILD_DIR}
 
 
-.PHONY: all release dev start-dev print-cmd systemd-install clippy check-style fmt lint test docs open-docs clean dist-clean purge seed seed-fetch seed-scan seed-test seed-clean
+.PHONY: all release dist docker version dev start-dev print-cmd systemd-install clippy check-style fmt lint test docs open-docs clean dist-clean purge seed seed-fetch seed-scan seed-test seed-clean

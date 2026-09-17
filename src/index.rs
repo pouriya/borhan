@@ -9,9 +9,9 @@
 //!
 //! # Why three fields over the same text
 //!
-//! The design document reaches this shape through a `term` table and a `lemma`
-//! table; tantivy reaches it through fields, and the fields are better because
-//! per-field document frequency comes out of the segment format for free.
+//! A hand-rolled index would reach this shape through a `term` table and a
+//! `lemma` table; tantivy reaches it through fields, and the fields are better
+//! because per-field document frequency comes out of the segment format for free.
 //!
 //! - `surface` holds the token as it was written. `JWT_SECRET`, `jwt_secret`
 //!   and `Error` are separate terms with separate postings, which is what keeps
@@ -426,7 +426,7 @@ impl Index {
     /// uses everywhere.
     ///
     /// What a caller about to search is missing is not the ranking rules but
-    /// the words. A memory of Persian tele-triage transcripts answers to `تب`
+    /// the words. A memory of Persian medical chat answers to `تب`
     /// and not to `fever`, and nothing in its description says so — the
     /// description was written by whoever created the memory, the vocabulary
     /// was written by whoever filled it. Reading this before writing a query is

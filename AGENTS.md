@@ -37,6 +37,9 @@ do not claim it passed without running it.
 | `make all` | **The gate**: `dev` + `clippy` + `test` + `check-style` |
 | `make dev` | Debug build → `build/borhan-<version>-<target>-dev` |
 | `make release` | Release build → `build/borhan-<version>-<target>` |
+| `make dist` | Release archive + `.sha256` for `TARGET` → `build/dist/`: `.zip` for Windows, `.tar.gz` otherwise |
+| `make docker` | Alpine image `borhan:<version>` + `borhan:latest`; `make release` runs inside it |
+| `make version` | Prints the `Cargo.toml` version; the release workflow checks the tag against it |
 | `make start-dev` | `make dev`, then runs `serve` with `--debug` |
 | `make clippy` | `cargo clippy --all-targets --no-deps -- -D warnings` |
 | `make check-style` | `cargo fmt --check` |
@@ -425,12 +428,15 @@ borhan memory create <NAME> \
 borhan                                  # print the long help and exit 0
 borhan memory                           # print the memory help and exit 0
 borhan memory list [--json]             # ULID, created, name, counts, languages, description
+borhan memory outline <NAME> [SESSION] [--json]
 borhan memory update <NAME> \
                   [--description T] [--languages L] [--json]
 borhan memory add <NAME> <TEXT> \
                   --session S [--message M]
                   [--role user|assistant|tool] [--author N] [--ts MS]
                   [--json]              # split into units, index, print the message ULID
+borhan memory replace <NAME> <TEXT> \
+                  --session S --message M [--ts MS] [--json]
 borhan memory search <NAME> <QUERY> \
                   [--fuzzy] [--limit N] \
                   [--json]              # one query string, coverage, cursor
@@ -438,6 +444,8 @@ borhan memory cursor <NAME> <ULID>... \
                   [--before N] [--after N] [--messages] [--json]
 borhan memory lexicon <NAME> <WORDS>... [--json]
 borhan memory rescan <NAME> [--json]
+borhan memory delete <NAME> --yes [--json]
+borhan skills remember|survey [--install]
 ```
 
 `--json` prints the same wrapped object the HTTP API returns, pretty-printed.
@@ -458,7 +466,7 @@ made every caller stop and pick one, and a model picking between them picks
 wrong.
 
 **The window is counted in units, not messages.** A unit is a thirtieth of a
-message in a corpus fed from PDFs (2 577 bytes against 84 in `teletriage_fa`,
+message in a corpus fed from PDFs (2 577 bytes against 84 in a Persian chat corpus,
 6 967 against 133 in `rfcs`), so pulling the whole page to re-read one paragraph
 costs eleven to forty times the context for text the caller did not ask for.
 `--messages` is still there for when the paragraph does not say who was talking,
@@ -473,7 +481,7 @@ because that is the caller malformed rather than the memory changed.
 
 Results are grouped by message: the fields that say *where* a unit sits are
 identical for every unit of a message, and a whole-message window is 122 units
-in `teletriage_fa`. Flat, that response was 57 KB of JSON around 5 KB of text.
+in that Persian chat corpus. Flat, that response was 57 KB of JSON around 5 KB of text.
 Each message carries its `unit_list` — the ids are what a caller passes back to
 move again — or its `body` when the window was counted in messages, where those
 ids would buy nothing.
@@ -586,6 +594,16 @@ src/search.rs      The query syntax, coverage, scoring, snippets, hints
 src/normalize.rs   NFC, ZWNJ, ک/ی folding, Persian affixes, Snowball English
 src/ulid.rs        Ulid, the primary key everywhere
 Makefile           Every build/check entry point. Use it, not cargo.
+borhan.service     systemd unit template for `make systemd-install`
+install.sh         The curl | sh installer for Linux and macOS; downloads what `make dist` built
+install.ps1        The irm | iex installer for Windows; also adds the binary to the user PATH
+Dockerfile         Alpine image for `serve`; first start writes a server.toml on 0.0.0.0:1995
+.github/workflows  ci.yml runs `make all` on Linux and Windows, smoke-tests install.ps1 and
+                   the image; release.yml runs `make dist` per target and pushes the
+                   image to ghcr.io on a v* tag
+README.md          For users: what borhan is, install, quick start
+CONTRIBUTING.md    For contributors: build, gate, release
+LICENSE            MIT
 seed/              Corpus cloned by `make seed` (gitignored)
 home/              BORHAN_HOME for `make seed` (gitignored)
 build/             Named binaries from make dev/release (gitignored)

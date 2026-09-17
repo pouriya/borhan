@@ -22,7 +22,7 @@
 //! Tantivy parses the string, owns the postings, the term dictionary, the
 //! fieldnorms and the BM25 arithmetic — for a phrase as well as for a word — and
 //! none of that is reimplemented here. What the stock query tree cannot express
-//! is the combination the design document specifies: **max within a clause**
+//! is the combination borhan ranks by: **max within a clause**
 //! (a paragraph that says the same thing three ways must not score triple),
 //! **coverage across top-level clauses** as `(hits/total)^α`, **minimum-span
 //! proximity** between positions belonging to *different* clauses, and the
