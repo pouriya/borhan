@@ -55,6 +55,16 @@ fn a_memory_from_creation_to_deletion() {
         response.header("x-borhan-version"),
         Some(env!("CARGO_PKG_VERSION"))
     );
+    assert_eq!(
+        response.header("server"),
+        Some(concat!(
+            "borhan/",
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("CARGO_PKG_REPOSITORY"),
+            ")"
+        ))
+    );
     assert_eq!(response.header("x-trace-id").unwrap().len(), 26);
 
     // Creating.

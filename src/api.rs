@@ -43,6 +43,7 @@ const TRACE_HEADER: HeaderName = HeaderName::from_static("x-trace-id");
 const SERVER_HEADER: HeaderName = HeaderName::from_static("server");
 const VERSION_HEADER: HeaderName = HeaderName::from_static("x-borhan-version");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1097,7 +1098,7 @@ async fn http_layer(mut request: Request, next: Next) -> Response {
 
 async fn identify(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    let server = format!("borhan/{VERSION}");
+    let server = format!("borhan/{VERSION} ({REPOSITORY})");
     if let Ok(value) = HeaderValue::from_str(&server) {
         response.headers_mut().insert(SERVER_HEADER, value);
     }

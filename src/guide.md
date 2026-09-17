@@ -71,7 +71,7 @@ If the server was started with a token, every request under `/api/v1` and
 Without it: `401` and `{"error":"missing or wrong token", ...}`. This page (`/`)
 is the one thing served without a token — it is documentation, not data.
 
-Every response carries `Server: borhan/<version>`, `X-Borhan-Version` and
+Every response carries `Server: borhan/<version> (<repository>)`, `X-Borhan-Version` and
 `X-Trace-Id`. That trace id is also `stats.trace` in the body and the `trace_id`
 on the server's log lines for that request; quote it when reporting a problem.
 
