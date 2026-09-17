@@ -268,8 +268,8 @@ fn envelope(id: &Value, outcome: Result<Value, Rejection>) -> Value {
 ///
 /// `instructions` is the one place a server gets to talk to the model before it
 /// has called anything, so it says the two things that are not derivable from
-/// any single tool schema: that a group is a concept and not a word, and that
-/// coverage is the number to believe.
+/// any single tool schema: that parentheses hold one idea and separate parts are
+/// separate ideas, and that coverage is the number to believe.
 fn initialize(params: &Value) -> Value {
     let mut version = PROTOCOL;
     if let Some(asked) = params["protocolVersion"].as_str() {
@@ -289,13 +289,16 @@ fn initialize(params: &Value) -> Value {
     a memory, and reading it gives you that memory's own vocabulary, which is what \
 your query has to be written in.
 
-Searching is by concept, not by string. A group is one idea spelled every way \
-    the corpus might spell it — {\"label\": \"error\", \"word_list\": [\"error\", \
-    \"خطا\", \"fail\", \"مشکل\"]} is one group, and a unit containing all four scores \
-    once, not four times. Send several groups for several ideas. Mark a group \
-`required` only when a result without it would be useless.
+Searching is by idea, not by sentence. `memory_search` takes one `query` string. \
+    Words inside one pair of parentheses are one idea spelled every way the corpus \
+    might spell it — (error خطا fail مشکل) is one idea, and a unit containing all four \
+    scores once, not four times. Parts side by side are separate ideas: \
+    (error خطا) (token توکن) asks for two things together. A + in front of a part \
+    drops units without it, a - drops units with it: use + only when a result \
+    without that idea would be useless. The tool's `query` description is the full \
+    reference — read it before your first search.
 
-Read `coverage` and not `score`. Coverage is [groups matched, groups asked] — a \
+Read `coverage` and not `score`. Coverage is [parts matched, parts asked] — a \
     fact. The score is BM25 squashed into 0..1 against the top hit of this one \
 query; it is not a probability and it does not compare across queries.
 
@@ -368,49 +371,79 @@ fn tools(app: &App) -> Vec<Value> {
         json!({
             "name": "memory_search",
             "title": "Search a memory",
-            "description": "Search one memory by concept groups. Each group is \
-        one idea written every way the corpus might write it, across languages; a unit \
-        matching several words of one group counts once for that group, and matching \
-        several groups is what makes it rank. Returns paragraphs and sentences with a \
-        snippet, a coverage pair, the words that matched, a cursor for reading around \
-        the hit, and — separately — the words that matched nothing and the words the \
-        top results share that you did not ask for. Ids are spelled the same way \
-        memory_cursor spells them: `session` and `message` are ULIDs and take you \
-        somewhere, `session_ref` and `message_ref` are the feeder's own names and are \
-        for reading.",
+            "description": "Search one memory with a query string. Parentheses \
+        hold one idea written every way the corpus might write it, across languages; a \
+        unit matching several words of one idea counts once for it, and matching several \
+        ideas is what makes it rank. Returns paragraphs and sentences with a snippet, a \
+        coverage pair, the parts that matched, a cursor for reading around the hit, and — \
+        separately — the words that matched nothing and the words the top results share \
+        that you did not ask for. Ids are spelled the same way memory_cursor spells them: \
+        `session` and `message` are ULIDs and take you somewhere, `session_ref` and \
+        `message_ref` are the feeder's own names and are for reading.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "memory": memory,
-                    "group_list": {
-                        "type": "array",
-                        "description": "One entry per concept. Two to four \
-        groups is the useful range: one group is a word search, and a dozen is a \
-        coverage denominator nothing can satisfy.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": {
-                                    "type": "string",
-                                    "description": "What this group means, in \
-        a word. Comes back on every hit that matched it, so make it readable.",
-                                },
-                                "word_list": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Spellings of this one \
-        concept: synonyms, both languages, the abbreviation, the misspelling the room \
-        actually uses. Not several concepts.",
-                                },
-                                "required": {
-                                    "type": "boolean",
-                                    "description": "Drop any unit that does \
-        not match this group at all. Default false. Use it for the one term that makes \
-        a result worth reading, not for every group.",
-                                },
-                            },
-                            "required": ["label", "word_list"],
-                        },
+                    "query": {
+                        "type": "string",
+                        "description": "What to find, in this syntax. Not a \
+        sentence: reduce the question to the two to four ideas that must appear \
+        together, then spell each one every way the corpus might.
+
+WORDS. `borrow` matches a unit containing borrow, borrowed or borrowing — every \
+        inflection. Case does not decide a match, but the exact spelling ranks above \
+        another form of the word.
+
+ONE IDEA: PARENTHESES. `(error fault خطا)` is one idea: synonyms, both languages, \
+        the abbreviation, the misspelling the room uses. Only the best word in it \
+        scores, so a unit with all three counts once. Never put two ideas in one pair.
+
+SEVERAL IDEAS: PARTS SIDE BY SIDE. Every top-level part — a word, a phrase or a \
+        parenthesised idea — is one idea, and `coverage` counts how many a unit \
+        matched. `(error خطا) (token jwt) (expired انقضا)` is three ideas. `error \
+        token` is two ideas; `(error token)` is one. A query wrapped whole in one \
+        pair of parentheses is one idea.
+
+REQUIRED AND EXCLUDED. `+` directly before a part drops units that miss it; `-` \
+        drops units that contain it; no space after the sign. `+(token jwt) (error \
+        خطا) -test`. `AND`, `OR`, `NOT` in capitals also work: `a AND b` is `+a +b`, \
+        `NOT a` is `-a`, `a OR b` is `a b`. Lowercase and, or, not are plain words.
+
+PHRASES. `\"borrow checker\"` needs both words together, in order. \
+        `\"rotate token\"~2` allows up to 2 words between them. `\"borrow check\"*` \
+        reads the last word as a beginning: borrow checker, borrow checking. A phrase \
+        is two words or more.
+
+WEIGHT. `^2` after a word, phrase or parenthesised idea doubles what it adds; \
+        `^0.5` halves it. It reorders hits and never changes which units match.
+
+FIELDS. A bare word is looked up as written, folded to its root, and in the rest \
+        of its message, and the best counts. `surface:JWT_SECRET` is the exact \
+        spelling only, case included — use it for identifiers. `lemma:borrowing` is \
+        the folded form only. `context:rotation` is only the rest of the message. A \
+        field before parentheses covers every word inside: `surface:(JWT_SECRET \
+        API_KEY)`, the same as `surface: IN [JWT_SECRET API_KEY]`.
+
+ESCAPING. `: ( ) [ ] { } ^ \" '` and backslash have meaning. Inside a word put a \
+        backslash before them, `http\\://host`, or quote the phrase. A word cannot \
+        start with + or -.
+
+NOT SUPPORTED, each refused with an error saying what to write instead: regular \
+        expressions (/…/); `*` on one word (`rot*` — write (rotate rotated \
+        rotation)); ranges ([a TO b], >a); `*` alone; and session:, ts: or role: \
+        inside the query — use the `session`, `after`/`before` and `role_list` \
+        arguments.
+
+EXAMPLE. \"why does the borrow checker reject this mutable alias\" becomes \
+        `(borrow borrowck borrowing) (mutable mut) +(alias aliasing)`.",
+                    },
+                    "fuzzy": {
+                        "type": "boolean",
+                        "description": "Also match words one letter away from a \
+        word this memory has never seen, for words of five letters or more: borow finds \
+        borrow. Default false. Such matches count for half, words the memory does have \
+        are never expanded, and `fuzzy_list` says which word was taken for which — \
+        write that spelling next time rather than leaving this on.",
                     },
                     "limit": {
                         "type": "integer",
@@ -444,7 +477,7 @@ fn tools(app: &App) -> Vec<Value> {
                         "description": "Only units written by these roles.",
                     },
                 },
-                "required": ["memory", "group_list"],
+                "required": ["memory", "query"],
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false },
         }),

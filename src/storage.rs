@@ -43,7 +43,7 @@ const DESCRIPTION_LIMIT: usize = 2000;
 
 /// Longest `memory.languages`, in characters. A comma-separated list like
 /// `fa,en`, reported by `memory list` so that a model composing a query knows
-/// which languages are worth expanding a concept group into.
+/// which languages are worth spelling each idea of a query in.
 const LANGUAGES_LIMIT: usize = 64;
 
 /// Longest feeder-supplied session or message identifier, in characters. A

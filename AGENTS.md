@@ -132,9 +132,11 @@ itself; that file is the source of truth and this table is the index to it.
   the design working: an index quietly disagreeing with the query side about what
   a word folds to is a search that returns other things and says nothing.
 - **The tokenizer and the scoring loop are not delegated.** tantivy has no notion
-  of ZWNJ, ک/ی folding or Persian morphology, and group semantics, coverage and
-  min-span proximity are not expressible in its stock queries. Everything else
-  about the index is tantivy's.
+  of ZWNJ, ک/ی folding or Persian morphology, and best-in-clause, coverage across
+  clauses and min-span proximity are not expressible in its stock query tree.
+  Everything else about the index is tantivy's — including the query grammar and
+  the BM25 of each word and phrase, which the scoring loop combines rather than
+  recomputes.
 
 ## Identifiers
 
@@ -379,10 +381,10 @@ nothing else to read.
 
 **Each one must stand alone.** A model given only an MCP server never sees
 `--help`; a model given only a URL never sees a tool schema. So the same handful
-of facts — a group is a concept and not a word, read `coverage` and not `score`,
-`lemma_units` of 0 means the corpus has never heard the word, one call reads
-every cursor — are written out in all three places on purpose. That duplication
-is the design, not drift to be factored out.
+of facts — parentheses hold one idea and separate parts are separate ideas, read
+`coverage` and not `score`, `lemma_units` of 0 means the corpus has never heard
+the word, one call reads every cursor — are written out in all three places on
+purpose. That duplication is the design, not drift to be factored out.
 
 **Three rules when changing any of this:**
 
@@ -430,8 +432,9 @@ borhan memory add <NAME> <TEXT> \
                   --session S [--message M]
                   [--role user|assistant|tool] [--author N] [--ts MS]
                   [--json]              # split into units, index, print the message ULID
-borhan memory search <NAME> <GROUPS>... \
-                  [--limit N] [--json]  # concept groups, coverage, cursor
+borhan memory search <NAME> <QUERY> \
+                  [--fuzzy] [--limit N] \
+                  [--json]              # one query string, coverage, cursor
 borhan memory cursor <NAME> <ULID>... \
                   [--before N] [--after N] [--messages] [--json]
 borhan memory lexicon <NAME> <WORDS>... [--json]
@@ -498,10 +501,11 @@ score  cover  cursor  session  message  size  matched
 "the best sentence of that unit, quoted"
 ```
 
-- **`cover` before `score`.** Coverage is a fact — groups matched over groups
-  asked. The score is squashed to `0..1` against the top hit of *this* query and
+- **`cover` before `score`.** Coverage is a fact — top-level parts matched over
+  parts asked. The score is squashed to `0..1` against the top hit of *this* query and
   orders these hits and nothing else.
-- **`matched` marks a nearby group with `~`.** A bare label means the word is in
+- **`matched` marks a nearby part with `~`.** Labels are the query's top-level
+  parts, spelled back from the parsed tree. A bare label means the word is in
   the quoted line; `~` means it was reached through the surrounding units of the
   same message. It still counts toward coverage — it is still evidence — but
   quoting the line for it would be wrong. See `matched_cell` in `main.rs`.
@@ -512,20 +516,61 @@ score  cover  cursor  session  message  size  matched
   was stored with, and escapes `\n`, `\r` and `\t` so a code block still reads
   as a code block while the hit stays one line.
 
-**Hits go to stdout and nothing else does.** The header, the unknown-word lines,
-`No hits.` and the closing vocabulary line all go to stderr, so a pipeline
+**Hits go to stdout and nothing else does.** The header, the unknown-word and
+fuzzy lines, `No hits.` and the closing vocabulary line all go to stderr, so a pipeline
 reading stdout receives only results. `memory create` prints the ULID and
 nothing else, so it pipes. `memory list` prints one aligned line per memory;
 with no memories stdout stays empty and the sentence goes to stderr, so a pipe
 reads an empty list rather than prose.
 
-**Read the unknown-word lines.** `unknown: "cva" (group "dx") matched nothing`
+**Read the unknown-word lines.** `unknown: "cva" (in "(cva stroke)") matched nothing`
 is the difference between "this memory disagrees with you" and "this memory has
 never heard that word", and only the second is a reason to search again with
 different wording. The closing `also in these results:` line is the frequent
 terms these hits share that were not asked for — the cheapest source of a better
 second query, and how a caller learns that the corpus says `x-ray` where they
 said `radiograph`. Both come back as lemmas.
+
+## Search queries
+
+`src/search.rs` — a search is **one string**, the same on every surface: `query`
+in the JSON body and the MCP tool, the positional `<QUERY>` on the command line.
+There is no list-of-groups form any more; a body that still sends `group_list`
+is a `400` that shows the equivalent query, because a model holding an old
+example should be told what replaced it rather than that `query` is missing.
+
+- **tantivy's grammar parses it; borhan compiles it.** `query_grammar::parse_query`
+  gives the tree, and `compile` turns every node into two things: a query for the
+  driver, which finds candidates and enforces `+`, `-` and the filters without
+  scoring, and a node of tantivy `Weight`s that the collector scores unit by unit.
+  `QueryParser` is not used: it would add up every field a bare word matched on,
+  and it has no tiers.
+- **Top-level parts are what coverage counts.** A word, a phrase or a
+  parenthesised clause is one idea; excluded parts are not counted. Inside a
+  clause, `OR` and plain spaces take the best, `+`/`AND` add, `^N` multiplies. A
+  leaf is the best of its probes — exact on `surface` (1.0), folded on `lemma`
+  (0.9), a typo on `lemma` (0.5), borrowed on `context` (0.35) — so a phrase is
+  scored as a phrase, by tantivy's phrase BM25, and not as its best word.
+- **Outer parentheses are recovered from the text.** The grammar discards them,
+  so `(a b)` and `a b` parse to one tree. A query wrapped whole in one pair,
+  optionally after `+` or before `^N`, is one idea; everything else is split at
+  the top level. Labels are rebuilt from the tree for the same reason, so
+  `error OR fault` comes back as `(error OR fault)`.
+- **What the grammar accepts and this refuses, each with a sentence naming the
+  fix:** regular expressions, a `*` on one word (the grammar keeps `rot*` as the
+  word `rot*`, the segmenter drops the `*`, and the search would silently be for
+  `rot`), ranges, `*` alone and `field:*`, any field other than `surface`,
+  `lemma` and `context`, and `session:`/`ts:`/`role:`, which stay request fields
+  so a query never has to spell a role code. A parse failure re-runs the lenient
+  parser only to say where it failed.
+- **`fuzzy` expands only words the memory has never seen**, of five letters or
+  more, to the lemmas one edit away (a transposition counts as one). The
+  dictionary is walked by hand rather than through `FuzzyTermQuery`, because
+  that query scores every expansion the same and names none of them, and
+  `fuzzy_list` has to say which word was taken for which.
+- **Caller-facing documentation teaches the syntax as borhan's own.** The guide,
+  the tool schema and `--help` do not name tantivy or any other query language,
+  and they say outright that regular expressions are not supported.
 
 ## Layout
 
@@ -538,7 +583,7 @@ src/server.toml    The commented server.toml template `init server` fills in and
 src/skills/*.md    The agent skills `skills <name> --install` writes out
 src/storage.rs     SQLite: the memory directory, the schema, add/locate/around
 src/index.rs       The tantivy schema, the writer and the reader
-src/search.rs      Groups, coverage, scoring, snippets, hints
+src/search.rs      The query syntax, coverage, scoring, snippets, hints
 src/normalize.rs   NFC, ZWNJ, ک/ی folding, Persian affixes, Snowball English
 src/ulid.rs        Ulid, the primary key everywhere
 Makefile           Every build/check entry point. Use it, not cargo.

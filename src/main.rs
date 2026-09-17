@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing_subscriber::{filter::LevelFilter, fmt};
 
 use crate::index::Index;
-use crate::search::{Filter, Group};
+use crate::search::Filter;
 use crate::storage::{Entry, Revision, Role, Storage};
 use crate::ulid::Ulid;
 
@@ -122,9 +122,9 @@ const PREVIEW_WORDS: usize = 60;
 /// and a result set full of other things looks exactly like one full of
 /// answers.
 ///
-/// (3) `memory search <name> <groups>…` — concept groups, not a sentence. A
-/// group is one idea spelled every way this corpus might spell it; separate
-/// groups are separate things being asked about.
+/// (3) `memory search <name> <query>` — one query string, not a sentence.
+/// Words in parentheses are one idea spelled every way this corpus might spell
+/// it; separate parts are separate things being asked about.
 ///
 /// (4) `memory cursor <name> <cursor>…` — read the hits back, at the width the
 /// question needs: the unit itself, the units around it, or the whole messages
@@ -136,7 +136,7 @@ const PREVIEW_WORDS: usize = 60;
 ///
 /// borhan memory lexicon rfcs borrow mutable alias radiograph
 ///
-/// borhan memory search rfcs borrow,borrowed,borrowing mutable,mutably,mut '!alias,aliasing'
+/// borhan memory search rfcs '(borrow borrowed borrowing) (mutable mut) +(alias aliasing)'
 ///
 /// borhan memory cursor rfcs 01M1BKH0YQ7YR34K2FKG3S4B0M --before 2 --after 2
 ///
@@ -250,7 +250,7 @@ pub enum Command {
     ///
     /// borhan memory lexicon <NAME> <WORDS>...
     ///
-    /// borhan memory search <NAME> <GROUPS>...
+    /// borhan memory search <NAME> <QUERY>
     ///
     /// borhan memory cursor <NAME> <CURSORS>...
     ///
@@ -258,8 +258,8 @@ pub enum Command {
     /// it holds and does not hold. `lexicon` says whether your words exist in
     /// that corpus before you spend a query on them — a word with a lemma count
     /// of 0 has never been seen there, and searching for it returns other
-    /// things rather than nothing. `search` takes concept groups, never a
-    /// sentence. `cursor` reads the hits back at whatever width the question
+    /// things rather than nothing. `search` takes one query of ideas in
+    /// parentheses, never a sentence. `cursor` reads the hits back at whatever width the question
     /// needs, and is the only reader.
     ///
     /// Write to a memory with three more:
@@ -282,7 +282,7 @@ pub enum Command {
     ///
     /// borhan memory lexicon rfcs borrow mutable alias
     ///
-    /// borhan memory search rfcs borrow,borrowed,borrowing mutable,mutably,mut '!alias,aliasing'
+    /// borhan memory search rfcs '(borrow borrowed borrowing) (mutable mut) +(alias aliasing)'
     ///
     /// borhan memory cursor rfcs 01M1BKH0YQ7YR34K2FKG3S4B0M
     ///
@@ -530,8 +530,8 @@ pub enum MemoryCommand {
     /// description, uncut.
     ///
     /// The name is the first argument of every other subcommand. The language
-    /// tags are a hint from whoever created the memory about which languages a
-    /// concept group is worth expanding into — they are not enforced, and a
+    /// tags are a hint from whoever created the memory about which languages
+    /// the ideas of a query are worth spelling in — they are not enforced, and a
     /// memory tagged `fa` can still hold English. The description says what is
     /// in the memory and what is not, which is what to read before deciding
     /// this is the one to search.
@@ -694,58 +694,103 @@ pub enum MemoryCommand {
         json: bool,
     },
 
-    /// Search a memory with concept groups.
+    /// Search a memory with one query.
     ///
-    /// A group is a comma-separated list of words that mean the same thing,
-    /// across languages if that is what the memory holds. Groups are the
-    /// arguments; there is no flag, and nothing to repeat:
+    /// The query is a single argument, so quote it: the shell would otherwise
+    /// take the parentheses and split the words.
     ///
-    /// borhan memory search notes error,fault,خطا '!timeout'
+    /// borhan memory search notes '(error fault خطا) +(token jwt) -expired'
     ///
-    /// Words inside one group are alternatives competing for a single slot and
-    /// only the best of them scores, so one group should hold every spelling,
-    /// inflection and translation of one idea, and never two different ideas.
-    /// Separate groups are separate things being asked about, and how many of
-    /// them a unit matches — its coverage — is the largest term in the score.
-    /// Three groups of two words each ask a far better question than one group
-    /// of six.
+    /// WORDS. A word matches every unit that contains it in any inflection:
+    /// `borrow` also finds `borrowed` and `borrowing`, `خطا` also finds
+    /// `خطاها`. Case does not decide a match, but a unit spelling the word
+    /// exactly as you did ranks above one holding another form of it.
     ///
-    /// A leading `!` makes a group required: units that miss it are dropped
-    /// rather than ranked lower. `label=word,word` names a group so the result
-    /// line can report which ones hit; unlabelled, the first word is the label.
+    /// ONE IDEA: PARENTHESES. Words inside one pair of parentheses are
+    /// alternatives for a single idea — synonyms, both languages, the
+    /// abbreviation, the misspelling the room actually uses — and only the best
+    /// of them scores, so a unit containing all of them counts once, not three
+    /// times. `(error fault خطا)` is one idea. Never put two different ideas in
+    /// one pair.
+    ///
+    /// SEVERAL IDEAS: PARTS SIDE BY SIDE. Every top-level part — a word, a
+    /// phrase, or a parenthesised idea — is a separate thing being asked about,
+    /// and how many of them a unit matches, its coverage, is the largest term
+    /// in the score. Three parts of two words each ask a far better question
+    /// than one part of six. A query wrapped whole in one pair of parentheses
+    /// is one idea. `error fault` is two ideas; `(error fault)` is one.
+    ///
+    /// REQUIRED AND EXCLUDED: + AND -. A `+` directly in front of a part drops
+    /// every unit that does not match it; a `-` drops every unit that does. No
+    /// space after the sign. Put `+` on the one idea that makes a result worth
+    /// reading, not on every part. `AND`, `OR` and `NOT`, in capitals, also
+    /// work: `a AND b` is `+a +b`, `NOT a` is `-a`, and `a OR b` is the same as
+    /// `a b`. Lowercase `and`, `or` and `not` are ordinary words.
+    ///
+    /// PHRASES: "…". Words in double quotes must appear together and in that
+    /// order: `"borrow checker"`. `~N` after the closing quote lets up to N
+    /// other words sit between them, so `"rotate token"~2` matches "rotate the
+    /// API token". `*` after the closing quote reads the last word as the start
+    /// of a word, so `"borrow check"*` matches "borrow checker". A phrase is two
+    /// words or more.
+    ///
+    /// WEIGHT: ^N. `^2` after a word, phrase or parenthesised idea doubles what
+    /// it contributes and `^0.5` halves it. Weight reorders hits; it never
+    /// decides which units match.
+    ///
+    /// FIELDS. With no field a word is looked up three ways at once — exactly
+    /// as written, folded to its root, and in the rest of the message the unit
+    /// came from — and the best of the three counts. A field restricts it to
+    /// one: `surface:JWT_SECRET` is the exact spelling, case included, which is
+    /// what an identifier wants; `lemma:borrowing` is the folded form only;
+    /// `context:rotation` is only the rest of the message. A field in front of
+    /// parentheses applies to every word inside: `surface:(JWT_SECRET API_KEY)`.
+    /// `surface: IN [JWT_SECRET API_KEY]` means the same thing.
+    ///
+    /// CHARACTERS THAT NEED CARE. `: ( ) [ ] { } ^ " '` and the backslash mean
+    /// something in a query. Inside a word, put a backslash in front of them —
+    /// `http\://host` — or quote the phrase. A word cannot start with `+` or `-`.
+    ///
+    /// NOT SUPPORTED, and refused with a sentence saying what to write instead:
+    /// regular expressions (`/…/`); a `*` on a single word (`rot*` — list the
+    /// forms in parentheses, `(rotate rotated rotation)`); ranges (`[a TO b]`,
+    /// `>a`); `*` on its own; and `session:`, `ts:` or `role:` inside the query,
+    /// which are the `--session`, `--after`/`--before` and `--role` flags.
     ///
     /// Do not paste a sentence in. Reduce it to the two to four things that
-    /// have to co-occur, then expand each one into its synonyms. So "why does
-    /// the borrow checker reject this mutable alias" becomes three groups:
+    /// have to co-occur, then expand each one into its spellings. So "why does
+    /// the borrow checker reject this mutable alias" becomes three ideas, the
+    /// last one required:
     ///
-    /// borrow,borrowck,borrowing mutable,mutably,mut alias,aliasing
+    /// '(borrow borrowck borrowing) (mutable mut) +(alias aliasing)'
     ///
     /// Two lines come back per hit, under a header that names the columns:
     ///
-    /// 0.847  2/3  01J8…  session  message  75 words  [site,sx,~acuity]
+    /// 0.847  2/3  01J8…  session  message  75 words  [(site OR location),~acuity]
     ///
     /// "the best sentence of the unit, quoted"
     ///
     /// `score` is relative to the best hit in this result set, which is always
     /// 1.000; it orders these hits and means nothing next to the score of a
-    /// different search. `cover` is how many groups the unit matched out of how
-    /// many were asked, and it is the more trustworthy of the two — prefer 3/3
-    /// at a middling score over 1/3 at a high one. `cursor` is what both
+    /// different search. `cover` is how many top-level parts the unit matched
+    /// out of how many were asked, and it is the more trustworthy of the two —
+    /// prefer 3/3 at a middling score over 1/3 at a high one. `cursor` is what
     /// `memory cursor` takes.
     ///
-    /// `matched` names those groups. A bare label means the unit contains one
-    /// of that group's words, and you will find it in the quoted line. A `~`
-    /// in front means the group was reached only through the surrounding
-    /// units of the same message: the concept is somewhere in that message,
-    /// but not on this line, and quoting this line for it would be wrong. It
-    /// still counts toward `cover`, because it is still evidence — read it as
-    /// a pointer to `memory cursor` rather than as an answer.
+    /// `matched` names those parts, spelled the way the query wrote them. A bare
+    /// label means the unit contains one of that part's words, and you will find
+    /// it in the quoted line. A `~` in front means the part was reached only
+    /// through the surrounding units of the same message: the idea is somewhere
+    /// in that message, but not on this line, and quoting this line for it would
+    /// be wrong. It still counts toward `cover`, because it is still evidence —
+    /// read it as a pointer to `memory cursor` rather than as an answer.
     ///
     /// Hits go to standard output and nothing else does. The header, the
-    /// unknown-word lines, `No hits.` and the closing vocabulary line all go to
-    /// standard error, so a pipeline reading stdout receives only results.
+    /// unknown-word and fuzzy lines, `No hits.` and the closing vocabulary line
+    /// all go to standard error, so a pipeline reading stdout receives only
+    /// results.
     ///
-    /// Read the unknown-word lines. `unknown: "cva" (group "dx") matched
+    /// Read the unknown-word lines. `unknown: "cva" (in "(cva stroke)") matched
     /// nothing` is the difference between "this memory disagrees with you" and
     /// "this memory has never heard that word", and only the second is a reason
     /// to search again with different wording. `memory lexicon` answers the
@@ -759,11 +804,18 @@ pub enum MemoryCommand {
         /// The memory to search, by the name `memory list` prints.
         name: String,
 
-        /// One or more groups, each a comma-separated list of alternatives.
-        /// Quote a group only when it starts with `!`, which the shell would
-        /// otherwise take.
-        #[arg(required = true, num_args = 1..)]
-        groups: Vec<String>,
+        /// The query, as one argument: '(error fault) +token -expired'. See
+        /// above for what the parentheses, signs, quotes and fields mean.
+        #[arg(allow_hyphen_values = true)]
+        query: String,
+
+        /// Also match words one letter away from a word this memory has never
+        /// seen, for words of five letters or more: `borow` finds `borrow`.
+        /// Such a match counts for half, words the memory does have are never
+        /// expanded, and a `fuzzy:` line on standard error says which word was
+        /// taken for which — use that spelling next time.
+        #[arg(long)]
+        fuzzy: bool,
 
         /// Hits to return, at most.
         #[arg(long, default_value_t = 10)]
@@ -793,8 +845,8 @@ pub enum MemoryCommand {
         #[arg(long = "role")]
         roles: Vec<String>,
 
-        /// Emit one JSON object holding `hit_list`, `unknown_list`, `hint_list`
-        /// and `stats` instead of the table. All of it goes to standard output.
+        /// Emit one JSON object holding `hit_list`, `unknown_list`,
+        /// `fuzzy_list`, `hint_list` and `stats` instead of the table. All of it goes to standard output.
         ///
         /// Ids in a hit are spelled the way `memory cursor` spells them:
         /// `session` and `message` are ULIDs and are what another call
@@ -993,47 +1045,6 @@ impl CommandLine {
             LevelFilter::WARN
         }
     }
-}
-
-/// One group argument.
-///
-/// `label=a,b,c` names the group, a leading `!` makes it required, and the
-/// label defaults to the first word so that a result set is readable without
-/// the caller having named anything.
-fn parse_group(text: &str) -> anyhow::Result<Group> {
-    let (required, rest) = match text.strip_prefix('!') {
-        Some(rest) => (true, rest),
-        None => (false, text),
-    };
-
-    // Split on the first `=` only, so a label is a label and everything after
-    // it is words. A word containing `=` is not a word.
-    let (label, list) = match rest.split_once('=') {
-        Some((label, list)) => (Some(label.trim().to_string()), list),
-        None => (None, rest),
-    };
-
-    let mut words = Vec::new();
-    for word in list.split(',') {
-        let word = word.trim();
-        if word.is_empty() {
-            continue;
-        }
-        words.push(word.to_string());
-    }
-    if words.is_empty() {
-        anyhow::bail!("Group {text:?} has no words in it");
-    }
-
-    let label = match label {
-        Some(label) if !label.is_empty() => label,
-        _ => words[0].clone(),
-    };
-    Ok(Group {
-        label,
-        words,
-        required,
-    })
 }
 
 /// Cut a text to [`PREVIEW_WORDS`] and escape what would break the column
@@ -1756,7 +1767,8 @@ async fn main() -> anyhow::Result<()> {
 
                 MemoryCommand::Search {
                     name,
-                    groups,
+                    query,
+                    fuzzy,
                     limit,
                     max_per_message,
                     session,
@@ -1765,21 +1777,10 @@ async fn main() -> anyhow::Result<()> {
                     roles,
                     json,
                 } => {
-                    let mut parsed = Vec::new();
-                    for group in &groups {
-                        parsed.push(parse_group(group)?);
-                    }
                     if let Some((origin, token)) = &origin {
-                        let mut group_list = Vec::new();
-                        for group in &parsed {
-                            group_list.push(serde_json::json!({
-                                "label": group.label,
-                                "word_list": group.words,
-                                "required": group.required,
-                            }));
-                        }
                         let mut payload = serde_json::json!({
-                            "group_list": group_list,
+                            "query": query,
+                            "fuzzy": fuzzy,
                             "limit": limit,
                             "max_per_message": max_per_message,
                         });
@@ -1835,7 +1836,7 @@ async fn main() -> anyhow::Result<()> {
                             &store,
                             &built,
                             &name,
-                            &parsed,
+                            (&query, fuzzy),
                             &filter,
                             (limit, max_per_message),
                             &trace,
@@ -2561,8 +2562,15 @@ fn matched_cell(matched: &[String], nearby: &[String]) -> String {
 fn print_search(outcome: &crate::search::Outcome) {
     for unknown in &outcome.unknown {
         eprintln!(
-            "unknown: {:?} (group {:?}) matched nothing",
-            unknown.word, unknown.group
+            "unknown: {:?} (in {:?}) matched nothing",
+            unknown.word, unknown.clause
+        );
+    }
+    for fuzzy in &outcome.fuzzy {
+        eprintln!(
+            "fuzzy: {:?} matched nothing, taken as {}",
+            fuzzy.word,
+            fuzzy.matched.join(", ")
         );
     }
     if outcome.hits.is_empty() {
@@ -2600,9 +2608,26 @@ fn print_search_json(body: &serde_json::Value) -> anyhow::Result<()> {
     if let Some(unknown) = body.get("unknown_list").and_then(|value| value.as_array()) {
         for item in unknown {
             eprintln!(
-                "unknown: {:?} (group {:?}) matched nothing",
+                "unknown: {:?} (in {:?}) matched nothing",
                 item["word"].as_str().unwrap_or(""),
-                item["group"].as_str().unwrap_or("")
+                item["clause"].as_str().unwrap_or("")
+            );
+        }
+    }
+    if let Some(fuzzy) = body.get("fuzzy_list").and_then(|value| value.as_array()) {
+        for item in fuzzy {
+            let mut matched = Vec::new();
+            if let Some(list) = item["matched_list"].as_array() {
+                for term in list {
+                    if let Some(term) = term.as_str() {
+                        matched.push(term);
+                    }
+                }
+            }
+            eprintln!(
+                "fuzzy: {:?} matched nothing, taken as {}",
+                item["word"].as_str().unwrap_or(""),
+                matched.join(", ")
             );
         }
     }

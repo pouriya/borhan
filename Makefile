@@ -202,27 +202,28 @@ seed-scan: release seed-fetch
 # the messages around it. Every command goes through the same BORHAN_HOME the
 # scan wrote to.
 #
-# Each search is concept groups rather than a sentence: words inside one group
-# are alternatives that compete for one slot, and separate groups are separate
-# things being asked about, which is what coverage scores. A group is one
-# argument, so quoting matters only for the `!` that marks one required.
+# Each search is one query of ideas rather than a sentence: words inside one
+# pair of parentheses are alternatives that compete for one slot, and separate
+# parts are separate things being asked about, which is what coverage scores.
+# The query is one argument, so it is always quoted — the shell would otherwise
+# take the parentheses.
 seed-test:
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory list
 	@ echo; echo "? borrowing a value mutably"
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
-		borrow,borrowed,borrowing mutable,mutably,mut --limit 5
+		'(borrow borrowed borrowing) (mutable mutably mut)' --limit 5
 	@ echo; echo "? associated types on a trait"
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
-		trait,traits associated type,types --limit 5
+		'(trait traits) associated (type types)' --limit 5
 	@ echo; echo "? a deprecation warning from the compiler"
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
-		'!deprecated,deprecation' warning,warn,lint --limit 5
+		'+(deprecated deprecation) (warning warn lint)' --limit 5
 	@ echo; echo "? what a word looks like in this memory before searching for it"
 	@ BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory lexicon ${SEED_NAME} \
 		borrow Borrowing lifetimes rustc UNRESOLVED_QUESTIONS
 	@ echo; echo "? the top hit, and the messages around it"
 	@ top=`BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory search ${SEED_NAME} \
-		borrow,borrowing mutable,mutably --limit 1 \
+		'(borrow borrowing) (mutable mutably)' --limit 1 \
 		2>/dev/null | head -n 1 | awk '{print $$3}'`; \
 	BORHAN_HOME=${SEED_HOME} ${CMD} --quiet memory cursor ${SEED_NAME} $$top \
 		--before 0 --after 0 | head -n 20

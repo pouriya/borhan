@@ -62,13 +62,15 @@ getrandom = "0.4.3"
 chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 
 # The inverted index: term dictionary, postings, positions, fieldnorms, BM25,
-# segment merging. Everything layer two of the design document describes, with
-# an FST-backed dictionary and a segment format that no hand-rolled SQLite
-# posting table is going to beat. What is *not* delegated is the tokenizer —
-# tantivy has no notion of ZWNJ, ک/ی folding or Persian morphology, and no
-# Snowball algorithm for Persian exists to delegate them to — and the scoring
-# loop, because group semantics, coverage and min-span proximity are not
-# expressible in the stock queries.
+# segment merging, and the query syntax a search is written in, parsed by its
+# grammar and scored per word and per phrase by its weights. Everything layer
+# two of the design document describes, with an FST-backed dictionary and a
+# segment format that no hand-rolled SQLite posting table is going to beat. What
+# is *not* delegated is the tokenizer — tantivy has no notion of ZWNJ, ک/ی
+# folding or Persian morphology, and no Snowball algorithm for Persian exists to
+# delegate them to — and the loop combining those scores, because best-in-clause,
+# coverage across clauses and min-span proximity are not expressible in the
+# stock query tree.
 #
 # default-features = false, then mmap and the two compressors back on. The
 # `stemmer` feature stays off even though borhan does stem English: what it

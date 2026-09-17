@@ -29,8 +29,8 @@
 //!
 //! Both body fields are fed the *same* text and differ only in their analyzer,
 //! so token position 7 is the same word in both. That is what lets proximity
-//! measure a span between a group that matched exactly and one that matched
-//! after folding.
+//! measure a span between a query clause that matched exactly and one that
+//! matched after folding.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

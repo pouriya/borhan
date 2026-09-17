@@ -6,7 +6,7 @@ installed, and there is no client library.
 
 borhan is a **keyword memory over stored conversations**, built for text that
 mixes Persian and English in the same sentence. It stores messages, splits them
-into paragraph-sized **units**, and searches those units by concept. It does not
+into paragraph-sized **units**, and searches those units by idea. It does not
 summarize, does not answer questions, and does not embed anything: what comes
 back is stored text and the address of where it sits.
 
@@ -58,7 +58,7 @@ result set that looks like answers and is not.
 
 1. `GET  /api/v1/memory_list` — which memories exist, and what each holds.
 2. `POST /api/v1/memory/{name}/lexicon` — do your words exist in this corpus?
-3. `POST /api/v1/memory/{name}/search` — concept groups, not a sentence.
+3. `POST /api/v1/memory/{name}/search` — a query of ideas, not a sentence.
 4. `POST /api/v1/memory/{name}/cursor` — read the hits back, as wide as needed.
 
 ## Authentication and headers
@@ -122,7 +122,7 @@ what to change.
 `name` is what goes in every other URL. `description` says what the memory
 holds and what it does not — it is the only thing that tells you whether a
 question belongs here at all. `languages` is a hint from whoever created the
-memory about which languages to expand a concept group into; it is not enforced.
+memory about which languages to spell each idea of a query in; it is not enforced.
 
 ## `POST /api/v1/memory/{name}/outline` — what is on file
 
@@ -186,17 +186,14 @@ corpus actually uses: if `radiograph` is 0, try `x-ray`; if `بریدگی` is 0,
     curl -s -X POST "$BORHAN/api/v1/memory/rfcs/search" \
       -H 'Content-Type: application/json' \
       -d '{
-            "group_list": [
-              {"label": "borrow",  "word_list": ["borrow","borrowed","borrowing"]},
-              {"label": "mutable", "word_list": ["mutable","mutably","mut"]},
-              {"label": "alias",   "word_list": ["alias","aliasing"], "required": true}
-            ],
+            "query": "(borrow borrowed borrowing) (mutable mut) +(alias aliasing)",
             "limit": 10
           }'
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `group_list` | required | One entry per **idea**. `label` names it, `word_list` is every spelling of it, `required: true` drops units that miss it instead of ranking them lower. |
+| `query` | required | What to find, in the syntax below. One string. |
+| `fuzzy` | `false` | Also match words one letter away from a word this memory has never seen. See **Typos** below. |
 | `limit` | `10` | Hits returned, at most. |
 | `max_per_message` | `2` | Units returned from any one message. Twenty hits from one page is a wasted result set — use the cursor to read the rest of it. |
 | `session` | — | Confine to one session, by its ULID. |
@@ -212,7 +209,7 @@ corpus actually uses: if `radiograph` is 0, try `x-ray`; if `بریدگی` is 0,
       "score": 1.0,
       "raw": 12.468404769897461,
       "coverage": [3, 3],
-      "matched_list": ["borrow", "mutable", "alias"],
+      "matched_list": ["(borrow OR borrowed OR borrowing)", "(mutable OR mut)", "(alias OR aliasing)"],
       "nearby_list": [],
       "session": "01M1BKGN5GWQA0AGWSJWQG6F1A", "session_ref": "rfcs",
       "message": "01M1BKGR8A2DSGVAWPE1H0GFY4", "message_ref": "0114-closures",
@@ -222,6 +219,7 @@ corpus actually uses: if `radiograph` is 0, try `x-ray`; if `بریدگی` is 0,
     }
   ],
   "unknown_list": [],
+  "fuzzy_list": [],
   "hint_list": [ {"term": "violat", "units": 6}, {"term": "invalid", "units": 4} ],
   "stats": {}
 }
@@ -229,37 +227,131 @@ corpus actually uses: if `radiograph` is 0, try `x-ray`; if `بریدگی` is 0,
 
 ### How to write the query
 
-**A group is one idea spelled every way this corpus might spell it.** Words
-inside a group are alternatives competing for a single slot, and only the best
-of them scores — so a unit containing all four words of a group scores once, not
-four times. One group must never hold two different ideas.
+`query` is not a sentence. Reduce the question to the **two to four ideas** that
+have to appear together, then spell each idea every way this memory might spell
+it — synonyms, both languages, the abbreviation, the misspelling the room
+actually uses.
 
-**Separate groups are separate things being asked about**, and how many of them
-a unit matched — its `coverage` — is the largest term in the score. Three groups
-of two words each ask a far better question than one group of six.
+**Words.** A word matches every unit containing it in any inflection: `borrow`
+also finds `borrowed` and `borrowing`, and `خطا` also finds `خطاها`. Case does
+not decide a match, but a unit spelling the word exactly as you did ranks above
+one holding another form of it.
 
-**Do not send a sentence.** Reduce the question to the two to four things that
-have to co-occur, then expand each into its synonyms and translations. "Why does
-the borrow checker reject this mutable alias" is three groups, as in the call
-above — not one group of nine words.
+    borrow
+
+**One idea: parentheses.** Words inside one pair of parentheses are
+alternatives for a **single** idea, and only the best of them scores — a unit
+containing all three words below counts once, not three times. Never put two
+different ideas in one pair.
+
+    (error fault خطا)
+
+**Several ideas: parts side by side.** Every top-level part — a word, a phrase
+or a parenthesised idea — is a separate thing being asked about, and how many
+of them a unit matched is its `coverage`, the largest term in the score. Three
+parts of two words each ask a far better question than one part of six.
+
+    (error fault خطا) (token jwt توکن) (expired انقضا)
+
+The parentheses are what make the difference: `error token` is **two** ideas,
+`(error token)` is **one**. A query wrapped whole in one pair of parentheses is
+one idea.
+
+**Required and excluded: `+` and `-`.** A `+` directly in front of a part drops
+every unit that does not match it; a `-` drops every unit that does. No space
+after the sign. Put `+` on the one idea that makes a result worth reading, not
+on every part.
+
+    +(token jwt) (error خطا) -test
+
+`AND`, `OR` and `NOT` also work, in capitals: `a AND b` is `+a +b`, `NOT a` is
+`-a`, and `a OR b` is the same as `a b`. Lowercase `and`, `or` and `not` are
+ordinary words.
+
+**Phrases: `"…"`.** Words in double quotes must appear together, in that order.
+
+    "borrow checker" (mutable mut)
+
+`~N` after the closing quote lets up to N other words sit between them, and `*`
+reads the last word as the beginning of a word:
+
+    "rotate token"~2      matches  rotate the API token
+    "borrow check"*       matches  borrow checker, borrow checking
+
+A phrase is two words or more.
+
+**Weight: `^N`.** `^2` after a word, phrase or parenthesised idea doubles what
+it contributes; `^0.5` halves it. Weight reorders hits — it never changes which
+units match.
+
+    (token jwt)^2 (rotation rotate)
+
+**Fields.** With no field, a word is looked up three ways at once — exactly as
+written, folded to its root, and in the rest of the message the unit came from —
+and the best of the three counts. A field restricts it to one:
+
+| Field | Matches | Use it for |
+|-------|---------|------------|
+| `surface:JWT_SECRET` | the exact spelling, case included | identifiers, names, codes |
+| `lemma:borrowing` | the folded form only | a word whose exact spelling should not rank higher |
+| `context:rotation` | only the rest of the message, never the unit itself | rarely; see `nearby_list` |
+
+A field in front of parentheses applies to every word inside, and `IN [ … ]`
+says the same thing:
+
+    surface:(JWT_SECRET API_KEY)
+    surface: IN [JWT_SECRET API_KEY]
+
+**Characters that need care.** `: ( ) [ ] { } ^ " '` and the backslash mean
+something in a query. Inside a word, put a backslash in front of them —
+`http\://host` — or quote the phrase. A word cannot begin with `+` or `-`.
+
+**Not supported.** Each of these is refused with a `400` whose sentence says
+what to write instead:
+
+| Written | Instead |
+|---------|---------|
+| Regular expressions, `/jo.n/` | spell the words out: `(john jon)` |
+| A `*` on one word, `rot*` | list the forms: `(rotate rotated rotation)`, or end a phrase with it: `"key rot"*` |
+| Ranges, `[a TO b]`, `>a` | for time, the `after` and `before` fields |
+| `*` on its own, `field:*` | search for words |
+| `session:`, `ts:`, `role:` | the `session`, `after`/`before` and `role_list` fields |
+
+A query that does not parse — an unclosed quote or parenthesis — is a `400`
+naming what is missing and at which character.
+
+**Typos.** With `"fuzzy": true`, a word of five letters or more that this memory
+has **never seen** also matches the words one letter away from it — a letter
+changed, added, dropped, or two swapped — so `borow` finds `borrow`. Those
+matches count for half, and a word the memory does have is never expanded.
+`fuzzy_list` says which word was taken for which, as
+`{"word": "borow", "matched_list": ["borrow"]}`: write that spelling next time
+rather than leaving `fuzzy` on.
+
+**Putting it together.** "Why does the borrow checker reject this mutable alias"
+is three ideas, the last one essential:
+
+    (borrow borrowck borrowing) (mutable mut) +(alias aliasing)
 
 ### How to read the result
 
-**`coverage` before `score`.** Coverage is `[groups matched, groups asked]` — a
+**`coverage` before `score`.** Coverage is `[parts matched, parts asked]` — a
 fact. The score is BM25 squashed into `0..1` against the top hit *of this one
 query*; it orders these hits and means nothing next to the score of a different
 query. Prefer `[3,3]` at a middling score over `[1,3]` at a high one.
 
-**`matched_list` with a `~` is a warning.** A bare label means the unit itself
-contains one of that group's words, and you will find it in `snippet`. A `~`
-prefix means the group was reached only through the *surrounding units of the
-same message*: the concept is somewhere on that page but not on this line, and
-quoting `snippet` for it would be wrong. It still counts toward coverage,
+**`matched_list` and `nearby_list` are different claims.** Both hold parts of
+the query, spelled the way it wrote them. A part in `matched_list` means the
+unit itself contains one of its words, and you will find it in `snippet`. A part
+in `nearby_list` was reached only through the *surrounding units of the same
+message*: the idea is somewhere on that page but not on this line, and quoting
+`snippet` for it would be wrong. It still counts toward coverage,
 because it is still evidence — treat it as a pointer to read wider with the
 cursor, never as an answer.
 
 **`unknown_list` is the difference between two very different failures.** A word
-listed there matched nothing in the corpus. "This memory disagrees with you" and
+listed there matched nothing in the corpus; `clause` is the part of the query it
+was written in. "This memory disagrees with you" and
 "this memory has never heard that word" look identical in a result set, and only
 the second is a reason to search again with different wording.
 
@@ -267,7 +359,7 @@ the second is a reason to search again with different wording.
 terms shared across the top results that you did not ask for. It is how you
 learn that the corpus says `x-ray` where you said `radiograph`. They come back
 as **lemmas**, not as written — `bacterem`, `inappropri` — so read them as stems
-and put the whole word in your next `word_list`.
+and put the whole word in the parentheses of your next query.
 
 **Two ids, two purposes.** `session` and `message` are ULIDs: they are what
 another call accepts, and `session` is exactly what the `session` filter of the

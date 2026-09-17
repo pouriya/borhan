@@ -32,7 +32,7 @@ use tantivy::IndexWriter;
 use tracing::Instrument;
 
 use crate::index::Index;
-use crate::search::{Filter, Group, Outcome};
+use crate::search::{Filter, Outcome};
 use crate::storage::{
     Entry, Located, Memory, MessageRow, Revision, Role, SessionRow, Storage, Written,
 };
@@ -74,6 +74,14 @@ pub enum Error {
 
     #[error("Role {role:?} is not one of user, assistant or tool")]
     Role { role: String },
+
+    #[error(
+        "`group_list` is gone: a search takes `query`, one string. Each group \
+         becomes a clause in parentheses and a required one gets a leading + — \
+         [{{\"word_list\": [\"error\", \"fault\"], \"required\": true}}, \
+         {{\"word_list\": [\"token\"]}}] is \"+(error fault) token\""
+    )]
+    Groups,
 
     #[error("{value:?} is not a ULID")]
     NotUlid {
@@ -566,7 +574,7 @@ pub fn search(
     store: &Storage,
     index: &Index,
     name: &str,
-    groups: &[Group],
+    request: (&str, bool),
     filter: &Filter,
     page: (usize, usize),
     trace: &Ulid,
@@ -575,7 +583,7 @@ pub fn search(
     let _span = tracing::info_span!("memory.search").entered();
     let started = Instant::now();
     let search_started = Instant::now();
-    let outcome = search::search(store, index, groups, filter, limit, per_message)?;
+    let outcome = search::search(store, index, request, filter, limit, per_message)?;
     let search_ms = ms(search_started);
 
     let mut stats = Stats::new(trace, started);
@@ -583,10 +591,12 @@ pub fn search(
     tracing::info!(
         trace_id = %trace,
         memory = name,
-        groups = groups.len(),
+        query_bytes = request.0.len(),
+        fuzzy = request.1,
         limit = limit,
         hits = outcome.hits.len(),
         unknown = outcome.unknown.len(),
+        typos = outcome.fuzzy.len(),
         search_ms = search_ms,
         total_ms = stats.total_ms,
         "searched memory",
@@ -864,8 +874,15 @@ pub fn search_json(outcome: &Outcome, stats: &Stats) -> serde_json::Value {
     let mut unknown_list = Vec::new();
     for unknown in &outcome.unknown {
         unknown_list.push(serde_json::json!({
-            "group": unknown.group,
+            "clause": unknown.clause,
             "word": unknown.word,
+        }));
+    }
+    let mut fuzzy_list = Vec::new();
+    for fuzzy in &outcome.fuzzy {
+        fuzzy_list.push(serde_json::json!({
+            "word": fuzzy.word,
+            "matched_list": fuzzy.matched,
         }));
     }
     let mut hint_list = Vec::new();
@@ -875,6 +892,7 @@ pub fn search_json(outcome: &Outcome, stats: &Stats) -> serde_json::Value {
     serde_json::json!({
         "hit_list": hit_list,
         "unknown_list": unknown_list,
+        "fuzzy_list": fuzzy_list,
         "hint_list": hint_list,
         "stats": stats,
     })
@@ -1129,7 +1147,19 @@ fn status_of(error: &Error) -> StatusCode {
         | Error::EmptyWords
         | Error::Role { .. }
         | Error::NotUlid { .. }
-        | Error::Search(search::Error::Empty)
+        | Error::Groups
+        | Error::Search(
+            search::Error::Empty
+            | search::Error::Syntax { .. }
+            | search::Error::Field { .. }
+            | search::Error::Filter { .. }
+            | search::Error::Regex
+            | search::Error::Range
+            | search::Error::Everything
+            | search::Error::Prefix { .. }
+            | search::Error::Unwanted
+            | search::Error::Clauses { .. },
+        )
         | Error::Storage(
             crate::storage::Error::Empty
             | crate::storage::Error::Long { .. }
@@ -1581,21 +1611,19 @@ pub(crate) fn run_add(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SearchBody {
-    group_list: Vec<GroupBody>,
+    query: Option<String>,
+    #[serde(default)]
+    fuzzy: bool,
+    /// The input this endpoint took before `query`. Accepted only so that a
+    /// caller still sending it is told what replaced it, rather than that
+    /// `query` is missing.
+    group_list: Option<serde_json::Value>,
     limit: Option<usize>,
     max_per_message: Option<usize>,
     session: Option<String>,
     after: Option<i64>,
     before: Option<i64>,
     role_list: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct GroupBody {
-    label: String,
-    word_list: Vec<String>,
-    #[serde(default)]
-    required: bool,
 }
 
 async fn search_memory(
@@ -1614,14 +1642,13 @@ pub(crate) fn run_search(
     body: SearchBody,
     trace: &Ulid,
 ) -> Result<(serde_json::Value, Stats), Error> {
-    let mut groups = Vec::new();
-    for group in body.group_list {
-        groups.push(Group {
-            label: group.label,
-            words: group.word_list,
-            required: group.required,
-        });
+    if body.group_list.is_some() {
+        return Err(Error::Groups);
     }
+    let query = match body.query {
+        Some(query) => query,
+        None => return Err(Error::Search(search::Error::Empty)),
+    };
     let mut filter = Filter {
         after: body.after,
         before: body.before,
@@ -1656,7 +1683,7 @@ pub(crate) fn run_search(
         &store,
         &opened.index,
         name,
-        &groups,
+        (&query, body.fuzzy),
         &filter,
         (limit, per_message),
         trace,

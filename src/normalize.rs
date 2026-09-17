@@ -11,7 +11,7 @@
 //! segmenter is load-bearing. [`SURFACE`] keeps a token as it was written and
 //! [`LEMMA`] folds it, but both cut the text at exactly the same byte offsets,
 //! so token position 7 means the same word in both fields. Proximity scoring
-//! reads positions from whichever field a group matched on, and if the two
+//! reads positions from whichever field a clause matched on, and if the two
 //! disagreed about where tokens begin, a span measured across an exact match
 //! and a folded one would be measuring nothing.
 
