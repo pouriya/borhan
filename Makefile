@@ -157,8 +157,22 @@ seed: seed-scan seed-test
 
 seed-fetch: ${SEED_DIR}
 
+
+# Cloned rather than downloaded as a tarball because codeload.github.com answers
+# unauthenticated tarball requests with 429 often enough to make a target that
+# depends on it useless. `--depth 1 --filter=blob:none --sparse` fetches only the
+# newest revision of only ${SEED_PATH}. A clone that finds no documents is
+# removed, so the next run tries again instead of scanning nothing.
 ${SEED_DIR}:
-	./scripts/fetch-seed.sh ${SEED_REPO} ${SEED_DIR} ${SEED_PATH}
+	@ rm -rf ${SEED_DIR}
+	git clone --depth 1 --filter=blob:none --sparse ${SEED_REPO} ${SEED_DIR}
+	git -C ${SEED_DIR} sparse-checkout set ${SEED_PATH}
+	@ count=`find ${SEED_DIR}/${SEED_PATH} -name '*.md' | wc -l`; \
+	if [ $$count -eq 0 ]; then \
+		echo "FAIL: no .md files under ${SEED_DIR}/${SEED_PATH}" >&2; \
+		rm -rf ${SEED_DIR}; exit 1; \
+	fi; \
+	echo "ready: ${SEED_DIR}/${SEED_PATH} ($$count documents)"
 
 
 # Built with `release`, not `dev`: the debug build is several times slower at

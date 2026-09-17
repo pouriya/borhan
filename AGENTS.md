@@ -88,10 +88,9 @@ document-frequency weighting to mean something.
 
 Two things the Makefile does that are not obvious:
 
-- **`seed-scan` depends on `release`, not `dev`.** A debug build spends **1.6s
-  of every invocation** loading the model against **0.17s** for release. Per
-  document that is the difference between 1.8s and 0.2s, which is the difference
-  between a coffee and an afternoon.
+- **`seed-scan` depends on `release`, not `dev`.** A debug build is several
+  times slower at tokenizing and indexing, and `seed-scan` runs the binary once
+  per document, which is the difference between a coffee and an afternoon.
 - **`--` goes before the text.** `memory add` takes the text as a positional,
   and a Markdown file that opens with a list item starts with `- `, which clap
   reads as a flag: `error: unexpected argument '- ' found`.
@@ -587,7 +586,6 @@ src/search.rs      The query syntax, coverage, scoring, snippets, hints
 src/normalize.rs   NFC, ZWNJ, ک/ی folding, Persian affixes, Snowball English
 src/ulid.rs        Ulid, the primary key everywhere
 Makefile           Every build/check entry point. Use it, not cargo.
-scripts/           Corpus fetchers, called by the seed targets
 seed/              Corpus cloned by `make seed` (gitignored)
 home/              BORHAN_HOME for `make seed` (gitignored)
 build/             Named binaries from make dev/release (gitignored)
@@ -724,7 +722,7 @@ letter. Additional structured fields follow as `key=value` pairs. Use `?` for
 ```rust
 tracing::info!(msg = "Created storage directory", directory = ?settings.storage_directory);
 tracing::warn!(msg = "Skipped unreadable memory file", path = ?path, error = %error);
-tracing::debug!(msg = "Embedding batch", count = texts.len(), dimensions = DIM);
+tracing::debug!(msg = "Opened index", memory = %name, segments = segments.len());
 tracing::trace!(msg = "Committed units", table = "unit", rows = written.units.len());
 ```
 

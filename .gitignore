@@ -2,13 +2,9 @@
 /build
 /oldbuild
 
-# Vendored embedding model (~31 MB) — fetch with `make model`
-/models
-src/embedding/potion-retrieval-32M
-
 # Corpus fetched by `make seed`, and the storage it is scanned into. Neither is
-# ours to commit: the corpus is somebody else's repository and the storage is a
-# few hundred MB of derived vectors.
+# ours to commit: the corpus is somebody else's repository and the storage is
+# derived from it.
 /seed
 /home
 /oldhome
@@ -17,4 +13,3 @@ src/embedding/potion-retrieval-32M
 *.db
 *.db-journal
 *.db-wal
-*.lance
