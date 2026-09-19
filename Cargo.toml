@@ -3,7 +3,7 @@ name = "borhan"
 version = "1.0.0"
 edition = "2024"
 description = "Keyword memory for AI agents over MCP, CLI and HTTP, for Persian and English text"
-authors = ["Pouriya Jahanbakhsh <pouriya.jb@gmail.com>"]
+authors = ["Pouriya Jahanbakhsh <pouriya.jahanbakhsh@gmail.com>"]
 # Edition 2024 and let-chains, and ordered-float (under tantivy) needs 1.90.
 # Without this an older toolchain reports a wall of errors instead of saying it
 # is too old.
@@ -142,9 +142,20 @@ clap = { version = "4.6.6", default-features = false, features = [
 ] }
 
 # CLI talking to a running `serve`. Blocking on purpose: a command is one
-# request then exit, and the rustls/native-tls stacks stay off because the
-# probe and the fallback are `http://` on loopback.
-ureq = { version = "2.12.1", default-features = false, features = ["json"] }
+# request then exit.
+#
+# `rustls` rather than `native-tls`, because `remote_address` may be an
+# `https://` URL and the release builds are static musl and a scratch container:
+# ring compiles into the binary, where OpenSSL would have to be found on the
+# host at link time and again at run time. It also carries
+# `remote_skip_tls_verify` — `TlsConfig::disable_verification` — which on the
+# native-tls side would have been ours to write against a certificate verifier
+# trait. `default-features = false` drops `gzip`; these responses are JSON over
+# a LAN or loopback and the server does not compress them.
+ureq = { version = "3.4.2", default-features = false, features = [
+    "json",
+    "rustls",
+] }
 
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [

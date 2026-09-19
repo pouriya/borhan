@@ -1,12 +1,54 @@
 # borhan server configuration.
 #
 # Written by `borhan init server`. Read by `borhan serve`, which binds `listen`,
-# and by every other `borhan` command, which probes that same address and routes
-# through the server when something answers there. Nothing here is re-read while
-# `serve` is running: change the file, restart the server.
+# and by every other `borhan` command, which goes to `remote_address` when one
+# is set and otherwise probes `listen` and routes through the server when
+# something answers there. Nothing here is re-read while `serve` is running:
+# change the file, restart the server.
 
 # Address to bind, and the address the CLI probes.
+#
+# A bind address, so `HOST:PORT` and no scheme. `0.0.0.0` and `[::]` mean every
+# interface to `serve`; the CLI cannot connect to either, and reads them as the
+# loopback of their family — `0.0.0.0:1995` is bound on everything and probed on
+# `127.0.0.1:1995`, which is the same server either way.
 listen = "@LISTEN@"
+
+# A server on another machine. Read by the CLI; `serve` ignores it.
+#
+# Set this and the CLI stops probing `listen` and goes here instead. It is a
+# URL, not a bind address — `https://borhan.example.com` or
+# `http://10.0.0.4:1995` — because what changes on the far side of a network is
+# the scheme, the name and sometimes a port, and `listen` can only say the last
+# of those.
+#
+# The failure is handled differently from `listen`'s, and the difference is
+# deliberate. A `listen` nothing answers on means the CLI opens the store under
+# `--home` directly, which is the same store `serve` would have opened for it.
+# The store behind this address is a different one, so a CLI that could not
+# reach it stops and says so. Falling back would write into the local memory,
+# report success, and leave the message nowhere anyone is looking for it.
+#
+# `token` is sent here too, so a remote address over plain `http://` puts that
+# token on the wire in the clear.
+# remote_address = "https://borhan.example.com"
+
+# Talk to an `https://` remote_address without checking its certificate.
+#
+# For a server with a self-signed certificate, or one signed by a CA this
+# machine has not been told about — which is what an internal memory usually
+# has. It switches off both halves of the check: whether the certificate chains
+# to anything trusted, and whether it was issued for the host being dialled.
+#
+# What is left is encryption with nobody on the other end of it. Anything that
+# can route these packets can answer instead of the real server, present a
+# certificate it made up, and read `token` out of the Authorization header as it
+# passes — and that token is every operation this store allows. It is a
+# reasonable thing to set on a LAN or a VPN you already trust, and not something
+# to leave on across the open internet.
+#
+# Nothing on an `http://` address, where no certificate is offered to check.
+# remote_skip_tls_verify = true
 
 # Token clients must present as `Authorization: Bearer <token>`. It governs who
 # may talk to this server at all, including for reads. Comment it out to serve

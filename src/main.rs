@@ -208,6 +208,12 @@ pub struct CommandLine {
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Create the home directory and what lives inside it.
+    ///
+    /// Two separate things, and which one you want depends on the machine:
+    /// `init storage` for a machine that keeps memories, `init server` for one
+    /// that serves them. A machine that only talks to someone else's server
+    /// needs neither — it needs a `server.toml` naming that server. Given no
+    /// subcommand this prints the choice rather than guessing at it.
     Init {
         #[command(subcommand)]
         command: Option<InitCommand>,
@@ -457,7 +463,7 @@ const SKILL_READERS: [SkillReader; 5] = [
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum InitCommand {
-    /// Create the local storage. The default when `init` is given no subcommand.
+    /// Create the local storage: `<home>/storage`, where memories are kept.
     ///
     /// Safe to run again: an existing storage is not an error, and re-running
     /// rebuilds the index of every memory in it from the stored messages, the
@@ -956,6 +962,34 @@ pub struct Server {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
 
+    /// A `serve` elsewhere, as a URL: `http://host:port` or `https://host`.
+    /// Read by the CLI only — `serve` binds [`Server::listen`] and nothing
+    /// else — and when it is set the CLI goes there instead of to `listen`.
+    ///
+    /// The two are not alternatives for the same fact. `listen` is where a
+    /// server puts its socket, which is why it is bare `HOST:PORT`: a bind
+    /// address has no scheme and no path. This is where a client finds a server
+    /// that somebody else started, possibly behind a TLS terminator, on a host
+    /// this machine reaches by name. That is a URL, and the scheme is the half
+    /// that `listen` cannot express.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_address: Option<String>,
+
+    /// Connect to an `https://` [`Server::remote_address`] without checking
+    /// the certificate: neither its chain nor the hostname it was issued for.
+    ///
+    /// For a server presenting a self-signed or internal-CA certificate, which
+    /// is what a memory on a LAN or behind a corporate CA usually has. What it
+    /// costs is the whole of what TLS was doing: anything that can route the
+    /// connection can terminate it, present any certificate, and read the token
+    /// in the `Authorization` header as it goes past. Turning this on over a
+    /// network that is not already trusted hands over the bearer token that
+    /// governs every operation on the store.
+    ///
+    /// Has no effect on `http://`, where there is nothing to verify.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_skip_tls_verify: Option<bool>,
+
     /// Token clients must present as `Authorization: Bearer`. Unset means open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -1009,6 +1043,82 @@ impl Server {
             }
         }
         Ok(allowed)
+    }
+
+    /// Where the CLI should send requests, and whether missing it is fatal.
+    ///
+    /// `Some((origin, required))`. `required` is the difference between the two
+    /// sources: a [`Server::remote_address`] that does not answer is an error,
+    /// a [`Server::listen`] that does not answer is a local store.
+    ///
+    /// That asymmetry is about which store the fallback lands in, not about
+    /// which line someone wrote. `listen` describes a `serve` on this machine
+    /// over this same `--home`, so the two paths reach the same bytes and going
+    /// direct when nothing answers costs nothing. A `remote_address` is a
+    /// different machine and a different store, and falling back there would
+    /// write the message into an empty local memory, print every sign of
+    /// success, and leave someone searching the team's server for it.
+    fn client_origin(&self) -> anyhow::Result<Option<(String, bool)>> {
+        if let Some(address) = &self.remote_address {
+            let address = address.trim();
+            let rest = match address.split_once("://") {
+                Some(("http" | "https", rest)) => rest,
+                Some((scheme, _)) => anyhow::bail!(
+                    "remote_address {address:?} has scheme {scheme:?}: it must be http or https"
+                ),
+                None => anyhow::bail!(
+                    "remote_address {address:?} is not a URL: write the scheme too, as in \
+                     \"http://{address}\""
+                ),
+            };
+            if rest.trim_end_matches('/').is_empty() {
+                anyhow::bail!("remote_address {address:?} has no host");
+            }
+            // Trailing slash off, because every path this client asks for
+            // starts with one and `//api/v1/health` is a different route to
+            // anything in front of the server. Trimmed after the scheme is
+            // read, so that `https://` is a missing host and not a missing
+            // scheme.
+            return Ok(Some((address.trim_end_matches('/').to_string(), true)));
+        }
+        let Some(listen) = &self.listen else {
+            return Ok(None);
+        };
+        Ok(Some((format!("http://{}", dialable(listen)), false)))
+    }
+}
+
+/// A bind address, rewritten as something to connect to.
+///
+/// `0.0.0.0` and `[::]` are answers to a different question. They mean *every
+/// interface on this machine* to `bind`, and as a destination they are not an
+/// address at all: Windows refuses to connect to them outright, and Linux only
+/// reaches the local machine by a convention nothing promises to keep. The
+/// machine the CLI wants is the one it is running on, so the wildcard becomes
+/// the loopback of its own family and the port is carried over untouched.
+///
+/// Anything else is passed through, including a `listen` that names one
+/// interface: a server bound to `192.168.1.10:1995` is not listening on
+/// loopback, and rewriting that one would break the connection it describes.
+fn dialable(listen: &str) -> String {
+    // Split on the last colon, and only when what follows is a port. `[::]:1995`
+    // splits correctly; bare `[::]` would otherwise split inside the address.
+    let (host, port) = match listen.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit()) =>
+        {
+            (host, Some(port))
+        }
+        _ => (listen, None),
+    };
+    let host = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "[::]" | "[::0]" => "[::1]",
+        host => host,
+    };
+    match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
     }
 }
 
@@ -1176,7 +1286,7 @@ fn check_storage(home: &Path, storage: &Path, command: &str) -> anyhow::Result<(
          (set --home, or the BORHAN_HOME environment variable, to move it).\n\
          \n\
          If this machine simply has no borhan data yet, create it:\n\
-         \n    borhan --home {home} init\n\
+         \n    borhan --home {home} init storage\n\
          \n\
          If you are an agent in a container or sandbox and the memories belong to a \
          user on the host, do NOT run init — it would make an empty store and every \
@@ -1245,117 +1355,145 @@ async fn main() -> anyhow::Result<()> {
     let storage = settings.home.join(STORAGE_DIRECTORY);
 
     match command {
-        Command::Init { command } => match command.unwrap_or(InitCommand::Storage) {
-            InitCommand::Storage => {
-                let existing = storage.is_dir();
-                fs::create_dir_all(&storage)
-                    .with_context(|| format!("Could not create {storage:?}"))?;
-                tracing::info!(directory = ?storage, existing = existing, "initialized storage");
-                if !existing {
-                    println!("Initialized {}", storage.display());
-                    return Ok(());
+        Command::Init { command } => {
+            // No implicit `storage`, for the same reason `memory` and `skills`
+            // have no implicit subcommand. The two things `init` writes are a
+            // store and a server configuration, and they are not variations on
+            // one another: a machine that only talks to someone else's server
+            // wants the second and specifically not the first. A bare `init`
+            // that quietly made a store would hand that machine an empty
+            // memory it never asked for.
+            let Some(command) = command else {
+                let mut root = <CommandLine as clap::CommandFactory>::command();
+                root.build();
+                match root.find_subcommand_mut("init") {
+                    Some(init) => init.print_long_help()?,
+                    None => root.print_long_help()?,
+                }
+                return Ok(());
+            };
+            match command {
+                InitCommand::Storage => {
+                    let existing = storage.is_dir();
+                    fs::create_dir_all(&storage)
+                        .with_context(|| format!("Could not create {storage:?}"))?;
+                    tracing::info!(directory = ?storage, existing = existing, "initialized storage");
+                    if !existing {
+                        println!("Initialized {}", storage.display());
+                        return Ok(());
+                    }
+
+                    // Re-initializing an existing storage is not an error and not a
+                    // no-op: the directory being there says nothing about whether
+                    // the indexes inside it were built by the normalizer that is
+                    // about to read them. So a second `init` rebuilds every memory
+                    // from its messages, which is what the systemd unit's
+                    // `ExecStartPre` leans on — one line that sets a machine up the
+                    // first time and keeps the indexes honest on every boot after.
+                    println!("Already initialized: {}", storage.display());
+                    let (memories, _) = borhan::api::list(&storage, &Ulid::new()?)?;
+                    for memory in &memories {
+                        let store = Storage::open(&storage, &memory.name)?;
+                        let built = Index::attach(&store.directory.join(borhan::index::DIRECTORY))?;
+                        let writer = built.writer()?;
+                        let store = Mutex::new(store);
+                        let writer = Mutex::new(writer);
+                        let (messages, units, _) = borhan::api::rescan(
+                            &store,
+                            &built,
+                            &writer,
+                            &memory.name,
+                            &Ulid::new()?,
+                        )?;
+                        println!(
+                            "Rescanned {}: {messages} messages, {units} units",
+                            memory.name
+                        );
+                    }
+                    Ok(())
                 }
 
-                // Re-initializing an existing storage is not an error and not a
-                // no-op: the directory being there says nothing about whether
-                // the indexes inside it were built by the normalizer that is
-                // about to read them. So a second `init` rebuilds every memory
-                // from its messages, which is what the systemd unit's
-                // `ExecStartPre` leans on — one line that sets a machine up the
-                // first time and keeps the indexes honest on every boot after.
-                println!("Already initialized: {}", storage.display());
-                let (memories, _) = borhan::api::list(&storage, &Ulid::new()?)?;
-                for memory in &memories {
-                    let store = Storage::open(&storage, &memory.name)?;
-                    let built = Index::attach(&store.directory.join(borhan::index::DIRECTORY))?;
-                    let writer = built.writer()?;
-                    let store = Mutex::new(store);
-                    let writer = Mutex::new(writer);
-                    let (messages, units, _) =
-                        borhan::api::rescan(&store, &built, &writer, &memory.name, &Ulid::new()?)?;
-                    println!(
-                        "Rescanned {}: {messages} messages, {units} units",
-                        memory.name
-                    );
-                }
-                Ok(())
-            }
-
-            InitCommand::Server {
-                listen,
-                token,
-                refuse,
-            } => {
-                let server_configuration = settings.home.join(SERVER_CONFIGURATION);
-                if server_configuration.is_file() {
-                    anyhow::bail!(
-                        "{server_configuration:?} already exists. Remove it before writing \
+                InitCommand::Server {
+                    listen,
+                    token,
+                    refuse,
+                } => {
+                    let server_configuration = settings.home.join(SERVER_CONFIGURATION);
+                    if server_configuration.is_file() {
+                        anyhow::bail!(
+                            "{server_configuration:?} already exists. Remove it before writing \
                          another listen address."
+                        );
+                    }
+                    let server = Server {
+                        listen: Some(listen.clone()),
+                        // Client-side settings, and this writes the file for a
+                        // machine that is about to run `serve`. The template
+                        // carries both, commented, for the machine that is not.
+                        remote_address: None,
+                        remote_skip_tls_verify: None,
+                        token: token.clone(),
+                        refuse: match refuse.is_empty() {
+                            true => None,
+                            false => Some(refuse.clone()),
+                        },
+                    };
+                    // Parsed before the file is written, so a misspelled name is a
+                    // message here rather than a `serve` that will not start.
+                    let allowed = server.allowed()?;
+
+                    // Rendered from the template rather than serialized from
+                    // `server`, because serializing loses every comment — and the
+                    // comments are most of what this file is. A generated
+                    // `refuse = []` says nothing; the template's twenty lines above
+                    // it say what the six names are, which two destroy, and why the
+                    // list is of refusals.
+                    let token_line = match &token {
+                        Some(token) => format!("token = {}", quoted(token)),
+                        None => "# token = \"a-long-random-string\"".to_string(),
+                    };
+                    let mut names = Vec::new();
+                    for name in &refuse {
+                        names.push(quoted(name));
+                    }
+                    let configuration = include_str!("server.toml")
+                        .replace("@LISTEN@", &listen)
+                        .replace("@TOKEN@", &token_line)
+                        .replace("@REFUSE@", &names.join(", "));
+
+                    fs::create_dir_all(&settings.home).with_context(|| {
+                        format!("Could not create home directory {:?}", settings.home)
+                    })?;
+                    let mut options = fs::OpenOptions::new();
+                    options.write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.mode(0o600);
+                    }
+                    let mut file = options
+                        .open(&server_configuration)
+                        .with_context(|| format!("Could not create {server_configuration:?}"))?;
+                    file.write_all(configuration.as_bytes())
+                        .with_context(|| format!("Could not write {server_configuration:?}"))?;
+
+                    tracing::info!(
+                        configuration = ?server_configuration,
+                        listen = listen,
+                        token = server.token.is_some(),
+                        refused = refuse.join(","),
+                        allowed = allowed.len(),
+                        "initialized server configuration",
                     );
+                    println!(
+                        "Initialized {} listening at {}",
+                        server_configuration.display(),
+                        listen
+                    );
+                    Ok(())
                 }
-                let server = Server {
-                    listen: Some(listen.clone()),
-                    token: token.clone(),
-                    refuse: match refuse.is_empty() {
-                        true => None,
-                        false => Some(refuse.clone()),
-                    },
-                };
-                // Parsed before the file is written, so a misspelled name is a
-                // message here rather than a `serve` that will not start.
-                let allowed = server.allowed()?;
-
-                // Rendered from the template rather than serialized from
-                // `server`, because serializing loses every comment — and the
-                // comments are most of what this file is. A generated
-                // `refuse = []` says nothing; the template's twenty lines above
-                // it say what the six names are, which two destroy, and why the
-                // list is of refusals.
-                let token_line = match &token {
-                    Some(token) => format!("token = {}", quoted(token)),
-                    None => "# token = \"a-long-random-string\"".to_string(),
-                };
-                let mut names = Vec::new();
-                for name in &refuse {
-                    names.push(quoted(name));
-                }
-                let configuration = include_str!("server.toml")
-                    .replace("@LISTEN@", &listen)
-                    .replace("@TOKEN@", &token_line)
-                    .replace("@REFUSE@", &names.join(", "));
-
-                fs::create_dir_all(&settings.home).with_context(|| {
-                    format!("Could not create home directory {:?}", settings.home)
-                })?;
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                let mut file = options
-                    .open(&server_configuration)
-                    .with_context(|| format!("Could not create {server_configuration:?}"))?;
-                file.write_all(configuration.as_bytes())
-                    .with_context(|| format!("Could not write {server_configuration:?}"))?;
-
-                tracing::info!(
-                    configuration = ?server_configuration,
-                    listen = listen,
-                    token = server.token.is_some(),
-                    refused = refuse.join(","),
-                    allowed = allowed.len(),
-                    "initialized server configuration",
-                );
-                println!(
-                    "Initialized {} listening at {}",
-                    server_configuration.display(),
-                    listen
-                );
-                Ok(())
             }
-        },
+        }
 
         Command::Serve => {
             check_storage(&settings.home, &storage, "serve")?;
@@ -1416,7 +1554,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             };
-            let origin = probe_server(&settings.home)?;
+            let remote = probe_server(&settings.home)?;
             match command {
                 MemoryCommand::Create {
                     name,
@@ -1424,10 +1562,9 @@ async fn main() -> anyhow::Result<()> {
                     languages,
                     json,
                 } => {
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             "/api/v1/memory",
                             Some(serde_json::json!({
@@ -1455,9 +1592,8 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 MemoryCommand::List { json } => {
-                    if let Some((origin, token)) = &origin {
-                        let response =
-                            request(origin, token.as_deref(), "GET", "/api/v1/memory_list", None)?;
+                    if let Some(remote) = &remote {
+                        let response = request(remote, "GET", "/api/v1/memory_list", None)?;
                         print_http(&response, json, print_memory_list_json)?;
                     } else {
                         check_storage(&settings.home, &storage, "memory list")?;
@@ -1481,7 +1617,7 @@ async fn main() -> anyhow::Result<()> {
                     if description.is_none() && languages.is_none() {
                         anyhow::bail!("Pass --description and/or --languages");
                     }
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let mut payload = serde_json::Map::new();
                         if let Some(description) = &description {
                             payload.insert(
@@ -1496,8 +1632,7 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "PATCH",
                             &format!("/api/v1/memory/{name}"),
                             Some(serde_json::Value::Object(payload)),
@@ -1533,14 +1668,9 @@ async fn main() -> anyhow::Result<()> {
                              message in it and cannot be undone."
                         );
                     }
-                    if let Some((origin, token)) = &origin {
-                        let response = request(
-                            origin,
-                            token.as_deref(),
-                            "DELETE",
-                            &format!("/api/v1/memory/{name}"),
-                            None,
-                        )?;
+                    if let Some(remote) = &remote {
+                        let response =
+                            request(remote, "DELETE", &format!("/api/v1/memory/{name}"), None)?;
                         print_http(&response, json, |body| {
                             print_deleted(
                                 body["name"].as_str().unwrap_or(&name),
@@ -1585,7 +1715,7 @@ async fn main() -> anyhow::Result<()> {
                     ts,
                     json,
                 } => {
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let mut payload = serde_json::json!({
                             "session": session,
                             "role": role,
@@ -1601,8 +1731,7 @@ async fn main() -> anyhow::Result<()> {
                             payload["ts"] = serde_json::json!(ts);
                         }
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/message_list"),
                             Some(payload),
@@ -1662,14 +1791,13 @@ async fn main() -> anyhow::Result<()> {
                     session,
                     json,
                 } => {
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let mut payload = serde_json::json!({});
                         if let Some(session) = &session {
                             payload["session"] = serde_json::Value::String(session.clone());
                         }
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/outline"),
                             Some(payload),
@@ -1698,7 +1826,7 @@ async fn main() -> anyhow::Result<()> {
                     ts,
                     json,
                 } => {
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let mut payload = serde_json::json!({
                             "session": session,
                             "message": message,
@@ -1708,8 +1836,7 @@ async fn main() -> anyhow::Result<()> {
                             payload["ts"] = serde_json::json!(ts);
                         }
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/message"),
                             Some(payload),
@@ -1769,7 +1896,7 @@ async fn main() -> anyhow::Result<()> {
                     roles,
                     json,
                 } => {
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let mut payload = serde_json::json!({
                             "query": query,
                             "fuzzy": fuzzy,
@@ -1789,8 +1916,7 @@ async fn main() -> anyhow::Result<()> {
                             payload["role_list"] = serde_json::json!(roles);
                         }
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/search"),
                             Some(payload),
@@ -1856,10 +1982,9 @@ async fn main() -> anyhow::Result<()> {
                         "after": after,
                         "messages": messages,
                     });
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/cursor"),
                             Some(body),
@@ -1901,10 +2026,9 @@ async fn main() -> anyhow::Result<()> {
                     if words.is_empty() {
                         anyhow::bail!("Pass at least one word to look up");
                     }
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/lexicon"),
                             Some(serde_json::json!({ "word_list": words })),
@@ -1926,10 +2050,9 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 MemoryCommand::Rescan { name, json } => {
-                    if let Some((origin, token)) = &origin {
+                    if let Some(remote) = &remote {
                         let response = request(
-                            origin,
-                            token.as_deref(),
+                            remote,
                             "POST",
                             &format!("/api/v1/memory/{name}/rescan"),
                             None,
@@ -2056,38 +2179,93 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn probe_server(home: &Path) -> anyhow::Result<Option<(String, Option<String>)>> {
+/// A `serve` that answered, and everything needed to keep talking to it.
+///
+/// The agent is carried rather than rebuilt per request because it holds the
+/// TLS configuration — a rebuilt one would verify certificates that
+/// [`Server::remote_skip_tls_verify`] said not to — and because it pools the
+/// connection, which for an `https://` origin saves a second handshake on a
+/// command that makes two calls.
+struct Remote {
+    origin: String,
+    token: Option<String>,
+    agent: ureq::Agent,
+}
+
+/// The HTTP client, configured from `server.toml`.
+///
+/// `http_status_as_error(false)` because a 404 here is an answer and not a
+/// failure: the body carries the server's `error` message, its `X-Trace-Id` and
+/// its version, all of which this CLI reports, and all of which are thrown away
+/// by a client that turns a status into an `Err` before the body is read.
+fn client(server: &Server) -> ureq::Agent {
+    let mut tls = ureq::tls::TlsConfig::builder();
+    if server.remote_skip_tls_verify.unwrap_or_default() {
+        tls = tls.disable_verification(true);
+    }
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(120)))
+        .tls_config(tls.build())
+        .build()
+        .new_agent()
+}
+
+fn probe_server(home: &Path) -> anyhow::Result<Option<Remote>> {
     let path = home.join(SERVER_CONFIGURATION);
     if !path.is_file() {
         tracing::debug!(reason = "no server.toml", "using local storage");
         return Ok(None);
     }
     let server: Server = read_configuration(&path)?;
-    let Some(listen) = server.listen else {
+    let Some((origin, required)) = server.client_origin()? else {
         tracing::debug!(reason = "server.toml has no listen", "using local storage");
         return Ok(None);
     };
-    let origin = format!("http://{listen}");
+    let agent = client(&server);
     let url = format!("{origin}/api/v1/health");
-    let mut req = ureq::get(&url);
-    req = req.timeout(Duration::from_secs(1));
+    // One second, and separate from the 120 the agent carries for real work: a
+    // probe is asking whether anything is there, and the answer to that arrives
+    // fast or not at all.
+    let mut req = agent
+        .get(&url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(1)))
+        .build();
     if let Some(token) = &server.token {
-        req = req.set("Authorization", &format!("Bearer {token}"));
+        req = req.header("Authorization", format!("Bearer {token}"));
     }
     match req.call() {
         Ok(response) if response.status() == 200 => {
             tracing::debug!(server.address = origin.as_str(), "using HTTP server");
-            Ok(Some((origin, server.token)))
+            Ok(Some(Remote {
+                origin,
+                token: server.token,
+                agent,
+            }))
         }
         Ok(response) => {
+            if required {
+                anyhow::bail!(
+                    "{url} answered {} and not 200. remote_address names the store this \
+                     command would have used; refusing to fall back to the local one.",
+                    response.status().as_u16(),
+                );
+            }
             tracing::debug!(
                 reason = "health was not 200",
-                http.response.status_code = response.status(),
+                http.response.status_code = response.status().as_u16(),
                 "using local storage",
             );
             Ok(None)
         }
         Err(error) => {
+            if required {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "No answer from {url}. remote_address names the store this command \
+                     would have used; refusing to fall back to the local one."
+                )));
+            }
             tracing::debug!(reason = "no response", error = %error, "using local storage");
             Ok(None)
         }
@@ -2136,14 +2314,26 @@ fn print_http(
     print_text(&response.body)
 }
 
+/// The ceiling on a response body held in memory before it is parsed.
+///
+/// Well above the client's default, because the body on the other side of this
+/// is `memory get --json` over a memory holding years of conversation, and the
+/// failure a low limit produces is not a truncated answer but a parse error on
+/// a command that works fine against local storage.
+const MAX_RESPONSE_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn header(response: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
+    let value = response.headers().get(name)?;
+    value.to_str().ok().map(str::to_string)
+}
+
 fn request(
-    origin: &str,
-    token: Option<&str>,
+    remote: &Remote,
     method: &str,
     path: &str,
     body: Option<serde_json::Value>,
 ) -> anyhow::Result<ClientResponse> {
-    let url = format!("{origin}{path}");
+    let url = format!("{}{path}", remote.origin);
     let (http_path, http_query) = match path.split_once('?') {
         Some((path, query)) => (path, query),
         None => (path, ""),
@@ -2158,50 +2348,76 @@ fn request(
     // and logged here, so the CLI line and the two server lines are one query.
     let _span = tracing::info_span!("http.client").entered();
     let started = std::time::Instant::now();
-    let mut req = ureq::request(method, &url);
-    req = req.timeout(Duration::from_secs(120));
-    if let Some(token) = token {
-        req = req.set("Authorization", &format!("Bearer {token}"));
+    let mut builder = ureq::http::Request::builder()
+        .method(method)
+        .uri(url.as_str());
+    if let Some(token) = &remote.token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
     }
-    let response = match body {
-        Some(body) => req.send_json(body),
-        None => req.call(),
+    // `Content-Type` by hand because this goes through the http-crate request
+    // rather than the client's own `send_json`, and axum's `Json` extractor
+    // dispatches on the header: without it every write is a 415 and not a
+    // parse error, which reads like the server refusing the operation.
+    let response = match &body {
+        Some(value) => {
+            let request = builder
+                .header("Content-Type", "application/json")
+                .body(value.to_string())
+                .with_context(|| format!("Could not build {method} {url}"))?;
+            remote.agent.run(request)
+        }
+        None => {
+            let request = builder
+                .body(())
+                .with_context(|| format!("Could not build {method} {url}"))?;
+            remote.agent.run(request)
+        }
     };
     let total_ms = started.elapsed().as_millis() as u64;
     match response {
-        Ok(response) => {
-            let status = response.status();
-            let response_bytes: u64 = match response.header("content-length") {
+        Ok(mut response) => {
+            // Headers first, and owned: reading the body takes the response
+            // mutably, and every one of these is still wanted afterwards.
+            let code = response.status().as_u16();
+            let response_bytes: u64 = match header(&response, "content-length") {
                 Some(value) => value.parse().unwrap_or_default(),
                 None => 0,
             };
-            let version = response.header("x-borhan-version").map(str::to_string);
-            let trace = response.header("x-trace-id").map(str::to_string);
-            tracing::info!(
-                trace_id = trace.as_deref().unwrap_or("-"),
-                http.request.method = method,
-                url.path = http_path,
-                url.query = http_query,
-                http.request.body.size = request_bytes,
-                http.response.status_code = status,
-                http.response.body.size = response_bytes,
-                total_ms = total_ms,
-                "sent request",
-            );
-            let body = match response.into_json::<serde_json::Value>() {
-                Ok(value) => value,
-                Err(error) => return Err(anyhow::Error::new(error).context("Could not read JSON")),
-            };
-            Ok(ClientResponse { version, body })
-        }
-        Err(ureq::Error::Status(code, response)) => {
-            let response_bytes: u64 = match response.header("content-length") {
-                Some(value) => value.parse().unwrap_or_default(),
-                None => 0,
-            };
-            let version = response.header("x-borhan-version").map(str::to_string);
-            let mut trace = response.header("x-trace-id").map(str::to_string);
-            let body = match response.into_json::<serde_json::Value>() {
+            let version = header(&response, "x-borhan-version");
+            let mut trace = header(&response, "x-trace-id");
+
+            if code < 400 {
+                tracing::info!(
+                    trace_id = trace.as_deref().unwrap_or("-"),
+                    http.request.method = method,
+                    url.path = http_path,
+                    url.query = http_query,
+                    http.request.body.size = request_bytes,
+                    http.response.status_code = code,
+                    http.response.body.size = response_bytes,
+                    total_ms = total_ms,
+                    "sent request",
+                );
+                let body = response
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_RESPONSE_BYTES)
+                    .read_json::<serde_json::Value>();
+                let body = match body {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error).context("Could not read JSON"));
+                    }
+                };
+                return Ok(ClientResponse { version, body });
+            }
+
+            let body = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BYTES)
+                .read_json::<serde_json::Value>();
+            let body = match body {
                 Ok(value) => value,
                 Err(_) => serde_json::json!({}),
             };

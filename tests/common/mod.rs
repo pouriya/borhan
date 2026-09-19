@@ -43,21 +43,35 @@ pub fn call(
     headers: &[(&str, &str)],
     body: Option<Value>,
 ) -> (u16, Value) {
-    let mut request = ureq::request(method, &format!("{origin}{path}"));
+    // `http_status_as_error(false)`: a 404 here is the answer the test is
+    // asserting on, and the body carrying it is not read by a client that
+    // turns the status into an `Err` first.
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut request = ureq::http::Request::builder()
+        .method(method)
+        .uri(format!("{origin}{path}"));
     for (name, value) in headers {
-        request = request.set(name, value);
+        request = request.header(*name, *value);
     }
     let response = match body {
-        Some(body) => request.send_json(body),
-        None => request.call(),
+        Some(body) => {
+            let request = request
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .unwrap();
+            agent.run(request)
+        }
+        None => agent.run(request.body(()).unwrap()),
     };
-    let response = match response {
+    let mut response = match response {
         Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
         Err(error) => panic!("{method} {path}: {error}"),
     };
-    let status = response.status();
-    let text = response.into_string().unwrap();
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().unwrap();
     match serde_json::from_str(&text) {
         Ok(value) => (status, value),
         Err(_) => (status, Value::String(text)),

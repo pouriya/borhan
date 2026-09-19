@@ -351,11 +351,16 @@ fn commands_on_local_storage() {
     assert!(fails(home, &["memory", "list"]).contains("borhan never creates it"));
     assert!(fails(home, &["serve"]).contains("borhan never creates it"));
 
-    assert!(ok(home, &["init"]).starts_with("Initialized"));
+    // A bare `init` prints the choice and creates nothing: the storage is still
+    // missing afterwards, which is the whole point of it having no default.
+    assert!(ok(home, &["init"]).contains("borhan init"));
+    assert!(fails(home, &["memory", "list"]).contains("borhan never creates it"));
+
+    assert!(ok(home, &["init", "storage"]).starts_with("Initialized"));
     ok(home, &["memory", "list"]);
     every_command(home);
 
-    let again = ok(home, &["--info", "init"]);
+    let again = ok(home, &["--info", "init", "storage"]);
     assert!(
         again.contains("Already initialized")
             && again.contains("Rescanned company: 2 messages, 2 units"),
@@ -435,7 +440,7 @@ fn commands_through_a_server() {
         ok(other.path(), &args);
         assert!(fails(other.path(), &["memory", "list"]).contains("borhan never creates it"));
         // Its address is taken by the running server, on every platform.
-        ok(other.path(), &["init"]);
+        ok(other.path(), &["init", "storage"]);
         assert!(fails(other.path(), &["serve"]).contains("Could not listen"));
     }
     let closed = tempfile::tempdir().unwrap();
@@ -443,7 +448,7 @@ fn commands_through_a_server() {
         closed.path(),
         &["init", "server", "--listen", "127.0.0.1:1"],
     );
-    ok(closed.path(), &["init"]);
+    ok(closed.path(), &["init", "storage"]);
     ok(closed.path(), &["memory", "list"]);
 
     let refusing = tempfile::tempdir().unwrap();
@@ -459,8 +464,84 @@ fn commands_through_a_server() {
         "listen = \"127.0.0.1:1\"\nrefuse = [\"fly\"]\n",
     )
     .unwrap();
-    ok(refusing.path(), &["init"]);
+    ok(refusing.path(), &["init", "storage"]);
     assert!(fails(refusing.path(), &["serve"]).contains("\"fly\" in refuse"));
     std::fs::write(refusing.path().join("server.toml"), "listen = 5\n").unwrap();
     assert!(fails(refusing.path(), &["memory", "list"]).contains("Could not read"));
+}
+
+/// `remote_address`: the URL the CLI goes to instead of probing `listen`, and
+/// the wildcard rewriting that makes `listen` dialable at all.
+#[test]
+fn commands_through_a_remote_address() {
+    let served = tempfile::tempdir().unwrap();
+    let origin = common::serve(served.path().to_path_buf(), Some("secret"), &[]);
+    let listen = origin.strip_prefix("http://").unwrap();
+    let port = listen.rsplit_once(':').unwrap().1;
+
+    // `remote_address` wins over a `listen` nothing is bound to, and the
+    // memories that arrive are the server's.
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    std::fs::write(
+        home.join("server.toml"),
+        format!("listen = \"127.0.0.1:1\"\nremote_address = \"{origin}/\"\ntoken = \"secret\"\n"),
+    )
+    .unwrap();
+    every_command(home);
+
+    // `0.0.0.0` is bound on every interface and dialled on loopback. Written
+    // through `listen`, so this is the rewrite and not `remote_address`.
+    let wildcard = tempfile::tempdir().unwrap();
+    std::fs::write(
+        wildcard.path().join("server.toml"),
+        format!("listen = \"0.0.0.0:{port}\"\ntoken = \"secret\"\n"),
+    )
+    .unwrap();
+    assert!(ok(wildcard.path(), &["memory", "list"]).contains("company"));
+
+    // A `remote_address` that does not answer stops the command. The store it
+    // names is not the local one, so falling back would file the work in the
+    // wrong place and say it worked.
+    let unreachable = tempfile::tempdir().unwrap();
+    std::fs::write(
+        unreachable.path().join("server.toml"),
+        "remote_address = \"http://127.0.0.1:1\"\n",
+    )
+    .unwrap();
+    ok(unreachable.path(), &["init", "storage"]);
+    let said = fails(unreachable.path(), &["memory", "list"]);
+    assert!(said.contains("No answer from"), "{said}");
+    assert!(said.contains("refusing to fall back"), "{said}");
+
+    // A bad token is the server answering, not the server missing: still an
+    // error, and still not the local store.
+    let wrong = tempfile::tempdir().unwrap();
+    std::fs::write(
+        wrong.path().join("server.toml"),
+        format!("remote_address = \"{origin}\"\ntoken = \"wrong\"\n"),
+    )
+    .unwrap();
+    ok(wrong.path(), &["init", "storage"]);
+    assert!(
+        fails(wrong.path(), &["memory", "list"]).contains("refusing to fall back"),
+        "a rejected token must not fall back to local storage",
+    );
+
+    // Not a URL, and a URL of a scheme this client does not speak.
+    for (address, said) in [
+        ("borhan.example.com:1995", "is not a URL"),
+        ("ftp://borhan.example.com", "it must be http or https"),
+        ("https://", "has no host"),
+    ] {
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(
+            broken.path().join("server.toml"),
+            format!("remote_address = \"{address}\"\n"),
+        )
+        .unwrap();
+        ok(broken.path(), &["init", "storage"]);
+        let failed = fails(broken.path(), &["memory", "list"]);
+        assert!(failed.contains(said), "{address}: {failed}");
+    }
 }

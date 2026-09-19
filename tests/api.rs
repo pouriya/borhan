@@ -48,15 +48,16 @@ fn a_memory_from_creation_to_deletion() {
             .contains("BORHAN=https://memory.example")
     );
 
-    let response = ureq::get(&format!("{origin}/api/v1/health"))
-        .call()
-        .unwrap();
+    let response = ureq::get(format!("{origin}/api/v1/health")).call().unwrap();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap())
+    };
+    assert_eq!(header("x-borhan-version"), Some(env!("CARGO_PKG_VERSION")));
     assert_eq!(
-        response.header("x-borhan-version"),
-        Some(env!("CARGO_PKG_VERSION"))
-    );
-    assert_eq!(
-        response.header("server"),
+        header("server"),
         Some(concat!(
             "borhan/",
             env!("CARGO_PKG_VERSION"),
@@ -65,7 +66,7 @@ fn a_memory_from_creation_to_deletion() {
             ")"
         ))
     );
-    assert_eq!(response.header("x-trace-id").unwrap().len(), 26);
+    assert_eq!(header("x-trace-id").unwrap().len(), 26);
 
     // Creating.
     let created = json!({"name": "company", "description": DESCRIPTION});
