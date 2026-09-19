@@ -1418,6 +1418,17 @@ async fn main() -> anyhow::Result<()> {
                     token,
                     refuse,
                 } => {
+                    // docker --env-file does no quote processing, so a line
+                    // reading BORHAN_TOKEN="x" arrives with the quotes in it.
+                    let token = token.map(|token| {
+                        let mut characters = token.chars();
+                        match (characters.next(), characters.next_back()) {
+                            (Some(first @ ('"' | '\'')), Some(last)) if first == last => {
+                                characters.as_str().to_string()
+                            }
+                            _ => token,
+                        }
+                    });
                     let server_configuration = settings.home.join(SERVER_CONFIGURATION);
                     if server_configuration.is_file() {
                         anyhow::bail!(
