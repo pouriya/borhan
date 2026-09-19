@@ -1534,10 +1534,16 @@ async fn main() -> anyhow::Result<()> {
                 .map(|permission| permission.as_str())
                 .collect();
             tracing::info!(
+                version = CRATE_VERSION,
+                normalization = borhan::normalize::VERSION,
                 server.address = address,
+                home = ?settings.home,
                 storage = ?storage,
                 token = server.token.is_some(),
+                remote_address = server.remote_address.as_deref().unwrap_or("-"),
                 permissions = allowed.join(","),
+                refused = server.refuse.unwrap_or_default().join(","),
+                pid = std::process::id(),
                 "started HTTP server",
             );
             axum::serve(listener, router)
