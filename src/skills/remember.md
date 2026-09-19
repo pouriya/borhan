@@ -1,6 +1,6 @@
 ---
 name: borhan-remember
-description: At the end of a working session, decide what from the conversation is worth keeping and store it in a borhan memory. Use when the user says they are finished, asks you to remember or save what happened, invokes /borhan-remember, or when a long session is about to be closed or compacted. Reads the memories that exist, asks the user which to write to with options rather than guessing, and files each turn under the right session, role and author. Pairs with borhan-survey: that one describes a project's code in a session named after the project, this one records what happened in a session named after the conversation — same memory, never the same session.
+description: "At the end of a working session, decide what from the conversation is worth keeping and store it in a borhan memory. Use when the user says they are finished, asks you to remember or save what happened, invokes /borhan-remember, or when a long session is about to be closed or compacted. Reads the memories that exist, asks the user which to write to with options rather than guessing, and files each turn under the right session, role and author. Pairs with borhan-survey: that one describes a project's code in a session named after the project, this one records what happened in a session named after the conversation — same memory, never the same session."
 license: MIT
 ---
 

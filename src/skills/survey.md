@@ -1,6 +1,6 @@
 ---
 name: borhan-survey
-description: Read a codebase and file what each part of it does into a borhan memory, one message per feature, so that a later search answers questions about this project. Use when the user asks you to survey, map, document or remember a project, invokes /borhan-survey, or when you are about to start work on a codebase nobody has described yet. Confirms which memory with options rather than guessing, names the session after the project, and reconciles with any survey already on file instead of replacing it. Pairs with borhan-remember: survey first when a project is not in the memory yet, then remember at the end of each working session on it.
+description: "Read a codebase and file what each part of it does into a borhan memory, one message per feature, so that a later search answers questions about this project. Use when the user asks you to survey, map, document or remember a project, invokes /borhan-survey, or when you are about to start work on a codebase nobody has described yet. Confirms which memory with options rather than guessing, names the session after the project, and reconciles with any survey already on file instead of replacing it. Pairs with borhan-remember: survey first when a project is not in the memory yet, then remember at the end of each working session on it."
 license: MIT
 ---
 
