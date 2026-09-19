@@ -5,9 +5,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/pouriya/borhan/master/install.sh | sh
 #
 # Downloads a release tarball, checks it against its published checksum, and
-# puts the binary in a directory on your PATH. It does not run `borhan init`:
-# where your memories live is a decision, and the installer tells you the one
-# command that makes it.
+# puts the binary in a directory on your PATH. It sets nothing up beyond that:
+# whether this machine keeps memories or only talks to a server that does is a
+# decision, and `borhan --help` is where it is made.
 #
 # Knobs, all optional:
 #   BORHAN_VERSION   version to install, without the leading v  (default: latest)
@@ -110,8 +110,11 @@ esac
 
 cat <<EOF
 
-Next, create the store (in ~/.borhan) and read the guide:
+Next, start here:
 
-  borhan init
   borhan --help
+
+Or read Getting started:
+
+  https://github.com/pouriya/borhan#getting-started
 EOF

@@ -19,7 +19,7 @@ Group=@GROUP@
 # Creates the storage the first time and rebuilds every memory's index on the
 # ones after, so a unit started against a store written by an older normalizer
 # serves an index that matches it rather than one that silently misses.
-ExecStartPre=/usr/local/bin/borhan --home @HOME@ init
+ExecStartPre=/usr/local/bin/borhan --home @HOME@ init storage
 
 # `--info` because the default level is `warn`, which for a server means a
 # journal holding nothing but failures: no line saying what it bound to, and no

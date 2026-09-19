@@ -112,7 +112,7 @@ itself; that file is the source of truth and this table is the index to it.
 | `pulldown-cmark` | 0.13.4 | Breaks stored Markdown into units |
 | `axum` | 0.8.9 | The HTTP server, and MCP over it |
 | `tokio` | 1.53.1 | Async runtime for `serve` |
-| `ureq` | 2.12.1 | The CLI talking to a running `serve`. Blocking on purpose |
+| `ureq` | 3.4.2 | The CLI talking to a running `serve`. Blocking on purpose; `rustls` for an `https://` `remote_address` |
 | `clap` | 4.6.6 | Command line, derive API |
 | `tanzim` | 0.28.0 | Reads `server.toml`, with located errors |
 | `toml_edit` | 0.22.27 | Writes `server.toml` in `init server` |
@@ -194,7 +194,7 @@ storage.sentences(unit)     -> Result<Vec<(usize, usize)>, Error>   // for the s
 
 **`Storage::open` will not create the directory.** A typo'd `--home` has to be an
 error naming the missing mount, never a new empty store that silently remembers
-nothing. `init` is the only thing that writes the layout; see `check_storage` in
+nothing. `init storage` is the only thing that writes the layout; see `check_storage` in
 `main.rs`, whose message spells out both fixes because an agent in a container
 has two and the wrong one *succeeds*.
 
@@ -337,24 +337,30 @@ and nothing sits outside it:
 ```
 ~/.borhan/
   storage/      One directory per memory. Written by `init storage`.
-  server.toml   Listen address and token. Written by `init server`.
+  server.toml   Listen or remote address, and the token. Written by `init server`.
                 `serve` binds it; the CLI probes it and uses HTTP when that
                 process answers, otherwise opens storage itself.
                 Absent for `serve` => 127.0.0.1:1995 and no token.
 ```
 
-**Nothing is created implicitly.** `init` is the only thing that writes the
-layout, so a missing `storage/` always means "never set up here", never "set up
+**Nothing is created implicitly.** `init storage` is the only thing that writes
+the layout, so a missing `storage/` always means "never set up here", never "set up
 somewhere you did not look". `check_storage` in `main.rs` is that gate, and it
 runs in front of every storage-touching command; its error spells out both fixes
-— run `init`, or mount the user's real `~/.borhan` into the sandbox and pass
+— run `init storage`, or mount the user's real `~/.borhan` into the sandbox and pass
 `--home`. The message is aimed at agents running in containers, where the
-difference between the two matters: `init` there silently produces an *empty*
+difference between the two matters: `init storage` there silently produces an *empty*
 store and hides every existing memory.
 
 ### Local vs HTTP
 
-`server.toml` is the only configuration file. `init server --listen HOST:PORT [--token T]` writes it (`create_new`, mode `0600`). `serve` reads it to bind; if the file is missing it binds `127.0.0.1:1995` with no token. Every memory command probes that listen address (`GET /api/v1/health`, about 1s). If the file is missing, `listen` is unset, or the server does not answer, the command opens storage itself.
+`server.toml` is the only configuration file. `init server --listen HOST:PORT [--token T]` writes it (`create_new`, mode `0600`). `serve` reads it to bind; if the file is missing it binds `127.0.0.1:1995` with no token. Every memory command probes the address (`GET /api/v1/health`, about 1s). If the file is missing, neither address is set, or the server does not answer, the command opens storage itself.
+
+The address the CLI probes is `remote_address` when it is set and `listen` otherwise, and the two differ in shape and in what a failure means:
+
+- `listen` is a bind address, `HOST:PORT`, no scheme. `0.0.0.0` and `[::]` are bindable and not dialable, so the probe rewrites them to `127.0.0.1` and `[::1]`, keeping the port. Anything else, including a single named interface, is passed through.
+- `remote_address` is a URL (`http://`/`https://` only; a trailing `/` is trimmed, a path prefix is kept for servers behind a reverse proxy). It is client-side and `serve` never reads it. A `remote_address` that does not answer, or answers with anything but 200, **fails the command**; it does not fall back to local storage. The fallback is safe for `listen`, which describes a `serve` over this same `--home`, and unsafe here, where the local store is a different store and a silent fallback would file the message where nobody is looking for it.
+- `remote_skip_tls_verify = true` drops both certificate-chain and hostname verification for an `https://` remote, for self-signed and internal-CA servers. It also drops the guarantee that `token` is going to the intended server.
 
 A token in `server.toml` is required on every HTTP request as `Authorization: Bearer`. The same file is what the CLI sends.
 
@@ -416,7 +422,7 @@ Logging flags and `--home` are `global = true`, so they work before or after a
 subcommand.
 
 ```
-borhan init                             # == borhan init storage
+borhan init                             # print the two below and exit
 borhan init storage                     # create ~/.borhan and ~/.borhan/storage
 borhan init server --listen H:P \
                   [--token T]           # write ~/.borhan/server.toml (0600)

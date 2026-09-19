@@ -9,8 +9,9 @@ the PATH. There is no ~/.local/bin convention on Windows and no rc file to tell
 you to edit, so the directory is added to your user PATH here, and only a new
 terminal sees it.
 
-It does not run `borhan init`: where your memories live is a decision, and the
-installer tells you the one command that makes it.
+It sets nothing up beyond that: whether this machine keeps memories or only
+talks to a server that does is a decision, and `borhan --help` is where it is
+made.
 
 Knobs, all optional, all environment variables so they match install.sh:
   BORHAN_VERSION   version to install, without the leading v  (default: latest)
@@ -105,10 +106,13 @@ try {
 
     Write-Host @"
 
-Next, create the store (in ~\.borhan) and read the guide:
+Next, start here:
 
-  borhan init
   borhan --help
+
+Or read Getting started:
+
+  https://github.com/pouriya/borhan#getting-started
 "@
 }
 finally {

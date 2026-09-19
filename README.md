@@ -71,28 +71,106 @@ docker run -d --name borhan -p 127.0.0.1:1995:1995 -e BORHAN_TOKEN="$(openssl ra
 First create the store, which lives in `~/.borhan`. With Docker, the container has already done this:
 
 ```bash
-borhan init
+borhan init storage
 ```
 
-You only need to run borhan as a server for two reasons: to use it as an MCP server, or to share memories with other people by running it on a machine they can all reach. Otherwise there is no server to run: any agent that can run shell commands uses the `borhan` command directly, and `borhan --help` is written to teach the agent everything it needs. Just tell it:
+### Server mode
 
-```
-Run `borhan --help` and use borhan as your long-term memory.
-```
+There are two reasons to run borhan as a server, and only two:
 
-### Start the server (skip if you don't need MCP or sharing)
+- **MCP**, so agents like Claude Code, Cursor or Codex can use it as a tool.
+- **The REST API**, so your own code can read and write the memory over HTTP.
+
+Neither one yours? Skip this section — borhan works on its own from the command line, which is how most agents use it. Carry on at [Without a server](#without-a-server).
+
+**Just you, on one machine?** Keep it on loopback. Nothing outside your machine can reach the port, which makes this both the easiest and the safest way to run it:
 
 ```bash
 borhan init server --listen 127.0.0.1:1995 --token "$(openssl rand -hex 24)"
 borhan serve
 ```
 
-To share memories with others, run the server on a machine they can reach and listen on its address instead of `127.0.0.1`. With Docker, the server is already running, and the token is the one you passed as `BORHAN_TOKEN`.
+**Several people, several machines?** Put the server on a host everyone can reach and keep it running there. With Docker — the same image as above, published on every interface instead of loopback:
 
-The MCP endpoint is `http://127.0.0.1:1995/mcp`, and it expects the token as `Authorization: Bearer <token>`. You will find the token in `~/.borhan/server.toml`. The easiest way to connect is to let your agent do it:
+```bash
+docker run -d --name borhan -p 1995:1995 \
+  -e BORHAN_TOKEN="$(openssl rand -hex 24)" \
+  -v borhan:/var/lib/borhan \
+  ghcr.io/pouriya/borhan:latest
+```
+
+Or with systemd, which keeps it running across reboots:
+
+<details>
+<summary><b>systemd unit</b> — copy, paste, done</summary>
+
+First the store and the config, as the user the service will run as:
+
+```bash
+borhan init storage
+borhan init server --listen 0.0.0.0:1995 --token "$(openssl rand -hex 24)"
+```
+
+Then the unit. The heredoc fills in your user, your home and wherever the installer put the binary, so this goes in as-is:
+
+```bash
+sudo tee /etc/systemd/system/borhan.service >/dev/null <<EOF
+[Unit]
+Description=borhan memory store
+After=network.target
+
+[Service]
+Type=exec
+User=$(whoami)
+ExecStartPre=$(command -v borhan) --home $HOME/.borhan init storage
+ExecStart=$(command -v borhan) --home $HOME/.borhan --info serve
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=$HOME/.borhan
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl enable --now borhan
+```
+
+`ExecStartPre` rebuilds each memory's index on every start, so an upgraded borhan never serves an index built by the older one. `--info` is there because the default level logs only failures, which on a service means a journal that never says what it bound to.
+
+Check it with `systemctl status borhan` and `journalctl -u borhan -f`. From a clone of this repository, `sudo make systemd-install` does all of the above for you.
+
+</details>
+
+Anyone who can reach the port and knows the token has the whole memory, so put nginx or Caddy in front with a certificate if this is leaving a private network.
+
+**Then point each machine at it.** One file on each, `~/.borhan/server.toml`, and nothing else — no `init`, no storage of its own:
+
+```toml
+remote_address = "https://borhan.example.com"
+token = "the-same-token-the-server-uses"
+```
+
+Every `borhan` command on that machine now goes to the server. If it can't be reached, the command stops and tells you. It won't fall back to a local memory, because that one is empty and your note would end up where nobody is looking for it.
+
+If the server's certificate is self-signed, or from a company CA this machine hasn't been told about, add `remote_skip_tls_verify = true`. That skips the certificate check entirely — who signed it, and whether it was issued for the host you typed — so anyone able to reroute the traffic can pose as the server and read your token. Fine on a VPN you trust. Not over the open internet.
+
+**To connect an agent over MCP**, the endpoint is the server's address plus `/mcp`, with the token as `Authorization: Bearer <token>`. The token is in `~/.borhan/server.toml`. The easiest way is to let the agent set it up:
 
 ```
 Add an MCP server named borhan to your configuration. It is an HTTP server at http://127.0.0.1:1995/mcp and needs the header "Authorization: Bearer <token>".
+```
+
+### Without a server
+
+Skip all of that and you lose nothing. Any agent that can run shell commands uses the `borhan` command directly, and `borhan --help` is written to teach it everything it needs. Just tell it:
+
+```
+Run `borhan --help` and use borhan as your long-term memory.
 ```
 
 ### Load the skills
@@ -209,7 +287,7 @@ borhan has no user accounts. Whoever holds the token can read and change every m
 - **Keep it on `127.0.0.1` unless you are sharing it.** That is the default, and only your own machine can connect. With Docker, keep the `127.0.0.1:` in `-p 127.0.0.1:1995:1995`; without it the port is open on every network interface.
 - **Refuse what you don't need.** `borhan init server --refuse delete --refuse replace` gives a server that can store but never destroy anything. Refused operations disappear from the agent's tool list, and the generated `server.toml` explains every option.
 - **Web pages can't use the MCP endpoint.** It rejects requests sent from a browser page, so a site you visit cannot reach your memories through it.
-- **There is no TLS.** borhan speaks plain HTTP, so the token travels unencrypted. To share a server across a network, put it behind a reverse proxy that handles TLS.
+- **The server speaks plain HTTP.** It terminates no TLS of its own, so to share it across a network put it behind a reverse proxy that does. Clients reach that proxy over `https://` through `remote_address`; without one, the token travels unencrypted.
 - **The guide at `/` needs no token.** It only documents the API; it contains no memories.
 
 Found a vulnerability? Please report it privately to pouriya.jahanbakhsh@gmail.com rather than opening a public issue.
