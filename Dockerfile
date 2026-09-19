@@ -32,19 +32,21 @@ RUN printf '%s\n' \
 	'# a caller reading `memory list --json` gets JSON and nothing else.' \
 	'borhan init storage >&2' \
 	'' \
+	'# First start writes server.toml; after that a changed BORHAN_TOKEN rewrites' \
+	'# it, keeping the listen address but not other hand edits.' \
+	'configuration="$BORHAN_HOME/server.toml"' \
+	'if [ ! -f "$configuration" ]; then' \
+	'	borhan init server --listen "0.0.0.0:${BORHAN_PORT:-1995}" ${BORHAN_TOKEN:+--token "$BORHAN_TOKEN"} >&2' \
+	'elif [ -n "${BORHAN_TOKEN:-}" ] && [ "$(sed -n "s/^token = \"\(.*\)\"\$/\1/p" "$configuration")" != "$BORHAN_TOKEN" ]; then' \
+	'	listen=$(sed -n "s/^listen = \"\(.*\)\"\$/\1/p" "$configuration")' \
+	'	rm -f "$configuration"' \
+	'	borhan init server --listen "${listen:-0.0.0.0:${BORHAN_PORT:-1995}}" --token "$BORHAN_TOKEN" >&2' \
+	'fi' \
+	'' \
 	'# Anything after the image name is a borhan command, not a server:' \
 	'#     docker run --rm -v borhan:/var/lib/borhan IMAGE memory list' \
 	'if [ "$#" -gt 0 ]; then' \
 	'	exec borhan "$@"' \
-	'fi' \
-	'' \
-	'# serve with no server.toml binds 127.0.0.1, which nothing outside the' \
-	'# container can reach. So the first start writes one that listens on every' \
-	'# interface, on BORHAN_PORT, with BORHAN_TOKEN as its token when that is' \
-	'# set. Written once: after that the file in the volume is the configuration,' \
-	'# exactly as on a host, and neither variable is read again.' \
-	'if [ ! -f "$BORHAN_HOME/server.toml" ]; then' \
-	'	borhan init server --listen "0.0.0.0:${BORHAN_PORT:-1995}" ${BORHAN_TOKEN:+--token "$BORHAN_TOKEN"}' \
 	'fi' \
 	'' \
 	'exec borhan --info serve' \
